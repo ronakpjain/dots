@@ -24,6 +24,3 @@ vim.g.have_nerd_font = true
 vim.g.python_host_prog = "/Users/ronak/.venv/bin/python"
 vim.g.python3_host_prog = "/Users/ronak/.venv/bin/python3"
 vim.g.loaded_perl_provider = 0
-
--- Colorscheme
-vim.cmd.colorscheme("catppuccin")
