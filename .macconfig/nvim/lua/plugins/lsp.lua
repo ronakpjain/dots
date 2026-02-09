@@ -15,6 +15,7 @@ return {
 				"ty",
 				"texlab",
 				"tsgo",
+				"neocmake",
 			}
 
 			local on_attach = function()
