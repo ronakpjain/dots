@@ -1,0 +1,9 @@
+[colors]
+background = "#1e1e2e"
+border = "#fab387"
+text = "#fab387"
+selected_bg = "#fab387"
+selected_text = "#1e1e2e"
+
+[aliases]
+Spotify = "spicetify auto"
