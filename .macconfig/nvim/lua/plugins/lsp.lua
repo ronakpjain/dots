@@ -16,6 +16,7 @@ return {
 				"texlab",
 				"tsgo",
 				"neocmake",
+				"verible",
 			}
 
 			local on_attach = function()
@@ -91,6 +92,15 @@ return {
 						},
 					}
 					vim.lsp.enable("texlab")
+				elseif server == "verible" then
+					vim.lsp.config.verible = {
+						on_attach = on_attach,
+						cmd = {
+							"verible-verilog-ls",
+							"--flagfile=/Users/ronak/.verible-format.flags",
+						},
+					}
+					vim.lsp.enable(server)
 				else
 					vim.lsp.config[server] = {
 						on_attach = on_attach,
