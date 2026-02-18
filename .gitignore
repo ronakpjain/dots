@@ -2,3 +2,4 @@
 .macconfig/nvim/lazy-lock.json
 .linuxconfig/nvim/lazy-lock.json
 .macconfig/kitty/kitty.conf.bak
+.vim/plugged
