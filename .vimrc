@@ -16,6 +16,15 @@ set expandtab
 
 syntax on
 
+call plug#begin()
+  
+Plug 'vhda/verilog_systemverilog.vim'
+
+Plug '907th/vim-auto-save'
+Plug 'jiangmiao/auto-pairs'
+ 
+call plug#end()
+
 set termguicolors
 colorscheme catppuccin_mocha
 
