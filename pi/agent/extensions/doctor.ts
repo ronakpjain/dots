@@ -38,6 +38,7 @@ const REQUIRED_EXTENSIONS = [
 	"context-budget.ts",
 	"checkpoint.ts",
 	"session-automation.ts",
+	"token-tracker.ts",
 	"recheck/index.ts",
 	"robinhood-mcp/index.ts",
 ];

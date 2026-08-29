@@ -54,6 +54,7 @@ import {
 	type LiveRun,
 } from "./ui.ts";
 import { applyAgentPolicy } from "./policy.ts";
+import { TOKEN_USAGE_EVENT } from "../token-tracker.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -583,13 +584,47 @@ export default function (pi: ExtensionAPI) {
 		r: SubagentRunResult,
 		step: number | undefined,
 		live: LiveRun,
+		ctx?: ExtensionContext,
 	) => {
 		pi.appendEntry(RUN_ENTRY_TYPE, toRunRecord(groupId, kind, r, step, live.runId));
 		pi.appendEntry(RUN_DETAIL_ENTRY_TYPE, toDetailRecord(groupId, kind, r, step, live));
+
+		// Subagents use isolated pi-agent-core Agents, so their assistant messages
+		// do not pass through the parent extension event hooks. Publish one usage
+		// event per completed run for the persistent token tracker.
+		const qualifiedModel = r.model;
+		const separator = qualifiedModel.indexOf("/");
+		const provider = separator > 0 ? qualifiedModel.slice(0, separator) : undefined;
+		const model = separator > 0 ? qualifiedModel.slice(separator + 1) : qualifiedModel;
+		pi.events.emit(TOKEN_USAGE_EVENT, {
+			recordId: `subagent:${live.runId}`,
+			source: "subagent",
+			timestamp: r.startedAt,
+			sessionId: ctx?.sessionManager.getSessionId(),
+			cwd: ctx?.cwd,
+			provider,
+			model,
+			label: r.name,
+			usage: {
+				input: r.usage.input,
+				output: r.usage.output,
+				cacheRead: r.usage.cacheRead,
+				cacheWrite: r.usage.cacheWrite,
+				totalTokens: r.usage.input + r.usage.output + r.usage.cacheRead + r.usage.cacheWrite,
+				turns: r.usage.turns,
+				cost: { total: r.usage.cost },
+			},
+		});
 	};
 
 	// Register a run that failed before it ever started (bad model/agent/etc.).
-	const recordFinishedRun = (groupId: string, kind: LiveRun["kind"], r: SubagentRunResult, step?: number) => {
+	const recordFinishedRun = (
+		groupId: string,
+		kind: LiveRun["kind"],
+		r: SubagentRunResult,
+		step?: number,
+		ctx?: ExtensionContext,
+	) => {
 		const live: LiveRun = {
 			runId: randomUUID(),
 			groupId,
@@ -609,7 +644,7 @@ export default function (pi: ExtensionAPI) {
 			sessionId: r.sessionId,
 		};
 		liveRuns.set(live.runId, live);
-		persistRun(groupId, kind, r, step, live);
+		persistRun(groupId, kind, r, step, live, ctx);
 	};
 
 	// Merge the in-memory registry with persisted detail entries for the browser.
@@ -806,7 +841,7 @@ export default function (pi: ExtensionAPI) {
 						startedAt: new Date().toISOString(),
 						durationMs: 0,
 					};
-					recordFinishedRun(groupId, resultMode, result, step);
+					recordFinishedRun(groupId, resultMode, result, step, ctx);
 					emitDashboard(resultMode, true);
 					return result;
 				}
@@ -837,7 +872,7 @@ export default function (pi: ExtensionAPI) {
 				});
 
 				finalizeLiveRun(live, result);
-				persistRun(groupId, resultMode, result, step, live);
+				persistRun(groupId, resultMode, result, step, live, ctx);
 				emitDashboard(resultMode, true);
 				return result;
 			};

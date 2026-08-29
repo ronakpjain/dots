@@ -134,6 +134,14 @@ work to cheap worker models via `subagent`:
   entries, so the browser works during and after runs (even across extension
   reloads within the session).
 
+### Persistent token accounting
+
+Each completed in-process subagent publishes its aggregate token usage to the
+`token-tracker` extension. The `/tokens` command combines those records with
+main-session, tool, and compaction usage in a global append-only log, so reports
+can span sessions and arbitrary date ranges. Subagent turns are retained as
+individual API-call counts even though `/subagents` displays one run.
+
 ### `/subagents` browser
 
 In the TUI, `/subagents` opens a full-screen overlay (Esc to close) drawn as a

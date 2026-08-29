@@ -1,3 +1,4 @@
 # Local Pi data can contain personal context or worktree snapshots.
 /agent/memories.json
+/agent/token-usage.jsonl
 /agent/checkpoints/
