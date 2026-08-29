@@ -10,4 +10,4 @@ Commands:
 
 Build mode removes the `subagent` launch tool from the active tool set and blocks stale or in-flight launch calls through the `tool_call` event. Existing background runs can still be inspected with `subagent_status`/`subagent_wait`.
 
-The selected mode is persisted in the session and restored on startup. If Sol is unavailable when restoring orchestration mode, the extension safely falls back to build mode.
+The selected mode is shown beside the Vim editor mode in the input border (`BUILD` or `ORCHESTRATION`), persisted in the session, and restored on startup. If Sol is unavailable when restoring orchestration mode, the extension safely falls back to build mode.

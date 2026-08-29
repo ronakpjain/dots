@@ -14,14 +14,27 @@ export const ORCHESTRATION_MODEL_ID = "openai-codex/gpt-5.6-sol";
 export const SUBAGENT_LAUNCH_TOOL = "subagent";
 export const SUBAGENT_AUXILIARY_TOOLS = ["subagent_status", "subagent_wait"] as const;
 
-let currentWorkMode: WorkMode = DEFAULT_WORK_MODE;
+type SharedWorkModeState = {
+	current: WorkMode;
+};
+
+// Extensions are loaded through jiti with module caching disabled, so an
+// import of this module from two extensions can otherwise create two copies
+// of the mutable mode. Keep the source of truth on the process global so the
+// work-mode extension and the Vim editor always observe the same value.
+const WORK_MODE_STATE_KEY = Symbol.for("pi.work-mode.state");
+const globalState = globalThis as typeof globalThis & {
+	[WORK_MODE_STATE_KEY]?: SharedWorkModeState;
+};
+const workModeState =
+	globalState[WORK_MODE_STATE_KEY] ?? (globalState[WORK_MODE_STATE_KEY] = { current: DEFAULT_WORK_MODE });
 
 export function getWorkMode(): WorkMode {
-	return currentWorkMode;
+	return workModeState.current;
 }
 
 export function setWorkMode(mode: WorkMode): void {
-	currentWorkMode = mode;
+	workModeState.current = mode;
 }
 
 export function parseWorkMode(value: unknown): WorkMode | undefined {
