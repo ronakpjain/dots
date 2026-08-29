@@ -266,7 +266,6 @@ alias sioyek='openclose sioyek'
 alias kittycat='kitten icat'
 alias weather='curl wttr.in'
 alias maps='telnet mapscii.me'
-alias ssh='kitten ssh'
 alias :q='exit'
 alias :qa='killall kitty'
 
