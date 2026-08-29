@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
 import workModeExtension from "../extensions/work-mode/index.ts";
 import {
 	activeToolsForMode,
@@ -99,6 +100,7 @@ describe("work mode policy", () => {
 		expect(canLaunchSubagents("build")).toBe(false);
 		expect(canLaunchSubagents("orchestration")).toBe(true);
 		expect(modePrompt("orchestration")).toContain("Use the `subagent` tool aggressively");
+		expect(modePrompt("orchestration")).toContain("Always load and apply the full `subagent-orchestration` skill first");
 		expect(modePrompt("build")).toContain("Do not call the `subagent` launch tool");
 	});
 
@@ -130,8 +132,23 @@ describe("work mode policy", () => {
 		await runtime.handlers.get("thinking_level_select")!({ level: "high" }, runtime.ctx);
 		expect(runtime.thinking).toBe("low");
 
-		const prompt = await runtime.handlers.get("before_agent_start")!({ systemPrompt: "base" }, runtime.ctx);
+		const prompt = await runtime.handlers.get("before_agent_start")!(
+			{
+				systemPrompt: "base",
+				systemPromptOptions: {
+					skills: [
+						{
+							name: "subagent-orchestration",
+							filePath: resolve(process.cwd(), "agent/skills/subagent-orchestration/SKILL.md"),
+						},
+					],
+				},
+			},
+			runtime.ctx,
+		);
 		expect(prompt.systemPrompt).toContain("DELEGATE BY DEFAULT");
+		expect(prompt.systemPrompt).toContain("## FULL SUBAGENT-ORCHESTRATION SKILL LOADED");
+		expect(prompt.systemPrompt).toContain("Core rule: hand off context, not just a task");
 
 		await runtime.commands.get("mode")!.handler("build", runtime.ctx);
 		expect(runtime.activeTools).not.toContain("subagent");

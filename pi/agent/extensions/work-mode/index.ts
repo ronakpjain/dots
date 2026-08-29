@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	activeToolsForMode,
@@ -19,6 +20,9 @@ type WorkModeEntry = {
 	data?: unknown;
 };
 
+const ORCHESTRATION_SKILL_NAME = "subagent-orchestration";
+const ORCHESTRATION_SKILL_MARKER = "## FULL SUBAGENT-ORCHESTRATION SKILL LOADED";
+
 function restoredWorkMode(ctx: ExtensionContext): WorkMode | undefined {
 	const entries = ctx.sessionManager.getBranch() as WorkModeEntry[];
 	for (let index = entries.length - 1; index >= 0; index--) {
@@ -33,6 +37,31 @@ function restoredWorkMode(ctx: ExtensionContext): WorkMode | undefined {
 
 export default function workModeExtension(pi: ExtensionAPI): void {
 	let modelUpdateInProgress = false;
+
+	const orchestrationSkillPrompt = (event: {
+		systemPromptOptions?: { skills?: readonly { name: string; filePath: string }[] };
+	}): string => {
+		const skill = event.systemPromptOptions?.skills?.find(
+			(candidate) => candidate.name === ORCHESTRATION_SKILL_NAME,
+		);
+		if (!skill) {
+			return [
+				`\n\n[${ORCHESTRATION_SKILL_NAME} skill was not found in the loaded skill catalog.]`,
+				"Before taking any other action, load the skill from its location in the available-skills prompt with the read tool.",
+			].join("\n");
+		}
+
+		try {
+			const contents = readFileSync(skill.filePath, "utf8").trim();
+			if (!contents) throw new Error("skill file is empty");
+			return `\n\n${ORCHESTRATION_SKILL_MARKER}\n<skill name=\"${ORCHESTRATION_SKILL_NAME}\">\n${contents}\n</skill>`;
+		} catch {
+			return [
+				`\n\n[${ORCHESTRATION_SKILL_NAME} skill could not be read from ${skill.filePath}.]`,
+				"Before taking any other action, use the read tool to load that skill and follow it.",
+			].join("\n");
+		}
+	};
 
 	const updateModeUi = (ctx: ExtensionContext): void => {
 		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "(none)";
@@ -230,9 +259,17 @@ export default function workModeExtension(pi: ExtensionAPI): void {
 		updateModeUi(ctx);
 	});
 
-	pi.on("before_agent_start", async (event, ctx) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${modePromptFor(ctx)}`,
-	}));
+	pi.on("before_agent_start", async (event, ctx) => {
+		const mode = getWorkMode();
+		const modeInstructions = modePromptFor(ctx);
+		const skillInstructions =
+			mode === "orchestration" && !event.systemPrompt.includes(ORCHESTRATION_SKILL_MARKER)
+				? orchestrationSkillPrompt(event)
+				: "";
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${modeInstructions}${skillInstructions}`,
+		};
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		const restored = restoredWorkMode(ctx) ?? DEFAULT_WORK_MODE;

@@ -117,6 +117,8 @@ work to cheap worker models via `subagent`:
   a partial result is not completion.
 - Every session's system prompt includes these orchestration controls and the live
   cheapest configured model catalog, so the planner can choose workers deliberately.
+  In orchestration mode, the full `subagent-orchestration` skill is also loaded
+  before each task so context-rich handoff rules are available before delegation.
 - `/subagents` opens a live browser showing per-run cost, activity, and transcripts.
 
 ## Monitoring & inspection
