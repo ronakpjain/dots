@@ -1,8 +1,9 @@
 import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 import { uuidv7 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader, DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Text, matchesKey } from "@earendil-works/pi-tui";
+import type { Component, Keybinding, KeybindingsManager, TUI } from "@earendil-works/pi-tui";
+import { Markdown, TruncatedText, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 const MAX_CONTEXT_CHARS = 24_000;
 const MAX_ENTRY_CHARS = 6_000;
@@ -210,40 +211,279 @@ async function requestAnswer(
 	}
 }
 
-async function askWithLoader(ctx: ExtensionCommandContext, question: string, snapshot: string): Promise<BtwResult> {
+type PendingRequestLifecycle = {
+	register(cancel: () => void): void;
+	unregister(cancel: () => void): void;
+};
+
+/** Loader whose request signal is aborted whenever the loader is cancelled or disposed. */
+export class BtwLoader extends BorderedLoader {
+	private readonly requestController = new AbortController();
+	private readonly keybindings: KeybindingsManager;
+	private disposed = false;
+	onCancel?: () => void;
+	onDispose?: () => void;
+
+	constructor(tui: TUI, theme: Theme, keybindings: KeybindingsManager) {
+		super(tui, theme, "Thinking about your side question…");
+		this.keybindings = keybindings;
+		this.onAbort = () => this.cancel();
+	}
+
+	override get signal(): AbortSignal {
+		return this.requestController.signal;
+	}
+
+	get isDisposed(): boolean {
+		return this.disposed;
+	}
+
+	abortRequest(): void {
+		this.requestController.abort();
+	}
+
+	cancel(): void {
+		if (this.disposed) return;
+		this.abortRequest();
+		this.onCancel?.();
+	}
+
+	override handleInput(data: string): void {
+		if (this.disposed) return;
+		if (this.keybindings.matches(data, "tui.select.cancel") || matchesKey(data, "ctrl+c")) {
+			this.cancel();
+			return;
+		}
+		// Keep BorderedLoader's handling as a compatibility fallback for a host whose
+		// global manager differs from the injected manager.
+		super.handleInput(data);
+	}
+
+	override dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.abortRequest();
+		this.onDispose?.();
+		super.dispose();
+	}
+}
+
+const ANSWER_OVERLAY_MARGIN = 2;
+const ANSWER_OVERLAY_MAX_HEIGHT_RATIO = 0.75;
+
+function displayKey(key: string): string {
+	return (
+		(
+			{
+				up: "↑",
+				down: "↓",
+				left: "←",
+				right: "→",
+				pageUp: "PgUp",
+				pageDown: "PgDn",
+				home: "Home",
+				end: "End",
+				escape: "Esc",
+				esc: "Esc",
+				enter: "Enter",
+				return: "Enter",
+				"ctrl+c": "Ctrl+C",
+			} as Record<string, string>
+		)[key] ?? key
+	);
+}
+
+function bindingText(keybindings: KeybindingsManager, binding: Keybinding, fallback: string): string {
+	const keys = keybindings.getKeys(binding);
+	return keys.length > 0 ? keys.map((key) => displayKey(key)).join("/") : fallback;
+}
+
+/** Read-only markdown viewport for the answer overlay. */
+export class BtwAnswerViewer implements Component {
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly keybindings: KeybindingsManager;
+	private readonly question: string;
+	private readonly markdown: Markdown;
+	private readonly border: DynamicBorder;
+	private readonly onClose: () => void;
+	private answerLines: string[] = [];
+	private viewportHeight = 0;
+	private offset = 0;
+	private disposed = false;
+	private closeRequested = false;
+
+	constructor(
+		tui: TUI,
+		theme: Theme,
+		keybindings: KeybindingsManager,
+		question: string,
+		answer: string,
+		onClose: () => void,
+	) {
+		this.tui = tui;
+		this.theme = theme;
+		this.keybindings = keybindings;
+		this.question = question;
+		this.markdown = new Markdown(sanitizeText(answer), 1, 1, getMarkdownTheme());
+		this.border = new DynamicBorder((value: string) => theme.fg("accent", value));
+		this.onClose = onClose;
+	}
+
+	get scrollOffset(): number {
+		return this.offset;
+	}
+
+	get maxScrollOffset(): number {
+		return Math.max(0, this.answerLines.length - this.viewportHeight);
+	}
+
+	private maxOverlayHeight(): number {
+		const rows = Math.max(1, Math.floor(this.tui.terminal.rows || 1));
+		const availableHeight = Math.max(1, rows - ANSWER_OVERLAY_MARGIN * 2);
+		return Math.max(1, Math.min(Math.floor(rows * ANSWER_OVERLAY_MAX_HEIGHT_RATIO), availableHeight));
+	}
+
+	private matches(data: string, binding: Keybinding): boolean {
+		return this.keybindings.matches(data, binding);
+	}
+
+	private hint(): string {
+		const up = bindingText(this.keybindings, "tui.select.up", "↑");
+		const down = bindingText(this.keybindings, "tui.select.down", "↓");
+		const pageUp = bindingText(this.keybindings, "tui.select.pageUp", "PgUp");
+		const pageDown = bindingText(this.keybindings, "tui.select.pageDown", "PgDn");
+		const top = bindingText(this.keybindings, "tui.altScreen.top", "Home");
+		const bottom = bindingText(this.keybindings, "tui.altScreen.bottom", "End");
+		const confirm = bindingText(this.keybindings, "tui.select.confirm", "Enter");
+		const cancel = bindingText(this.keybindings, "tui.select.cancel", "Esc");
+		return `${up}/${down} scroll • ${pageUp}/${pageDown} page • ${top}/${bottom} jump • ${confirm} close • ${cancel} cancel`;
+	}
+
+	render(width: number): string[] {
+		if (this.disposed) return [];
+
+		const safeWidth = Math.max(1, Math.floor(width));
+		const top = this.border.render(safeWidth)[0] ?? "";
+		const title =
+			new TruncatedText(this.theme.fg("accent", this.theme.bold(`BTW · ${compact(this.question)}`)), 1, 0).render(
+				safeWidth,
+			)[0] ?? "";
+		const hint = new TruncatedText(this.theme.fg("dim", this.hint()), 1, 0).render(safeWidth)[0] ?? "";
+		const bottom = this.border.render(safeWidth)[0] ?? "";
+		const chrome = [top, title, hint, bottom];
+		const maxHeight = this.maxOverlayHeight();
+
+		// Very small terminals cannot fit the complete frame. Return only complete
+		// bounded lines rather than letting the overlay crop arbitrary content.
+		if (chrome.length >= maxHeight) {
+			this.answerLines = [];
+			this.viewportHeight = 0;
+			this.offset = 0;
+			return chrome.slice(0, maxHeight).map((line) => truncateToWidth(line, safeWidth, ""));
+		}
+
+		this.answerLines = this.markdown.render(safeWidth).map((line) => truncateToWidth(line, safeWidth, ""));
+		this.viewportHeight = maxHeight - chrome.length;
+		this.offset = Math.max(0, Math.min(this.offset, this.maxScrollOffset));
+
+		return [
+			top,
+			title,
+			...this.answerLines.slice(this.offset, this.offset + this.viewportHeight),
+			hint,
+			bottom,
+		].map((line) => truncateToWidth(line, safeWidth, ""));
+	}
+
+	private close(): void {
+		if (this.disposed || this.closeRequested) return;
+		this.closeRequested = true;
+		this.onClose();
+	}
+
+	handleInput(data: string): void {
+		if (this.disposed) return;
+		if (
+			this.matches(data, "tui.select.confirm") ||
+			this.matches(data, "tui.select.cancel") ||
+			matchesKey(data, "ctrl+c")
+		) {
+			this.close();
+			return;
+		}
+
+		const pageSize = Math.max(1, this.viewportHeight - 1);
+		let nextOffset = this.offset;
+		if (this.matches(data, "tui.select.up")) nextOffset = this.offset - 1;
+		else if (this.matches(data, "tui.select.down")) nextOffset = this.offset + 1;
+		else if (this.matches(data, "tui.select.pageUp")) nextOffset = this.offset - pageSize;
+		else if (this.matches(data, "tui.select.pageDown")) nextOffset = this.offset + pageSize;
+		else if (this.matches(data, "tui.altScreen.top")) nextOffset = 0;
+		else if (this.matches(data, "tui.altScreen.bottom")) nextOffset = this.maxScrollOffset;
+		else return;
+
+		nextOffset = Math.max(0, Math.min(nextOffset, this.maxScrollOffset));
+		if (nextOffset === this.offset) return;
+		this.offset = nextOffset;
+		this.tui.requestRender();
+	}
+
+	invalidate(): void {
+		this.markdown.invalidate();
+		this.border.invalidate();
+	}
+
+	dispose(): void {
+		this.disposed = true;
+		this.closeRequested = true;
+	}
+}
+
+async function askWithLoader(
+	ctx: ExtensionCommandContext,
+	question: string,
+	snapshot: string,
+	lifecycle?: PendingRequestLifecycle,
+): Promise<BtwResult> {
 	if (ctx.mode !== "tui") {
 		return requestAnswer(ctx, question, snapshot, new AbortController().signal);
 	}
 
-	const controller = new AbortController();
-	const result = await ctx.ui.custom<BtwResult | undefined>(
-		(tui, theme, _keybindings, done) => {
-			const loader = new BorderedLoader(tui, theme, "Thinking about your side question…");
-			let finished = false;
+	let cancelPending: (() => void) | undefined;
+	try {
+		const result = await ctx.ui.custom<BtwResult | undefined>(
+			(tui, theme, keybindings, done) => {
+				const loader = new BtwLoader(tui, theme, keybindings);
+				let finished = false;
 
-			const finish = (value: BtwResult): void => {
-				if (finished) return;
-				finished = true;
-				done(value);
-			};
+				const finish = (value: BtwResult): void => {
+					if (finished || loader.isDisposed) return;
+					finished = true;
+					if (value.cancelled) loader.abortRequest();
+					done(value);
+				};
 
-			loader.onAbort = () => {
-				controller.abort();
-				finish({ cancelled: true });
-			};
+				cancelPending = () => finish({ cancelled: true });
+				lifecycle?.register(cancelPending);
+				loader.onCancel = cancelPending;
+				loader.onDispose = () => lifecycle?.unregister(cancelPending!);
 
-			void requestAnswer(ctx, question, snapshot, controller.signal).then(finish, (error) =>
-				finish({ error: errorText(error) }),
-			);
-			return loader;
-		},
-		{
-			overlay: true,
-			overlayOptions: { anchor: "top-center", width: "60%", maxHeight: "30%", margin: 2 },
-		},
-	);
+				void requestAnswer(ctx, question, snapshot, loader.signal).then(finish, (error) =>
+					finish({ error: errorText(error) }),
+				);
+				return loader;
+			},
+			{
+				overlay: true,
+				overlayOptions: { anchor: "top-center", width: "60%", maxHeight: "30%", margin: 2 },
+			},
+		);
 
-	return result ?? { cancelled: true };
+		return result ?? { cancelled: true };
+	} finally {
+		if (cancelPending) lifecycle?.unregister(cancelPending);
+	}
 }
 
 async function showAnswer(ctx: ExtensionCommandContext, question: string, answer: string): Promise<void> {
@@ -253,33 +493,31 @@ async function showAnswer(ctx: ExtensionCommandContext, question: string, answer
 	}
 
 	await ctx.ui.custom<void>(
-		(_tui, theme, _keybindings, done) => {
-			const container = new Container();
-			const border = new DynamicBorder((value: string) => theme.fg("accent", value));
-			const markdown = new Markdown(sanitizeText(answer), 1, 1, getMarkdownTheme());
-
-			container.addChild(border);
-			container.addChild(new Text(theme.fg("accent", theme.bold(`BTW · ${compact(question)}`)), 1, 0));
-			container.addChild(markdown);
-			container.addChild(new Text(theme.fg("dim", "Press Enter or Esc to close"), 1, 0));
-			container.addChild(border);
-
-			return {
-				render: (width: number) => container.render(width),
-				invalidate: () => container.invalidate(),
-				handleInput: (data: string) => {
-					if (matchesKey(data, "enter") || matchesKey(data, "escape")) done();
-				},
-			};
-		},
+		(tui, theme, keybindings, done) => new BtwAnswerViewer(tui, theme, keybindings, question, answer, done),
 		{
 			overlay: true,
-			overlayOptions: { anchor: "top-center", width: "80%", maxHeight: "75%", margin: 2 },
+			overlayOptions: { anchor: "top-center", width: "80%", maxHeight: "75%", margin: ANSWER_OVERLAY_MARGIN },
 		},
 	);
 }
 
 export default function btwExtension(pi: ExtensionAPI): void {
+	const cancelPendingRequests = new Set<() => void>();
+	const pendingRequestLifecycle: PendingRequestLifecycle = {
+		register: (cancel) => {
+			cancelPendingRequests.add(cancel);
+		},
+		unregister: (cancel) => {
+			cancelPendingRequests.delete(cancel);
+		},
+	};
+
+	pi.on("session_shutdown", () => {
+		const cancels = [...cancelPendingRequests];
+		cancelPendingRequests.clear();
+		for (const cancel of cancels) cancel();
+	});
+
 	pi.on("before_agent_start", (event) => ({
 		systemPrompt: `${event.systemPrompt}\n\n${BTW_CAPABILITY}`,
 	}));
@@ -316,7 +554,7 @@ export default function btwExtension(pi: ExtensionAPI): void {
 
 			const entries = ctx.sessionManager.buildContextEntries();
 			const snapshot = buildConversationSnapshot(entries);
-			const result = await askWithLoader(ctx, question, snapshot);
+			const result = await askWithLoader(ctx, question, snapshot, pendingRequestLifecycle);
 
 			if (result.cancelled) return;
 			if (result.error) {

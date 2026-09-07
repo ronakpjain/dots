@@ -1,5 +1,31 @@
 import { describe, expect, test } from "bun:test";
-import btwExtension, { buildConversationSnapshot, extractAnswer } from "../extensions/btw.ts";
+import { initTheme } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import btwExtension, {
+	BtwAnswerViewer,
+	BtwLoader,
+	buildConversationSnapshot,
+	extractAnswer,
+} from "../extensions/btw.ts";
+
+function testKeybindings(overrides: Record<string, string>): any {
+	return {
+		matches: (data: string, binding: string) => overrides[binding] === data,
+		getKeys: (binding: string) => (overrides[binding] ? [overrides[binding]] : []),
+	};
+}
+
+const testTheme = {
+	fg: (_color: string, text: string) => text,
+	bold: (text: string) => text,
+};
+
+function testTui(rows = 16): any {
+	return {
+		terminal: { columns: 80, rows },
+		requestRender: () => {},
+	};
+}
 
 describe("btw helpers", () => {
 	test("builds a bounded snapshot from user, assistant, and tool messages", () => {
@@ -54,6 +80,120 @@ describe("btw helpers", () => {
 	});
 });
 
+describe("btw answer viewer", () => {
+	test("scrolls by line, page, and home/end bindings", () => {
+		const keybindings = testKeybindings({
+			"tui.select.up": "up",
+			"tui.select.down": "down",
+			"tui.select.pageUp": "pageUp",
+			"tui.select.pageDown": "pageDown",
+			"tui.altScreen.top": "home",
+			"tui.altScreen.bottom": "end",
+			"tui.select.confirm": "enter",
+			"tui.select.cancel": "escape",
+		});
+		const viewer = new BtwAnswerViewer(
+			testTui(),
+			testTheme as any,
+			keybindings,
+			"A long answer",
+			Array.from({ length: 40 }, (_, index) => `line ${index}`).join("\\n"),
+			() => {},
+		);
+
+		viewer.render(40);
+		expect(viewer.scrollOffset).toBe(0);
+		viewer.handleInput("down");
+		expect(viewer.scrollOffset).toBe(1);
+		viewer.handleInput("pageDown");
+		expect(viewer.scrollOffset).toBeGreaterThan(1);
+		viewer.handleInput("end");
+		expect(viewer.scrollOffset).toBe(viewer.maxScrollOffset);
+		viewer.handleInput("pageUp");
+		expect(viewer.scrollOffset).toBeLessThan(viewer.maxScrollOffset);
+		viewer.handleInput("home");
+		expect(viewer.scrollOffset).toBe(0);
+	});
+
+	test("keeps rendered lines within width across resize and narrow terminals", () => {
+		const keybindings = testKeybindings({
+			"tui.select.up": "up",
+			"tui.select.down": "down",
+			"tui.select.pageUp": "pageUp",
+			"tui.select.pageDown": "pageDown",
+			"tui.altScreen.top": "home",
+			"tui.altScreen.bottom": "end",
+			"tui.select.confirm": "enter",
+			"tui.select.cancel": "escape",
+		});
+		const tui = testTui(16);
+		const viewer = new BtwAnswerViewer(
+			tui,
+			testTheme as any,
+			keybindings,
+			"Question",
+			Array.from({ length: 30 }, (_, index) => `content ${index} ` + "x".repeat(30)).join("\\n"),
+			() => {},
+		);
+
+		for (const width of [1, 7, 20, 80]) {
+			for (const line of viewer.render(width)) {
+				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			}
+		}
+
+		viewer.handleInput("end");
+		tui.terminal.rows = 6;
+		for (const line of viewer.render(20)) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(20);
+		}
+		expect(viewer.render(20).length).toBeLessThanOrEqual(2);
+	});
+
+	test("uses configured confirm/cancel bindings and always accepts Ctrl+C", () => {
+		const keybindings = testKeybindings({
+			"tui.select.up": "up",
+			"tui.select.down": "down",
+			"tui.select.pageUp": "pageUp",
+			"tui.select.pageDown": "pageDown",
+			"tui.altScreen.top": "home",
+			"tui.altScreen.bottom": "end",
+			"tui.select.confirm": "y",
+			"tui.select.cancel": "n",
+		});
+		let closes = 0;
+		const makeViewer = () =>
+			new BtwAnswerViewer(testTui(), testTheme as any, keybindings, "Question", "Answer", () => closes++);
+		const confirmed = makeViewer();
+		confirmed.render(40);
+		confirmed.handleInput("y");
+		confirmed.handleInput("y");
+		confirmed.handleInput("n");
+		confirmed.handleInput("\x03");
+		expect(closes).toBe(1);
+
+		const cancelled = makeViewer();
+		cancelled.render(40);
+		cancelled.handleInput("n");
+		const interrupted = makeViewer();
+		interrupted.render(40);
+		interrupted.handleInput("\x03");
+		expect(closes).toBe(3);
+	});
+
+	test("aborts the request signal and disposal hook only once", () => {
+		initTheme("dark");
+		const loader = new BtwLoader(testTui(), testTheme as any, testKeybindings({ "tui.select.cancel": "escape" }));
+		let disposals = 0;
+		loader.onDispose = () => disposals++;
+		expect(loader.signal.aborted).toBe(false);
+		loader.dispose();
+		loader.dispose();
+		expect(loader.signal.aborted).toBe(true);
+		expect(disposals).toBe(1);
+	});
+});
+
 describe("btw command", () => {
 	test("answers through the side channel without injecting a main-session message", async () => {
 		let handler: ((args: string, ctx: any) => Promise<void>) | undefined;
@@ -92,6 +232,70 @@ describe("btw command", () => {
 
 		expect(sentMessage).toBe(false);
 		expect(notifications).toEqual(["BTW: A side answer."]);
+	});
+
+	test("aborts overlapping requests during session shutdown without late done calls", async () => {
+		initTheme("dark");
+		let handler: ((args: string, ctx: any) => Promise<void>) | undefined;
+		let shutdown: (() => void) | undefined;
+		const requestSignals: AbortSignal[] = [];
+		const resolveRequests: ((result: any) => void)[] = [];
+		let doneCalls = 0;
+		const components: any[] = [];
+
+		btwExtension({
+			on: (event: string, callback: () => void) => {
+				if (event === "session_shutdown") shutdown = callback;
+			},
+			registerCommand: (_name: string, spec: { handler: (args: string, ctx: any) => Promise<void> }) => {
+				handler = spec.handler;
+			},
+		} as any);
+
+		const keybindings = testKeybindings({ "tui.select.cancel": "escape" });
+		const ctx = {
+			mode: "tui",
+			hasUI: true,
+			cwd: "/tmp/project",
+			model: { provider: "fake", id: "model" },
+			modelRegistry: {
+				hasConfiguredAuth: () => true,
+				complete: async (_model: any, _request: any, options: { signal: AbortSignal }) => {
+					requestSignals.push(options.signal);
+					return new Promise((resolve) => resolveRequests.push(resolve));
+				},
+			},
+			sessionManager: { buildContextEntries: () => [] },
+			ui: {
+				notify: () => {},
+				custom: async (factory: any) =>
+					new Promise((resolve) => {
+						let component: any;
+						component = factory(testTui(), testTheme, keybindings, (value: any) => {
+							doneCalls++;
+							component.dispose?.();
+							resolve(value);
+						});
+						components.push(component);
+					}),
+			},
+		};
+
+		const first = handler!("What is pending one?", ctx);
+		const second = handler!("What is pending two?", ctx);
+		await Promise.resolve();
+		expect(requestSignals).toHaveLength(2);
+		shutdown!();
+		expect(requestSignals.every((signal) => signal.aborted)).toBe(true);
+		await Promise.all([first, second]);
+		expect(doneCalls).toBe(2);
+
+		for (const resolveRequest of resolveRequests) {
+			resolveRequest({ stopReason: "stop", content: [{ type: "text", text: "late answer" }] });
+		}
+		await Promise.resolve();
+		expect(doneCalls).toBe(2);
+		expect(components).toHaveLength(2);
 	});
 
 	test("shows usage when no question is supplied and no UI is available", async () => {
