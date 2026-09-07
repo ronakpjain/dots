@@ -427,6 +427,26 @@ def point_to_rect_boundary_distance(point: Point, rect: Rect) -> float:
     return math.hypot(dx, dy)
 
 
+def point_to_rect_distance(point: Point, rect: Rect) -> float:
+    dx = max(rect.x - point.x, 0.0, point.x - rect.right)
+    dy = max(rect.y - point.y, 0.0, point.y - rect.bottom)
+    return math.hypot(dx, dy)
+
+
+def point_to_segment_distance(point: Point, first: Point, second: Point) -> float:
+    dx = second.x - first.x
+    dy = second.y - first.y
+    length_squared = dx * dx + dy * dy
+    if length_squared <= EPSILON:
+        return math.hypot(point.x - first.x, point.y - first.y)
+    fraction = (
+        (point.x - first.x) * dx + (point.y - first.y) * dy
+    ) / length_squared
+    fraction = min(1.0, max(0.0, fraction))
+    nearest = Point(first.x + fraction * dx, first.y + fraction * dy)
+    return math.hypot(point.x - nearest.x, point.y - nearest.y)
+
+
 def segment_intersects_rect(a: Point, b: Point, rect: Rect) -> bool:
     """Liang-Barsky segment/rectangle intersection."""
     dx = b.x - a.x
@@ -486,6 +506,56 @@ def segments_intersect(a: Point, b: Point, c: Point, d: Point) -> bool:
         and on_segment(c, d, a)
         or abs(o4) <= EPSILON
         and on_segment(c, d, b)
+    )
+
+
+def segment_to_rect_distance(first: Point, second: Point, rect: Rect) -> float:
+    if segment_intersects_rect(first, second, rect):
+        return 0.0
+    corners = (
+        Point(rect.x, rect.y),
+        Point(rect.right, rect.y),
+        Point(rect.right, rect.bottom),
+        Point(rect.x, rect.bottom),
+    )
+    return min(
+        point_to_rect_distance(first, rect),
+        point_to_rect_distance(second, rect),
+        *(point_to_segment_distance(corner, first, second) for corner in corners),
+    )
+
+
+def route_to_rect_distance(route: Sequence[Point], rect: Rect) -> float:
+    return min(
+        (segment_to_rect_distance(first, second, rect) for first, second in segments(route)),
+        default=math.inf,
+    )
+
+
+def collinear_overlap_length(
+    first_a: Point,
+    first_b: Point,
+    second_a: Point,
+    second_b: Point,
+) -> float:
+    """Return the positive shared length of two collinear segments."""
+    if (
+        abs(orientation(first_a, first_b, second_a)) > EPSILON
+        or abs(orientation(first_a, first_b, second_b)) > EPSILON
+    ):
+        return 0.0
+    dx = abs(first_b.x - first_a.x)
+    dy = abs(first_b.y - first_a.y)
+    if dx >= dy:
+        return max(
+            0.0,
+            min(max(first_a.x, first_b.x), max(second_a.x, second_b.x))
+            - max(min(first_a.x, first_b.x), min(second_a.x, second_b.x)),
+        )
+    return max(
+        0.0,
+        min(max(first_a.y, first_b.y), max(second_a.y, second_b.y))
+        - max(min(first_a.y, first_b.y), min(second_a.y, second_b.y)),
     )
 
 
@@ -1510,9 +1580,21 @@ class Validator:
                         )
                 continue
 
-            # Edge labels are intentionally drawn over their own connector
-            # stroke in draw.io.  They still must stay between boxes and away
-            # from arrowheads and unrelated connectors.
+            # Edge labels are intentionally drawn over or immediately beside
+            # their own connector. They must not drift into otherwise empty
+            # space, boxes, arrowheads, or unrelated connectors.
+            owner_route = routes.get(owner_id)
+            if owner_route is not None:
+                distance = route_to_rect_distance(owner_route, label_rect)
+                if distance > self.args.edge_label_distance:
+                    self.add(
+                        "error",
+                        "edge-label-detached",
+                        f"edge label is {distance:.1f}px from its connector {owner_id!r}",
+                        page.name,
+                        label_id,
+                    )
+
             for box_id, box_rect in box_rects.items():
                 if positive_overlap(label_rect, box_rect):
                     self.add(
@@ -1561,6 +1643,47 @@ class Validator:
                         label_id,
                     )
                     reported_arrow_edges.add(arrow_edge_id)
+                    break
+
+        # A left/right-aligned standalone annotation placed immediately beside
+        # a shape boundary is normally a boundary label (for example, a memory
+        # address). Its text center should sit on that horizontal boundary.
+        for cell_id in page.vertex_ids:
+            cell = page.cells[cell_id]
+            styles = style_map(cell.get("style", ""))
+            if (
+                not is_text_cell(cell)
+                or is_edge_label_cell(page, cell_id)
+                or page.parents.get(cell_id) not in {"1", None}
+                or styles.get("align") not in {"left", "right"}
+                or not has_label_content(cell.get("value", ""))
+            ):
+                continue
+            group = groups.get(cell_id)
+            if group is None:
+                continue
+            annotation = union_rects(rendered_label_bboxes(group, cell_id))
+            if annotation is None:
+                continue
+            for box_id, box_rect in box_rects.items():
+                horizontal_gap = min(
+                    abs(annotation.right - box_rect.x),
+                    abs(annotation.x - box_rect.right),
+                )
+                if horizontal_gap > self.args.annotation_boundary_gap:
+                    continue
+                boundary_delta = min(
+                    abs(annotation.center.y - box_rect.y),
+                    abs(annotation.center.y - box_rect.bottom),
+                )
+                if self.args.alignment_tolerance < boundary_delta <= 20.0:
+                    self.add(
+                        "warning",
+                        "boundary-label-misaligned",
+                        f"annotation center is {boundary_delta:.1f}px from the nearby boundary of box {box_id!r}",
+                        page.name,
+                        cell_id,
+                    )
                     break
 
     def validate_file(self, path: Path) -> Report:
@@ -1895,11 +2018,17 @@ class Validator:
                         label,
                         cell_id,
                     )
-                if source == target:
+                if (
+                    source == target
+                    and style_map(element.get("style", "")).get(
+                        "validationAllowSelfLoop"
+                    )
+                    != "1"
+                ):
                     self.add(
                         "warning",
                         "self-loop",
-                        "edge source and target are the same shape",
+                        "edge source and target are the same shape; add validationAllowSelfLoop=1 after reviewing its rendered route",
                         label,
                         cell_id,
                     )
@@ -2024,7 +2153,25 @@ class Validator:
             second = page.cells[second_id]
             first_endpoints = {first.get("source"), first.get("target")}
             second_endpoints = {second.get("source"), second.get("target")}
-            if first_endpoints & second_endpoints:
+            shared_endpoints = first_endpoints & second_endpoints
+            overlap = max(
+                (
+                    collinear_overlap_length(a, b, c, d)
+                    for a, b in segments(routes[first_id])
+                    for c, d in segments(routes[second_id])
+                ),
+                default=0.0,
+            )
+            if overlap > self.args.edge_overlap_tolerance:
+                self.add(
+                    "warning",
+                    "edge-overlap",
+                    f"edge routes share {overlap:.1f}px: {first_id!r} and {second_id!r}",
+                    page.name,
+                    first_id,
+                )
+                continue
+            if shared_endpoints:
                 continue
             if any(
                 segments_intersect(a, b, c, d)
@@ -2201,6 +2348,40 @@ class Validator:
                         edge_id,
                     )
 
+            for endpoint_kind, endpoint, endpoint_id, endpoint_rect in (
+                ("source", route[0], source, source_rect),
+                ("target", route[-1], target, target_rect),
+            ):
+                if endpoint_rect is None or endpoint_id is None:
+                    continue
+                endpoint_cell = page.cells.get(endpoint_id)
+                endpoint_style = (
+                    endpoint_cell.get("style", "") if endpoint_cell is not None else ""
+                )
+                endpoint_styles = style_map(endpoint_style)
+                if (
+                    endpoint_styles.get("shape") in {"ellipse", "rhombus"}
+                    or has_style_token(endpoint_style, "ellipse")
+                    or has_style_token(endpoint_style, "rhombus")
+                ):
+                    continue
+                near_horizontal_corner = min(
+                    abs(endpoint.x - endpoint_rect.x),
+                    abs(endpoint.x - endpoint_rect.right),
+                ) <= self.args.corner_tolerance
+                near_vertical_corner = min(
+                    abs(endpoint.y - endpoint_rect.y),
+                    abs(endpoint.y - endpoint_rect.bottom),
+                ) <= self.args.corner_tolerance
+                if near_horizontal_corner and near_vertical_corner:
+                    self.add(
+                        "warning",
+                        "edge-endpoint-at-corner",
+                        f"rendered {endpoint_kind} endpoint attaches at a corner of shape {endpoint_id!r}",
+                        page.name,
+                        edge_id,
+                    )
+
             for first, second in segments(route):
                 for vertex_id, rect in rendered_rects.items():
                     if not is_box_cell(page, vertex_id):
@@ -2289,6 +2470,36 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="allowed rendered label overflow beyond its owning box in pixels (default: 1)",
+    )
+    parser.add_argument(
+        "--edge-label-distance",
+        type=float,
+        default=12.0,
+        help="maximum gap between an edge label and its own connector in pixels (default: 12)",
+    )
+    parser.add_argument(
+        "--edge-overlap-tolerance",
+        type=float,
+        default=4.0,
+        help="allowed collinear overlap between connector routes in pixels (default: 4)",
+    )
+    parser.add_argument(
+        "--corner-tolerance",
+        type=float,
+        default=4.0,
+        help="distance from both sides treated as a connector attached at a box corner (default: 4)",
+    )
+    parser.add_argument(
+        "--annotation-boundary-gap",
+        type=float,
+        default=40.0,
+        help="maximum gap used to identify standalone boundary annotations (default: 40)",
+    )
+    parser.add_argument(
+        "--alignment-tolerance",
+        type=float,
+        default=3.0,
+        help="allowed boundary-label center misalignment in pixels (default: 3)",
     )
     parser.add_argument(
         "--allow-floating",

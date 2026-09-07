@@ -147,9 +147,10 @@ Checks include:
 - positive-area overlap between unrelated visible boxes/shapes;
 - XML-estimated edge routes intersecting unrelated boxes;
 - crossings between unrelated edge routes as warnings;
-- actual SVG-rendered shape bounds and edge routes, including disconnected endpoints and rendered edge/box collisions;
+- actual SVG-rendered shape bounds and edge routes, including disconnected endpoints, awkward box-corner attachments, rendered edge/box collisions, and collinear connector overlaps;
 - rendered vertex labels staying inside their owning boxes, including HTML labels and explicitly parented text labels;
-- edge-label collisions with visible boxes, arrowheads, and unrelated connector routes (while allowing an edge label to sit on its own main stroke). Standalone `text` vertices remain annotations unless they are explicitly parented to a box.
+- edge labels staying on or close to their own connector and avoiding visible boxes, arrowheads, and unrelated connector routes (while allowing a label to sit on its own main stroke);
+- nearby left/right-aligned standalone boundary annotations (such as memory addresses) lining up with the shape boundary they describe. Other standalone `text` vertices remain annotations unless they are explicitly parented to a box.
 
 Use `--no-render` only when draw.io is unavailable or when a fast XML/static-geometry check is specifically desired; label placement and label collision checks use rendered SVG geometry. Use `--allow-floating` only for diagrams that intentionally contain floating connectors. `--strict` turns warnings (including edge crossings and intentional-quality concerns) into failures. `--render-dir DIR` keeps the generated per-page SVGs for debugging; otherwise they are temporary. `--label-tolerance N` controls the permitted rendered label overflow beyond a box (default: 1 pixel).
 
