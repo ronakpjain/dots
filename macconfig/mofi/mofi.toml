@@ -4,3 +4,6 @@ border = "#fab387"
 text = "#fab387"
 selected_bg = "#fab387"
 selected_text = "#1e1e2e"
+
+[aliases]
+Helium = "/usr/bin/open -a /Applications/Helium.app --args --remote-debugging-port=9222 '--user-data-dir=/Users/ronak/Library/Application Support/net.imput.helium' --profile-directory=Default"
