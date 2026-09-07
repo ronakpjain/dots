@@ -5,6 +5,7 @@ import fastModeExtension, {
 	FAST_MODE_COMMAND,
 	FAST_MODE_SERVICE_TIER,
 	FAST_MODE_SHORTCUT,
+	isLunaModel,
 	isOpenAIModel,
 } from "../extensions/fast-mode.ts";
 
@@ -20,7 +21,7 @@ type TestRuntime = {
 	ctx: Record<string, any>;
 };
 
-function testRuntime(model: Record<string, unknown> = { provider: "openai-codex", id: "gpt-5.6-luna" }): TestRuntime {
+function testRuntime(model: Record<string, unknown> = { provider: "openai-codex", id: "gpt-5.6-sol" }): TestRuntime {
 	const runtime = {
 		handlers: new Map<string, Handler>(),
 		commands: new Map<string, { handler: Handler }>(),
@@ -61,6 +62,14 @@ describe("OpenAI fast mode", () => {
 		expect(isOpenAIModel(undefined)).toBe(false);
 	});
 
+	test("identifies Luna only on native OpenAI models", () => {
+		expect(isLunaModel({ provider: "openai-codex", id: "gpt-5.6-luna" })).toBe(true);
+		expect(isLunaModel({ provider: "openai", name: "GPT 5.6 Luna" })).toBe(true);
+		expect(isLunaModel({ provider: "openai-codex", id: "gpt-5.6-sol" })).toBe(false);
+		expect(isLunaModel({ provider: "openrouter", id: "gpt-5.6-luna" })).toBe(false);
+		expect(isLunaModel({ provider: "anthropic", id: "claude-luna" })).toBe(false);
+	});
+
 	test("adds priority service tier without mutating the original payload", () => {
 		const payload = { model: "gpt-5.6-luna" };
 		const result = applyFastMode(payload, true) as Record<string, unknown>;
@@ -75,6 +84,26 @@ describe("OpenAI fast mode", () => {
 
 		expect(result).toEqual({ model: "gpt-5.6-luna" });
 		expect(payload.service_tier).toBe(FAST_MODE_SERVICE_TIER);
+	});
+
+	test("automatically enforces fast mode for Luna even when manually disabled", async () => {
+		const runtime = testRuntime({ provider: "openai-codex", id: "gpt-5.6-luna" });
+		fastModeExtension(runtime.pi as never);
+		await runtime.handlers.get("session_start")!({}, runtime.ctx);
+
+		expect(runtime.statuses.get("fast-mode")).toBe("⚡ fast (Luna enforced)");
+		expect(await requestPayload(runtime, { model: "gpt-5.6-luna", service_tier: "default" })).toEqual({
+			model: "gpt-5.6-luna",
+			service_tier: FAST_MODE_SERVICE_TIER,
+		});
+
+		await runtime.commands.get(FAST_MODE_COMMAND)!.handler("off", runtime.ctx);
+		expect(runtime.statuses.get("fast-mode")).toBe("⚡ fast (Luna enforced)");
+		expect(runtime.notifications.at(-1)).toContain("always uses fast mode");
+		expect(await requestPayload(runtime, { model: "gpt-5.6-luna" })).toHaveProperty(
+			"service_tier",
+			FAST_MODE_SERVICE_TIER,
+		);
 	});
 
 	test("toggles request rewriting and exposes the command and shortcut", async () => {

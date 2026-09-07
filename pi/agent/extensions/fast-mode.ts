@@ -10,6 +10,8 @@ const FAST_MODE_STATUS = "fast-mode";
 type ModelLike = {
 	provider?: unknown;
 	api?: unknown;
+	id?: unknown;
+	name?: unknown;
 };
 
 type RequestPayload = Record<string, unknown>;
@@ -21,6 +23,13 @@ function isRecord(value: unknown): value is RequestPayload {
 /** Native OpenAI endpoints support the priority service tier. */
 export function isOpenAIModel(model: ModelLike | undefined): boolean {
 	return model?.provider === "openai" || model?.provider === "openai-codex";
+}
+
+/** Native OpenAI models whose name/id identifies them as Luna always use fast mode. */
+export function isLunaModel(model: ModelLike | undefined): boolean {
+	if (model === undefined || !isOpenAIModel(model)) return false;
+	const identifiers = [model.id, model.name];
+	return identifiers.some((value) => typeof value === "string" && /(?:^|[^a-z0-9])luna(?:$|[^a-z0-9])/i.test(value));
 }
 
 /** Apply or remove only this extension's priority service-tier override. */
@@ -40,20 +49,33 @@ export function applyFastMode(payload: unknown, enabled: boolean): unknown {
 export default function fastModeExtension(pi: ExtensionAPI): void {
 	let enabled = false;
 
+	function isEffective(ctx: ExtensionContext): boolean {
+		return enabled || isLunaModel(ctx.model);
+	}
+
 	function updateStatus(ctx: ExtensionContext): void {
-		if (!enabled) {
+		if (!isEffective(ctx)) {
 			ctx.ui.setStatus(FAST_MODE_STATUS, undefined);
 			return;
 		}
 
-		ctx.ui.setStatus(FAST_MODE_STATUS, isOpenAIModel(ctx.model) ? "⚡ fast" : "⚡ fast (OpenAI only)");
+		const status = isLunaModel(ctx.model)
+			? "⚡ fast (Luna enforced)"
+			: isOpenAIModel(ctx.model)
+				? "⚡ fast"
+				: "⚡ fast (OpenAI only)";
+		ctx.ui.setStatus(FAST_MODE_STATUS, status);
 	}
 
 	function toggle(ctx: ExtensionContext): void {
 		enabled = !enabled;
 		updateStatus(ctx);
 
-		const scope = isOpenAIModel(ctx.model) ? "" : " (applies when an OpenAI model is selected)";
+		const scope = !isOpenAIModel(ctx.model)
+			? " (applies when an OpenAI model is selected)"
+			: isLunaModel(ctx.model)
+				? "; Luna always uses fast mode"
+				: "";
 		ctx.ui.notify(`OpenAI fast mode ${enabled ? "enabled" : "disabled"}${scope}.`, "info");
 	}
 
@@ -69,10 +91,20 @@ export default function fastModeExtension(pi: ExtensionAPI): void {
 			case "disable":
 				enabled = false;
 				updateStatus(ctx);
-				ctx.ui.notify("OpenAI fast mode disabled.", "info");
+				ctx.ui.notify(
+					isLunaModel(ctx.model)
+						? "OpenAI fast mode disabled; Luna always uses fast mode."
+						: "OpenAI fast mode disabled.",
+					"info",
+				);
 				return;
 			case "status":
-				ctx.ui.notify(`OpenAI fast mode is ${enabled ? "enabled" : "disabled"}.`, "info");
+				ctx.ui.notify(
+					`OpenAI fast mode is ${isEffective(ctx) ? "enabled" : "disabled"}${
+						!enabled && isLunaModel(ctx.model) ? " (Luna enforced)" : ""
+					}.`,
+					"info",
+				);
 				return;
 			default:
 				toggle(ctx);
@@ -94,7 +126,7 @@ export default function fastModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("before_provider_request", (event, ctx) => {
 		if (!isOpenAIModel(ctx.model)) return;
-		return applyFastMode(event.payload, enabled);
+		return applyFastMode(event.payload, isEffective(ctx));
 	});
 
 	pi.on("model_select", (_event, ctx) => {
