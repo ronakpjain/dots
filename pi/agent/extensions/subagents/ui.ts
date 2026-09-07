@@ -8,7 +8,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	Key,
@@ -43,6 +43,8 @@ export interface RunActivity {
 export interface LiveRun {
 	runId: string;
 	groupId: string;
+	/** Planned number of runs in this invocation group (display-only). */
+	groupSize?: number;
 	kind: "single" | "parallel" | "chain";
 	step?: number;
 	name: string;
@@ -59,6 +61,44 @@ export interface LiveRun {
 	stopReason?: string;
 	errorMessage?: string;
 	sessionId?: string;
+	/** True when the persisted transcript was capped before storage. */
+	transcriptTruncated?: boolean;
+}
+
+/** Fields searched by `/subagents`; optional fields keep legacy records safe. */
+export interface RunFilterRecord {
+	name?: unknown;
+	model?: unknown;
+	task?: unknown;
+	kind?: unknown;
+	status?: unknown;
+	stopReason?: unknown;
+	groupId?: unknown;
+	sessionId?: unknown;
+}
+
+/** Match every whitespace-separated term against any searchable run field. */
+export function runMatchesFilter(run: RunFilterRecord, filter: string): boolean {
+	const terms = filter
+		.trim()
+		.toLowerCase()
+		.split(/\s+/)
+		.filter(Boolean);
+	if (terms.length === 0) return true;
+
+	const fields = [
+		run.name,
+		run.model,
+		run.task,
+		run.kind,
+		run.status,
+		run.stopReason,
+		run.groupId,
+		run.sessionId,
+	]
+		.filter((value): value is string | number | boolean => value !== undefined && value !== null)
+		.map((value) => String(value).toLowerCase());
+	return terms.every((term) => fields.some((field) => field.includes(term)));
 }
 
 // ---------------------------------------------------------------------------
@@ -263,9 +303,10 @@ export function renderLiveDashboard(live: LiveRun[], expanded: boolean, theme: T
 			r.status === "running" ? "accent" : r.status === "ok" ? "success" : "error";
 		const elapsed = formatElapsed((r.status === "running" ? Date.now() : (r.endTime ?? Date.now())) - r.startTime);
 		const stop = r.stopReason && r.status !== "running" ? ` ${theme.fg("warning", `[${r.stopReason}]`)}` : "";
+		const group = r.groupSize ? ` · ${groupContext(r, live)}` : "";
 		container.addChild(
 			new Text(
-				`${icon} ${theme.fg(color, runDisplayName(r))}${stop} · ${theme.fg("dim", r.model)} · ${theme.fg("dim", elapsed)}`,
+				`${icon} ${theme.fg(color, runDisplayName(r))}${stop} · ${theme.fg("dim", r.model)} · ${theme.fg("dim", elapsed)}${theme.fg("dim", group)}`,
 				0,
 				0,
 			),
@@ -290,7 +331,8 @@ export function liveDashboardText(live: LiveRun[]): string {
 	for (const r of live) {
 		const icon = statusIcon(r.status);
 		const elapsed = formatElapsed((r.status === "running" ? Date.now() : (r.endTime ?? Date.now())) - r.startTime);
-		lines.push(`${icon} ${runDisplayName(r)} [${r.model}] ${elapsed}`);
+		const group = r.groupSize ? ` · ${groupContext(r, live)}` : "";
+		lines.push(`${icon} ${runDisplayName(r)} [${r.model}] ${elapsed}${group}`);
 		if (r.currentThinking) lines.push(`   💭 ${preview(r.currentThinking, 100)}`);
 		const last = r.activities[r.activities.length - 1];
 		if (last) lines.push(`   ${activityPlainText(last)}`);
@@ -369,6 +411,15 @@ type PanelBg = "selectedBg" | "customMessageBg" | "toolPendingBg";
 /** A rendered detail row: code rows keep full width and scroll horizontally; others wrap. */
 type BodyLine = { text: string; code: boolean };
 
+function groupContext(run: LiveRun, runs: LiveRun[], allRuns: LiveRun[] = runs): string | undefined {
+	if (!run.groupId) return undefined;
+	const groupRuns = allRuns.filter((candidate) => candidate.groupId === run.groupId);
+	const planned = run.groupSize && run.groupSize > 0 ? run.groupSize : Math.max(1, groupRuns.length);
+	const completed = groupRuns.filter((candidate) => candidate.status !== "running").length;
+	const step = run.step !== undefined ? `step ${run.step}/${planned} · ` : "";
+	return `group ${run.groupId.slice(0, 8)} · ${step}${completed}/${planned} done`;
+}
+
 function transcriptBodyLines(messages: AgentMessage[], theme: Theme, width: number, capChars: number): BodyLine[] {
 	const lines: BodyLine[] = [];
 	let lastTurn = 0;
@@ -382,9 +433,10 @@ function transcriptBodyLines(messages: AgentMessage[], theme: Theme, width: numb
 			for (const l of wrapTextWithAnsi(styled, innerWidth)) lines.push({ text: l, code: false });
 		}
 	};
+	const pushNotice = (text: string) => lines.push({ text: theme.fg("warning", `  ⚠ ${text}`), code: false });
 	for (const seg of messageSegments(messages)) {
 		if (budget <= 0) {
-			lines.push({ text: theme.fg("dim", "  … transcript truncated"), code: false });
+			pushNotice("transcript display truncated; more content is not shown");
 			break;
 		}
 		if (seg.turn && seg.turn !== lastTurn) {
@@ -393,16 +445,21 @@ function transcriptBodyLines(messages: AgentMessage[], theme: Theme, width: numb
 		}
 		switch (seg.type) {
 			case "text": {
-				const t = truncateBytes(seg.text, 4000);
-				budget -= t.length;
+				const t = truncateBytes(seg.text, Math.min(4000, Math.max(1, budget)));
+				if (t !== seg.text) pushNotice("message text truncated for display");
+				budget -= Math.min(budget, t.length);
 				for (const l of t.split("\n")) pushStyled(`  💬 ${l}`, false);
 				break;
 			}
-			case "thinking":
-				for (const l of truncateBytes(seg.text, 1500).split("\n")) {
+			case "thinking": {
+				const t = truncateBytes(seg.text, Math.min(1500, Math.max(1, budget)));
+				if (t !== seg.text) pushNotice("thinking text truncated for display");
+				budget -= Math.min(budget, t.length);
+				for (const l of t.split("\n")) {
 					pushStyled(theme.fg("thinkingLow", `  💭 ${l}`), false);
 				}
 				break;
+			}
 			case "toolCall":
 				pushStyled(`  ${theme.fg("toolTitle", `🔧 ${seg.name}`)} ${theme.fg("dim", seg.args)}`, true);
 				break;
@@ -412,8 +469,9 @@ function transcriptBodyLines(messages: AgentMessage[], theme: Theme, width: numb
 					code: false,
 				});
 				if (seg.text) {
-					const t = truncateBytes(seg.text, 3000);
-					budget -= t.length;
+					const t = truncateBytes(seg.text, Math.min(3000, Math.max(1, budget)));
+					if (t !== seg.text) pushNotice("tool output truncated for display");
+					budget -= Math.min(budget, t.length);
 					for (const l of t.split("\n")) pushStyled(theme.fg("toolOutput", `    ${l}`), true);
 				}
 				break;
@@ -426,22 +484,33 @@ function transcriptBodyLines(messages: AgentMessage[], theme: Theme, width: numb
 export class SubagentsBrowser implements Component {
 	private view: "list" | "detail" = "list";
 	private selected = 0;
+	private selectedRunId?: string;
 	private detailRunId?: string;
 	private scroll = 0;
 	private scrollX = 0;
 	private timer: ReturnType<typeof setInterval> | null = null;
 	private cachedWidth = 0;
+	private cachedRows = 0;
+	private cachedSignature = "";
 	private cachedLines: string[] = [];
+	private getAllRuns: () => LiveRun[];
 
 	constructor(
 		private theme: Theme,
-		private tui: { requestRender(): void },
+		private tui: { requestRender(): void; terminal?: { rows?: number } },
 		private onClose: () => void,
 		private getRuns: () => LiveRun[],
+		private keybindings?: KeybindingsManager,
+		getAllRuns?: () => LiveRun[],
 	) {
-		// Live refresh while any subagent is running.
+		this.getAllRuns = getAllRuns ?? getRuns;
+		// Refresh while active for elapsed-time changes, and whenever any data
+		// changes so the first completed tick cannot leave a stale cached row.
 		this.timer = setInterval(() => {
-			if (this.getRuns().some((r) => r.status === "running")) {
+			const runs = this.getRuns();
+			const allRuns = this.getAllRuns();
+			const signature = this.runsSignature(runs) + this.runsSignature(allRuns);
+			if (signature !== this.cachedSignature || runs.some((r) => r.status === "running")) {
 				this.invalidate();
 				this.tui.requestRender();
 			}
@@ -455,15 +524,118 @@ export class SubagentsBrowser implements Component {
 
 	invalidate(): void {
 		this.cachedWidth = 0;
+		this.cachedRows = 0;
+		this.cachedSignature = "";
 		this.cachedLines = [];
 	}
 
 	/** Dark panel fill (mantle) — darker than the session base so the overlay reads as a distinct window. */
 	private static readonly PANEL_BG: PanelBg = "toolPendingBg";
 
+	private terminalRows(): number | undefined {
+		const rows = this.tui.terminal?.rows;
+		return typeof rows === "number" && rows > 0 ? rows : undefined;
+	}
+
+	/** Capture every mutable field consumed by browser output, including nested content. */
+	private runsSignature(runs: LiveRun[]): string {
+		return JSON.stringify(
+			runs.map((run) => {
+				return [
+					run.runId,
+					run.groupId,
+					run.groupSize,
+					run.kind,
+					run.step,
+					run.name,
+					run.model,
+					run.task,
+					run.status,
+					run.startTime,
+					run.endTime,
+					run.usage.input,
+					run.usage.output,
+					run.usage.cacheRead,
+					run.usage.cacheWrite,
+					run.usage.cost,
+					run.usage.contextTokens,
+					run.usage.turns,
+					run.currentThinking,
+					run.messages.length,
+					// Detail rendering derives segments from nested message fields, so an
+					// array length alone is insufficient when a record is updated in place.
+					JSON.stringify(run.messages),
+					run.activities.length,
+					JSON.stringify(run.activities),
+					run.stopReason,
+					run.errorMessage,
+					run.sessionId,
+					run.transcriptTruncated,
+				];
+			}),
+		);
+	}
+
+	/** Keep the overlay within the visible terminal, with a safe fallback for test/RPC TUIs. */
+	private viewportRows(): number {
+		const rows = this.terminalRows();
+		return rows === undefined ? BROWSER_DETAIL_ROWS + 8 : Math.max(4, Math.floor(rows * 0.8));
+	}
+
+	private matches(
+		data: string,
+		binding: Parameters<KeybindingsManager["matches"]>[1],
+	): boolean {
+		return this.keybindings?.matches(data, binding) ?? false;
+	}
+
+	/** Enforce the total overlay height, not just its scrollable body height. */
+	private fitHeight(lines: string[], width: number, detail = false): string[] {
+		const rows = this.terminalRows();
+		if (rows === undefined) return lines;
+		const budget = Math.max(1, Math.floor(rows * 0.8));
+		if (lines.length <= budget) return lines;
+		if (budget === 1) return lines.slice(0, 1);
+		if (budget === 2) return [lines[0]!, lines[lines.length - 1]!];
+		if (budget === 3) {
+			return detail
+				? [lines[0]!, lines[lines.length - 2]!, lines[lines.length - 1]!]
+				: [
+						lines[0]!,
+						this.boxed("⚠ terminal too small; resize to see browser content", width),
+						lines[lines.length - 1]!,
+				];
+		}
+		const footer = lines[lines.length - 2] ?? lines[lines.length - 1]!;
+		const bottom = lines[lines.length - 1]!;
+		if (budget === 4) {
+			return detail
+				? [lines[0]!, lines[1]!, footer, bottom]
+				: [
+						lines[0]!,
+						lines[1]!,
+						this.boxed("⚠ compact view; resize terminal for navigation hints", width),
+						bottom,
+				];
+		}
+		const middleSlots = budget - 5;
+		const middle = lines.slice(2, -2).slice(0, middleSlots);
+		return [
+			...lines.slice(0, 2),
+			...middle,
+			this.boxed("⚠ some content omitted to fit terminal height", width),
+			footer,
+			bottom,
+		];
+	}
+
 	/** One content row: │ interior │, full-width bg so the box interior is solid. */
 	private boxed(content: string, width: number, bg: PanelBg = SubagentsBrowser.PANEL_BG): string {
-		const inner = truncateToWidth(content, Math.max(0, width - 2), "...", true);
+		const safeWidth = Math.max(1, width);
+		if (safeWidth === 1) {
+			return this.theme.bg(bg, truncateToWidth(content.replace(/[\r\n]+/g, " "), 1, "...", true));
+		}
+		const inner = truncateToWidth(content.replace(/[\r\n]+/g, " "), safeWidth - 2, "...", true);
 		// truncateToWidth emits full resets (\x1b[0m) around the ellipsis; neutralize them
 		// to a fg-only reset so the panel background survives on the trailing characters.
 		const clean = inner.replace(/\x1b\[0m/g, "\x1b[39m");
@@ -472,9 +644,11 @@ export class SubagentsBrowser implements Component {
 
 	/** Top (╭─╮) or bottom (╰─╯) border row of the box. */
 	private boxBorder(width: number, top: boolean): string {
+		const safeWidth = Math.max(1, width);
+		if (safeWidth === 1) return this.theme.bg(SubagentsBrowser.PANEL_BG, top ? "╭" : "╰");
 		const l = top ? "╭" : "╰";
 		const r = top ? "╮" : "╯";
-		const mid = "─".repeat(Math.max(0, width - 2));
+		const mid = "─".repeat(safeWidth - 2);
 		return this.theme.bg(SubagentsBrowser.PANEL_BG, this.theme.fg("border", `${l}${mid}${r}`));
 	}
 
@@ -482,8 +656,25 @@ export class SubagentsBrowser implements Component {
 		return this.boxed("", width);
 	}
 
+	/** Keep the selected run stable when live updates reorder or add entries. */
+	private syncSelection(runs: LiveRun[]): void {
+		if (runs.length === 0) {
+			this.selected = 0;
+			this.selectedRunId = undefined;
+			return;
+		}
+		const byId = this.selectedRunId ? runs.findIndex((run) => run.runId === this.selectedRunId) : -1;
+		if (byId >= 0) this.selected = byId;
+		else this.selected = Math.min(this.selected, runs.length - 1);
+		this.selectedRunId = runs[this.selected]?.runId;
+	}
+
 	handleInput(data: string): void {
-		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+		if (
+			this.matches(data, "tui.select.cancel") ||
+			matchesKey(data, Key.escape) ||
+			matchesKey(data, Key.ctrl("c"))
+		) {
 			if (this.view === "detail") {
 				this.view = "list";
 				this.detailRunId = undefined;
@@ -506,17 +697,27 @@ export class SubagentsBrowser implements Component {
 
 	private handleListInput(data: string): void {
 		const runs = this.getRuns();
+		this.syncSelection(runs);
 		if (runs.length === 0) return;
-		if (matchesKey(data, Key.up) || data === "k") this.selected = Math.max(0, this.selected - 1);
-		else if (matchesKey(data, Key.down) || data === "j")
+		if (this.matches(data, "tui.select.up") || matchesKey(data, Key.up) || data === "k") {
+			this.selected = Math.max(0, this.selected - 1);
+		}
+		else if (this.matches(data, "tui.select.down") || matchesKey(data, Key.down) || data === "j")
 			this.selected = Math.min(runs.length - 1, this.selected + 1);
-		else if (matchesKey(data, Key.pageUp)) this.selected = Math.max(0, this.selected - BROWSER_PAGE);
-		else if (matchesKey(data, Key.pageDown))
+		else if (this.matches(data, "tui.select.pageUp") || matchesKey(data, Key.pageUp))
+			this.selected = Math.max(0, this.selected - BROWSER_PAGE);
+		else if (this.matches(data, "tui.select.pageDown") || matchesKey(data, Key.pageDown))
 			this.selected = Math.min(runs.length - 1, this.selected + BROWSER_PAGE);
 		else if (matchesKey(data, Key.home)) this.selected = 0;
 		else if (matchesKey(data, Key.end)) this.selected = runs.length - 1;
-		else if (matchesKey(data, Key.enter) || matchesKey(data, Key.right) || data === "l") {
+		else if (
+			this.matches(data, "tui.select.confirm") ||
+			matchesKey(data, Key.enter) ||
+			matchesKey(data, Key.right) ||
+			data === "l"
+		) {
 			const run = runs[this.selected];
+			this.selectedRunId = run?.runId;
 			if (run) {
 				this.detailRunId = run.runId;
 				this.scroll = 0;
@@ -526,6 +727,7 @@ export class SubagentsBrowser implements Component {
 		} else {
 			return;
 		}
+		this.selectedRunId = runs[this.selected]?.runId;
 		this.invalidate();
 		this.tui.requestRender();
 	}
@@ -543,10 +745,12 @@ export class SubagentsBrowser implements Component {
 		const hStep = Math.max(1, Math.floor((this.cachedWidth - 2) / 2));
 		if (matchesKey(data, Key.left) || data === "h") this.scrollX = Math.max(0, this.scrollX - hStep);
 		else if (matchesKey(data, Key.right) || data === "l") this.scrollX += hStep;
-		else if (matchesKey(data, Key.up) || data === "k") this.scroll = Math.max(0, this.scroll - 1);
-		else if (matchesKey(data, Key.down) || data === "j") this.scroll += 1;
-		else if (matchesKey(data, Key.pageUp)) this.scroll = Math.max(0, this.scroll - BROWSER_PAGE);
-		else if (matchesKey(data, Key.pageDown)) this.scroll += BROWSER_PAGE;
+		else if (this.matches(data, "tui.select.up") || matchesKey(data, Key.up) || data === "k")
+			this.scroll = Math.max(0, this.scroll - 1);
+		else if (this.matches(data, "tui.select.down") || matchesKey(data, Key.down) || data === "j") this.scroll += 1;
+		else if (this.matches(data, "tui.select.pageUp") || matchesKey(data, Key.pageUp))
+			this.scroll = Math.max(0, this.scroll - BROWSER_PAGE);
+		else if (this.matches(data, "tui.select.pageDown") || matchesKey(data, Key.pageDown)) this.scroll += BROWSER_PAGE;
 		else if (matchesKey(data, Key.home) || data === "g") this.scroll = 0;
 		else if (matchesKey(data, Key.end) || data === "G") this.scroll = Number.MAX_SAFE_INTEGER;
 		else return;
@@ -555,23 +759,50 @@ export class SubagentsBrowser implements Component {
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines.length > 0 && this.cachedWidth === width) return this.cachedLines;
+		const rows = this.terminalRows() ?? 0;
 		const runs = this.getRuns();
+		const allRuns = this.getAllRuns();
+		const signature = this.runsSignature(runs) + this.runsSignature(allRuns);
+		if (
+			this.cachedLines.length > 0 &&
+			this.cachedWidth === width &&
+			this.cachedRows === rows &&
+			this.cachedSignature === signature
+		) {
+			return this.cachedLines;
+		}
 		if (this.view === "detail" && this.detailRunId) {
 			const run = runs.find((r) => r.runId === this.detailRunId);
 			if (run) {
-				this.cachedLines = this.renderDetail(run, width);
+				this.cachedLines = this.fitHeight(this.renderDetail(run, width, runs, allRuns), width, true);
 				this.cachedWidth = width;
+				this.cachedRows = rows;
+				this.cachedSignature = signature;
 				return this.cachedLines;
 			}
 			this.view = "list";
 		}
-		this.cachedLines = this.renderList(runs, width);
+		this.syncSelection(runs);
+		this.cachedLines = this.fitHeight(this.renderList(runs, width, allRuns), width);
 		this.cachedWidth = width;
+		this.cachedRows = rows;
+		this.cachedSignature = signature;
 		return this.cachedLines;
 	}
 
-	private renderList(runs: LiveRun[], width: number): string[] {
+	private listRunLimit(): number {
+		// A run uses two rows (summary + task); reserve room for borders, header,
+		// and footer so small terminals do not get an over-tall overlay.
+		const rows = this.terminalRows();
+		if (rows === undefined) return BROWSER_MAX_ROWS;
+		return Math.max(
+			1,
+			Math.min(BROWSER_MAX_ROWS, Math.floor(Math.max(1, this.viewportRows() - 8) / 2)),
+		);
+	}
+
+
+	private renderList(runs: LiveRun[], width: number, allRuns: LiveRun[]): string[] {
 		const th = this.theme;
 		const lines: string[] = [];
 		const active = runs.filter((r) => r.status === "running").length;
@@ -594,7 +825,7 @@ export class SubagentsBrowser implements Component {
 				),
 			);
 		} else {
-			const maxRows = BROWSER_MAX_ROWS;
+			const maxRows = this.listRunLimit();
 			const start = Math.max(
 				0,
 				Math.min(this.selected - Math.floor(maxRows / 2), Math.max(0, runs.length - maxRows)),
@@ -603,13 +834,14 @@ export class SubagentsBrowser implements Component {
 			if (start > 0) lines.push(this.boxed(`  ${th.fg("dim", `… ${start} older runs`)}`, width));
 			for (let i = start; i < end; i++) {
 				const r = runs[i]!;
-				const row = this.listRow(r);
 				const indent = i === this.selected ? th.fg("accent", "▍") : " ";
-				const line = `${indent}${row}`;
+				const line = `${indent}${this.listRow(r, runs, allRuns, width)}`;
 				lines.push(i === this.selected ? this.boxed(line, width, "selectedBg") : this.boxed(line, width));
-				if (r.status === "error" && r.errorMessage) {
-					lines.push(this.boxed(`  ${th.fg("error", preview(r.errorMessage, 100))}`, width));
-				}
+				const task = preview(r.task, 160);
+				const error = r.status === "error" && r.errorMessage ? ` · ${preview(r.errorMessage, 100)}` : "";
+				lines.push(
+					this.boxed(`  ${th.fg("muted", "Task: ")}${th.fg(error ? "error" : "dim", `${task}${error}`)}`, width),
+				);
 			}
 			if (end < runs.length)
 				lines.push(this.boxed(`  ${th.fg("dim", `… ${runs.length - end} newer runs`)}`, width));
@@ -622,7 +854,7 @@ export class SubagentsBrowser implements Component {
 		return lines;
 	}
 
-	private listRow(r: LiveRun): string {
+	private listRow(r: LiveRun, runs: LiveRun[], allRuns: LiveRun[], width: number): string {
 		const th = this.theme;
 		const icon = statusIcon(r.status);
 		const elapsed =
@@ -637,13 +869,22 @@ export class SubagentsBrowser implements Component {
 				: r.status === "ok"
 					? th.fg("success", `ok ${elapsed}`)
 					: th.fg("error", `error ${elapsed}`);
-		const parts = [icon, th.fg("accent", runDisplayName(r)), th.fg("dim", r.model), status];
-		const u = usageLine(r.usage);
-		if (u) parts.push(th.fg("dim", u));
+		const parts = [
+			icon,
+			status,
+			th.fg("accent", preview(runDisplayName(r), width < 45 ? 40 : 90)),
+		];
+		const group = groupContext(r, runs, allRuns);
+		if (group) parts.push(th.fg("dim", group));
+		if (width >= 70) parts.push(th.fg("dim", r.model));
+		if (width >= 105) {
+			const u = usageLine(r.usage);
+			if (u) parts.push(th.fg("dim", u));
+		}
 		return parts.join(" · ");
 	}
 
-	private renderDetail(run: LiveRun, width: number): string[] {
+	private renderDetail(run: LiveRun, width: number, runs: LiveRun[], allRuns: LiveRun[]): string[] {
 		const th = this.theme;
 		const lines: string[] = [];
 		const icon = statusIcon(run.status);
@@ -670,31 +911,51 @@ export class SubagentsBrowser implements Component {
 		if (u) lines.push(this.boxed(th.fg("dim", u), width));
 		if (run.errorMessage) lines.push(this.boxed(th.fg("error", run.errorMessage), width));
 		if (run.sessionId) lines.push(this.boxed(th.fg("dim", `session: ${run.sessionId}`), width));
+		const group = groupContext(run, runs, allRuns);
+		if (group) lines.push(this.boxed(th.fg("dim", group), width));
 		lines.push(this.boxed(th.fg("muted", `Task: ${run.task}`), width));
+		if (run.transcriptTruncated) {
+			lines.push(
+				this.boxed(
+					th.fg("warning", "⚠ transcript was shortened before storage; displayed content is partial"),
+					width,
+				),
+			);
+		}
 		lines.push(this.blankRow(width));
 
+		const innerWidth = Math.max(1, width - 2);
 		let body: BodyLine[];
 		if (run.messages && run.messages.length > 0) {
 			body = transcriptBodyLines(run.messages, th, width, BROWSER_DETAIL_CAP);
 		} else if (run.activities && run.activities.length > 0) {
-			body = run.activities.map((a) => ({
-				text: `${th.fg("dim", `+${formatElapsed(a.at)}`)} ${activityLine(a, th)}`,
-				code: false,
-			}));
+			body = run.activities.flatMap((a) =>
+				wrapTextWithAnsi(`${th.fg("dim", `+${formatElapsed(a.at)}`)} ${activityLine(a, th)}`, innerWidth).map(
+					(text) => ({ text, code: false }),
+				),
+			);
 		} else {
 			body = [{ text: th.fg("dim", "No activity recorded for this run."), code: false }];
 		}
 
-		const innerWidth = Math.max(1, width - 2);
 		const maxCodeWidth = body.reduce((m, l) => (l.code ? Math.max(m, visibleWidth(l.text)) : m), 0);
 		const hasOverflow = maxCodeWidth > innerWidth;
 		if (hasOverflow) this.scrollX = Math.min(this.scrollX, maxCodeWidth - innerWidth);
 		else this.scrollX = 0;
 
-		const maxScroll = Math.max(0, body.length - BROWSER_DETAIL_ROWS);
+		// Header rows vary with usage, errors, sessions, groups, and truncation
+		// notices. Reserve the actual header plus the three footer rows, rather
+		// than subtracting a fixed chrome estimate from the terminal height.
+		const totalBudget = this.terminalRows() === undefined ? undefined : Math.max(1, Math.floor(this.terminalRows()! * 0.8));
+		const footerRows = 3; // blank row, navigation hints, bottom border
+		const detailRows =
+			totalBudget === undefined
+				? BROWSER_DETAIL_ROWS
+				: Math.max(0, Math.min(BROWSER_DETAIL_ROWS, totalBudget - lines.length - footerRows));
+		const maxScroll = Math.max(0, body.length - detailRows);
 		if (this.scroll > maxScroll) this.scroll = maxScroll;
 		const start = this.scroll;
-		const end = Math.min(body.length, start + BROWSER_DETAIL_ROWS);
+		const end = Math.min(body.length, start + detailRows);
 		for (let i = start; i < end; i++) {
 			const row = body[i]!;
 			const text = row.code && hasOverflow ? sliceByColumn(row.text, this.scrollX, innerWidth) : row.text;
@@ -703,7 +964,7 @@ export class SubagentsBrowser implements Component {
 
 		lines.push(this.blankRow(width));
 		const hints = [`↑/↓ scroll`];
-		if (body.length > BROWSER_DETAIL_ROWS) {
+		if (body.length > detailRows) {
 			const pct = Math.min(100, Math.round((end / body.length) * 100));
 			hints.unshift(` ${pct}% (${body.length} lines)`);
 		}

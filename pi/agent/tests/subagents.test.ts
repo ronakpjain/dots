@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	runSubagent,
 	getFinalOutput,
@@ -19,6 +20,9 @@ import {
 	formatTokens,
 	formatElapsed,
 	activityPlainText,
+	runMatchesFilter,
+	SubagentsBrowser,
+	type LiveRun,
 	type RunActivity,
 } from "../extensions/subagents/ui.ts";
 import { applyAgentPolicy, ENFORCED_AGENT_PROFILES } from "../extensions/subagents/policy.ts";
@@ -53,7 +57,12 @@ type StubConfig = {
 
 function stubProvider(config: StubConfig) {
 	let invocations = 0;
-	const streamSimple = async (_model: unknown, context: any, _options: any) => {
+	const payloads: unknown[] = [];
+	const streamSimple = async (model: unknown, context: any, options: any) => {
+		const payload = { model: (model as { id?: string }).id, service_tier: "default" };
+		const nextPayload = await options?.onPayload?.(payload, model);
+		payloads.push(nextPayload ?? payload);
+
 		const i = invocations++;
 		const useTool = i < (config.toolTurns ?? 0);
 		const text =
@@ -89,6 +98,9 @@ function stubProvider(config: StubConfig) {
 		get invocations() {
 			return invocations;
 		},
+		get payloads() {
+			return payloads;
+		},
 	};
 }
 
@@ -113,6 +125,36 @@ function opts(
 		sessionCache: new Map(),
 		...extra,
 	} as Parameters<typeof runSubagent>[1];
+}
+
+const browserTheme = {
+	fg: (_color: string, text: string) => text,
+	bg: (_color: string, text: string) => text,
+	bold: (text: string) => text,
+} as any;
+
+function browserRun(overrides: Partial<LiveRun> = {}): LiveRun {
+	return {
+		runId: "run-1",
+		groupId: "group-123456789",
+		groupSize: 3,
+		kind: "parallel",
+		step: 1,
+		name: "worker",
+		model: "fake-model",
+		task: "inspect the implementation",
+		status: "ok",
+		startTime: Date.now() - 2_000,
+		endTime: Date.now(),
+		usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.001, contextTokens: 30, turns: 1 },
+		activities: [],
+		messages: [],
+		...overrides,
+	};
+}
+
+function browserTui(rows = 24) {
+	return { requestRender() {}, terminal: { rows } };
 }
 
 describe("named subagent policies", () => {
@@ -263,6 +305,25 @@ describe("named subagent policies", () => {
 	});
 });
 
+test("forces priority fast mode for Luna requests in the in-process runner", async () => {
+	const stub = stubProvider({ finalText: "DONE" });
+	const luna = await runSubagent(
+		spec({ name: "custom", model: "openai-codex/gpt-5.6-luna" }),
+		opts(stub, { getModel: getTestModel }),
+	);
+	const sol = await runSubagent(
+		spec({ name: "custom", model: "openai-codex/gpt-5.6-sol" }),
+		opts(stub, { getModel: getTestModel }),
+	);
+
+	expect(luna.exitCode).toBe(0);
+	expect(sol.exitCode).toBe(0);
+	expect(stub.payloads).toEqual([
+		{ model: "gpt-5.6-luna", service_tier: "priority" },
+		{ model: "gpt-5.6-sol", service_tier: "default" },
+	]);
+});
+
 describe("subagent runner cancellation", () => {
 	test("does not start a provider request when the parent is already aborted", async () => {
 		const stub = stubProvider({ finalText: "MUST NOT RUN" });
@@ -383,6 +444,241 @@ describe("subagent ui helpers", () => {
 			expect(result.name).toBe("read");
 			expect(result.text).toContain("file contents");
 			expect(result.turn).toBe(1);
+		}
+	});
+
+	test("runMatchesFilter trims, ignores case, and ANDs terms across metadata", () => {
+		const run = {
+			name: "Worker",
+			model: "openai-codex/gpt-5.6-luna",
+			task: "Review the browser",
+			kind: "chain",
+			status: "error",
+			stopReason: "maxTurns",
+			groupId: "group-abc",
+			sessionId: "session-xyz",
+		};
+		expect(runMatchesFilter(run, "  WORKER error  ")).toBe(true);
+		expect(runMatchesFilter(run, "browser GROUP-ABC")).toBe(true);
+		expect(runMatchesFilter(run, "session-xyz missing")).toBe(false);
+		expect(runMatchesFilter(run, "   ")).toBe(true);
+	});
+
+	test("browser includes group context and adapts every line to narrow widths", () => {
+		const runs = [browserRun(), browserRun({ runId: "run-2", status: "running", step: 2 })];
+		const tui = browserTui(12);
+		const browser = new SubagentsBrowser(browserTheme, tui, () => {}, () => runs);
+		try {
+			const rendered = browser.render(100);
+			expect(rendered.join(" ")).toContain("group group-12");
+			expect(rendered.join(" ")).toContain("step 1/3");
+			expect(rendered.length).toBeLessThanOrEqual(Math.floor(tui.terminal.rows * 0.8));
+			for (const width of [1, 8, 24, 60]) {
+				for (const line of browser.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(Math.max(1, width));
+			}
+		} finally {
+			browser.dispose();
+		}
+
+		const tinyTui = browserTui(4);
+		const tiny = new SubagentsBrowser(browserTheme, tinyTui, () => {}, () => runs);
+		try {
+			const tinyLines = tiny.render(24);
+			expect(tinyLines.length).toBeLessThanOrEqual(Math.floor(tinyTui.terminal.rows * 0.8));
+			expect(tinyLines.join(" ")).toContain("⚠");
+		} finally {
+			tiny.dispose();
+		}
+	});
+
+	test("browser refreshes a cached row when a run completes", () => {
+		const run = browserRun({ status: "running", endTime: undefined });
+		const browser = new SubagentsBrowser(browserTheme, browserTui(), () => {}, () => [run]);
+		try {
+			expect(browser.render(60).join(" ")).toContain("running");
+			run.status = "ok";
+			run.endTime = Date.now();
+			expect(browser.render(60).join(" ")).toContain("ok");
+		} finally {
+			browser.dispose();
+		}
+	});
+
+	test("browser wraps fallback activities and keeps wrapped rows scrollable", () => {
+		const run = browserRun({
+			groupId: "",
+			groupSize: undefined,
+			activities: [
+				{
+					kind: "tool",
+					at: 12,
+					toolName: "bash",
+					argsPreview: `${"argument ".repeat(30)}TAIL_ACTIVITY`,
+				},
+			],
+		});
+		const tui = browserTui(20);
+		const browser = new SubagentsBrowser(browserTheme, tui, () => {}, () => [run]);
+		try {
+			browser.render(24);
+			browser.handleInput(String.fromCharCode(13));
+			const first = browser.render(24);
+			expect(first.join(" ")).toContain("argument");
+			expect(first.join(" ")).not.toContain("TAIL_ACTIVITY");
+			for (let i = 0; i < 20; i++) browser.handleInput("j");
+			const last = browser.render(24);
+			expect(last.join(" ")).toContain("TAIL_ACTIVITY");
+			for (const line of last) expect(visibleWidth(line)).toBeLessThanOrEqual(24);
+		} finally {
+			browser.dispose();
+		}
+	});
+
+	test("browser cache signatures include mutable usage and activity fields", () => {
+		const run = browserRun({
+			groupId: "",
+			groupSize: undefined,
+			activities: [
+				{ kind: "tool", at: 1, toolName: "bash", argsPreview: "old args" },
+				{ kind: "toolResult", at: 2, toolName: "bash", resultPreview: "old result", isError: false },
+			],
+		});
+		const browser = new SubagentsBrowser(browserTheme, browserTui(24), () => {}, () => [run]);
+		try {
+			browser.render(80);
+			browser.handleInput(String.fromCharCode(13));
+			const initial = browser.render(80);
+			run.usage.turns = 2;
+			run.usage.contextTokens = 99;
+			run.usage.cacheRead = 7;
+			run.usage.cacheWrite = 8;
+			run.activities[0]!.argsPreview = "new args";
+			run.activities[1]!.isError = true;
+			const updated = browser.render(80);
+			expect(updated).not.toBe(initial);
+			expect(updated.join(" ")).toContain("2 turns");
+			expect(updated.join(" ")).toContain("ctx 99");
+			expect(updated.join(" ")).toContain("new args");
+			expect(updated.join(" ")).toContain("✗ bash");
+		} finally {
+			browser.dispose();
+		}
+	});
+
+	test("browser allocates detail body from actual header chrome and keeps its footer", () => {
+		const sparse = browserRun({
+			groupId: "",
+			groupSize: undefined,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			activities: Array.from({ length: 8 }, (_, i) => ({ kind: "status", at: i, text: `body-${i}` })),
+		});
+		const sparseTui = browserTui(15);
+		const sparseBrowser = new SubagentsBrowser(browserTheme, sparseTui, () => {}, () => [sparse]);
+		try {
+			sparseBrowser.render(50);
+			sparseBrowser.handleInput(String.fromCharCode(13));
+			const rendered = sparseBrowser.render(50);
+			expect(rendered.length).toBe(Math.floor(sparseTui.terminal.rows * 0.8));
+			expect(rendered.join(" ")).toContain("body-4");
+			expect(rendered.join(" ")).toContain("↑/↓ scroll");
+		} finally {
+			sparseBrowser.dispose();
+		}
+
+		const full = browserRun({
+			activities: [{ kind: "status", at: 1, text: "full-header-body" }],
+			errorMessage: "failed",
+			sessionId: "session",
+			transcriptTruncated: true,
+		});
+		const fullTui = browserTui(17);
+		const fullBrowser = new SubagentsBrowser(browserTheme, fullTui, () => {}, () => [full]);
+		try {
+			fullBrowser.render(60);
+			fullBrowser.handleInput(String.fromCharCode(13));
+			const rendered = fullBrowser.render(60);
+			expect(rendered.length).toBeLessThanOrEqual(Math.floor(fullTui.terminal.rows * 0.8));
+			expect(rendered.join(" ")).toContain("full-header-body");
+			expect(rendered.join(" ")).toContain("↑/↓ scroll");
+		} finally {
+			fullBrowser.dispose();
+		}
+	});
+
+	test("browser computes group progress from unfiltered runs", () => {
+		const visible = browserRun({ runId: "visible", status: "ok" });
+		const all = [
+			visible,
+			browserRun({ runId: "other-1", status: "ok", step: 2 }),
+			browserRun({ runId: "other-2", status: "ok", step: 3 }),
+		];
+		const browser = new SubagentsBrowser(browserTheme, browserTui(), () => {}, () => [visible], undefined, () => all);
+		try {
+			expect(browser.render(100).join(" ")).toContain("3/3 done");
+		} finally {
+			browser.dispose();
+		}
+	});
+
+	test("browser preserves selected run id across live list updates and uses injected bindings", () => {
+		const first = browserRun({ runId: "first", task: "first task" });
+		const second = browserRun({ runId: "second", task: "second task", step: 2 });
+		const runs = [first, second];
+		const calls: string[] = [];
+		let closed = 0;
+		const keybindings = {
+			matches: (data: string, binding: string) => {
+				calls.push(`${data}:${binding}`);
+				return (
+					(data === "x" && binding === "tui.select.down") ||
+					(data === "c" && binding === "tui.select.confirm") ||
+					(data === "q" && binding === "tui.select.cancel")
+				);
+			},
+		} as any;
+		const browser = new SubagentsBrowser(browserTheme, browserTui(), () => {
+			closed++;
+		}, () => runs, keybindings);
+		try {
+			browser.render(60);
+			browser.handleInput("x");
+			runs.unshift(browserRun({ runId: "new", status: "running", task: "new task" }));
+			browser.render(60);
+			browser.handleInput("c");
+			expect(browser.render(60).join(" ")).toContain("Task: second task");
+			browser.handleInput("q");
+			expect(closed).toBe(0);
+			expect(calls).toContain("x:tui.select.down");
+			expect(calls).toContain("c:tui.select.confirm");
+			expect(calls).toContain("q:tui.select.cancel");
+		} finally {
+			browser.dispose();
+		}
+	});
+
+	test("browser visibly marks display and storage transcript truncation", () => {
+		const browser = new SubagentsBrowser(
+			browserTheme,
+			browserTui(),
+			() => {},
+			() => [
+				browserRun({
+					transcriptTruncated: true,
+					messages: [{ role: "assistant", content: [{ type: "text", text: "x".repeat(41_000) }] } as any],
+				}),
+			],
+		);
+		try {
+			browser.render(60);
+			browser.handleInput(String.fromCharCode(13));
+			const rendered = browser.render(60).join(" ");
+			expect(rendered).toContain("shortened before storage");
+			expect(rendered).toContain("truncated for display");
+			for (const width of [1, 8, 24, 60]) {
+				for (const line of browser.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(Math.max(1, width));
+			}
+		} finally {
+			browser.dispose();
 		}
 	});
 

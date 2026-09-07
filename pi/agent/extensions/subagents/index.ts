@@ -50,6 +50,7 @@ import {
 	statusIcon,
 	truncateBytes,
 	usageLine,
+	runMatchesFilter,
 	SubagentsBrowser,
 	type LiveRun,
 } from "./ui.ts";
@@ -214,6 +215,8 @@ interface BackgroundGroup {
 interface RunRecord {
 	runId: string;
 	groupId: string;
+	/** Planned number of runs in this invocation group (display-only). */
+	groupSize?: number;
 	kind: RunKind;
 	name: string;
 	model: string;
@@ -227,6 +230,8 @@ interface RunRecord {
 	sessionId?: string;
 	startedAt: string;
 	durationMs?: number;
+	/** True when the persisted detail transcript was capped. */
+	transcriptTruncated?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -402,26 +407,24 @@ function resultOutput(r: SubagentRunResult): string {
 }
 
 /** Truncate message payloads so persisted detail entries stay small. */
-function truncateMessagesForStorage(messages: AgentMessage[]): AgentMessage[] {
-	return messages.map((m) => {
+function truncateMessagesForStorage(messages: AgentMessage[]): { messages: AgentMessage[]; truncated: boolean } {
+	let truncated = false;
+	const capPart = <T extends { type?: string; text?: string }>(part: T, cap: number): T => {
+		if (part.type !== "text" || typeof part.text !== "string") return part;
+		const text = truncateBytes(part.text, cap);
+		if (text !== part.text) truncated = true;
+		return { ...part, text };
+	};
+	const stored = messages.map((m) => {
 		if (m.role === "assistant") {
-			return {
-				...m,
-				content: m.content.map((part) =>
-					part.type === "text" ? { ...part, text: truncateBytes(part.text, MESSAGE_TEXT_CAP) } : part,
-				),
-			} as AgentMessage;
+			return { ...m, content: m.content.map((part) => capPart(part, MESSAGE_TEXT_CAP)) } as AgentMessage;
 		}
 		if (m.role === "toolResult") {
-			return {
-				...m,
-				content: m.content.map((part) =>
-					part.type === "text" ? { ...part, text: truncateBytes(part.text, MESSAGE_RESULT_CAP) } : part,
-				),
-			} as AgentMessage;
+			return { ...m, content: m.content.map((part) => capPart(part, MESSAGE_RESULT_CAP)) } as AgentMessage;
 		}
 		return m;
 	});
+	return { messages: stored, truncated };
 }
 
 /** Full per-run detail record persisted alongside the summary entry. */
@@ -433,11 +436,13 @@ function toDetailRecord(
 	live: LiveRun,
 ): LiveRun {
 	const startedAt = new Date(r.startedAt).getTime();
+	const storedMessages = truncateMessagesForStorage(r.messages);
 	return {
 		runId: live.runId,
 		groupId,
 		kind,
 		step,
+		groupSize: live.groupSize,
 		name: r.name,
 		model: r.model,
 		task: r.task,
@@ -455,7 +460,8 @@ function toDetailRecord(
 		},
 		activities: live.activities.slice(-MAX_STORED_ACTIVITIES),
 		currentThinking: live.currentThinking,
-		messages: truncateMessagesForStorage(r.messages),
+		messages: storedMessages.messages,
+		transcriptTruncated: storedMessages.truncated || live.transcriptTruncated,
 		stopReason: r.stopReason,
 		errorMessage: r.errorMessage,
 		sessionId: r.sessionId,
@@ -468,11 +474,13 @@ function toRunRecord(
 	r: SubagentRunResult,
 	step: number | undefined,
 	runId: string,
+	groupSize?: number,
 ): RunRecord {
 	return {
 		runId,
 		groupId,
 		kind,
+		groupSize,
 		name: r.name,
 		model: r.model,
 		task: preview(r.task, 80),
@@ -510,10 +518,17 @@ export default function (pi: ExtensionAPI) {
 		if (live.activities.length > 300) live.activities.splice(0, live.activities.length - 300);
 	};
 
-	const startLiveRun = (groupId: string, kind: LiveRun["kind"], spec: ResolvedTask, step?: number): LiveRun => {
+	const startLiveRun = (
+		groupId: string,
+		kind: LiveRun["kind"],
+		spec: ResolvedTask,
+		step?: number,
+		groupSize?: number,
+	): LiveRun => {
 		const live: LiveRun = {
 			runId: randomUUID(),
 			groupId,
+			groupSize,
 			kind,
 			step,
 			name: spec.name,
@@ -586,7 +601,7 @@ export default function (pi: ExtensionAPI) {
 		live: LiveRun,
 		ctx?: ExtensionContext,
 	) => {
-		pi.appendEntry(RUN_ENTRY_TYPE, toRunRecord(groupId, kind, r, step, live.runId));
+		pi.appendEntry(RUN_ENTRY_TYPE, toRunRecord(groupId, kind, r, step, live.runId, live.groupSize));
 		pi.appendEntry(RUN_DETAIL_ENTRY_TYPE, toDetailRecord(groupId, kind, r, step, live));
 
 		// Subagents use isolated pi-agent-core Agents, so their assistant messages
@@ -624,10 +639,12 @@ export default function (pi: ExtensionAPI) {
 		r: SubagentRunResult,
 		step?: number,
 		ctx?: ExtensionContext,
+		groupSize?: number,
 	) => {
 		const live: LiveRun = {
 			runId: randomUUID(),
 			groupId,
+			groupSize,
 			kind,
 			step,
 			name: r.name,
@@ -651,13 +668,13 @@ export default function (pi: ExtensionAPI) {
 	const collectRuns = (ctx: ExtensionContext, filter: string): LiveRun[] => {
 		const byId = new Map<string, LiveRun>();
 		for (const live of liveRuns.values()) {
-			if (!filter || live.name.includes(filter) || live.model.includes(filter)) byId.set(live.runId, live);
+			if (runMatchesFilter(live, filter)) byId.set(live.runId, live);
 		}
 		for (const entry of ctx.sessionManager.getEntries()) {
 			if (entry.type !== "custom" || entry.customType !== RUN_DETAIL_ENTRY_TYPE || !entry.data) continue;
 			const rec = entry.data as LiveRun;
 			if (!rec || typeof rec.runId !== "string" || !rec.name) continue;
-			if (filter && !rec.name.includes(filter) && !rec.model?.includes(filter)) continue;
+			if (!runMatchesFilter(rec, filter)) continue;
 			if (!byId.has(rec.runId)) byId.set(rec.runId, rec);
 		}
 		return [...byId.values()].sort((a, b) => {
@@ -710,12 +727,13 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to subagents with isolated context windows and explicit orchestration controls. Use background:true when the main thread should continue while they run.",
 			"Single: {task}. Parallel: {tasks:[...], parallelLimit}. Chain: {chain:[...], onFailure, {previous}}.",
-			'Model is arbitrary: "provider/id", "provider/*", or bare id; validated before running. Bundled named-agent profiles are policy-locked.',
+			'Model is arbitrary: "provider/id", "provider/*", or bare id; validated before running. Bundled named-agent profiles are policy-locked. Native OpenAI Luna models always use priority fast mode.',
 			"Use focused tasks with an explicit expected output; do not make one worker own discovery, implementation, and review.",
 			"Use parallel for independent tasks, chain for dependencies, and keepSession/sessionId to continue partial work without restarting.",
 			"maxTurns reserves a finalization turn; if a run still fails, its result includes partial output and a session id when keepSession was enabled.",
 			"Background groups keep running after the launch tool returns, so continue independent main-thread work and synchronize with subagent_wait only at dependency points.",
 			"thinking, tools, cwd, timeoutSec, maxTurns, parallelLimit, and onFailure are orchestration controls, not decoration.",
+			"Luna subagents always use OpenAI priority fast mode; callers cannot disable or override that service tier.",
 			`Agents: ${formatAgentList(discoverAgents(process.cwd(), "user").agents, 5).text}.`,
 		].join(" "),
 		parameters: SubagentParams,
@@ -727,6 +745,7 @@ export default function (pi: ExtensionAPI) {
 			"Use subagent chain with {previous} for dependent phases; set onFailure to continue only when later phases can recover from partial evidence.",
 			"Use keepSession when a task may need follow-up; resume a max-turn or partial run with its returned sessionId and a narrower task.",
 			"Prefer task-specific systemPrompt and tools allowlists so subagents stay focused and finish within their turn budget. For planner, reviewer, scout, and worker, model/tools/thinking/budget overrides are ignored.",
+			"When a native OpenAI model id/name contains Luna, the runner enforces priority fast mode at the provider payload boundary.",
 		],
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -795,6 +814,8 @@ export default function (pi: ExtensionAPI) {
 			const executionSignal = backgroundController?.signal ?? parentSignal;
 			const dashboardOnUpdate = background ? undefined : onUpdate;
 			const mode: RunKind = hasSingle ? "single" : hasChain ? "chain" : "parallel";
+			// Display-only context; the runner and scheduling limits remain unchanged.
+			const groupSize = hasSingle ? 1 : hasChain ? params.chain!.length : params.tasks!.length;
 
 			const makeDetails = (results: SubagentRunResult[], resultMode: RunKind, live?: LiveRun[]) => ({
 				mode: resultMode,
@@ -841,13 +862,13 @@ export default function (pi: ExtensionAPI) {
 						startedAt: new Date().toISOString(),
 						durationMs: 0,
 					};
-					recordFinishedRun(groupId, resultMode, result, step, ctx);
+					recordFinishedRun(groupId, resultMode, result, step, ctx, groupSize);
 					emitDashboard(resultMode, true);
 					return result;
 				}
 
 				const spec = resolved.task;
-				const live = startLiveRun(groupId, resultMode, spec, step);
+				const live = startLiveRun(groupId, resultMode, spec, step, groupSize);
 
 				const result = await runSubagent(spec, {
 					defaultCwd: ctx.cwd,
@@ -1197,12 +1218,14 @@ export default function (pi: ExtensionAPI) {
 			"info",
 		);
 		await ctx.ui.custom<null>(
-			(tui, theme, _kb, done) =>
+			(tui, theme, keybindings, done) =>
 				new SubagentsBrowser(
 					theme,
 					tui,
 					() => done(null),
 					() => collectRuns(ctx, filter),
+					keybindings,
+					() => collectRuns(ctx, ""),
 				),
 			{
 				overlay: true,
@@ -1221,7 +1244,7 @@ export default function (pi: ExtensionAPI) {
 				runs.push(entry.data as RunRecord);
 			}
 		}
-		const filtered = filter ? runs.filter((r) => r.name.includes(filter) || r.model.includes(filter)) : runs;
+		const filtered = runs.filter((r) => runMatchesFilter(r, filter));
 		const recent = filtered.slice(-15).reverse();
 
 		if (recent.length === 0) {
@@ -1234,8 +1257,11 @@ export default function (pi: ExtensionAPI) {
 		let totalCost = 0;
 		let totalTurns = 0;
 		for (const r of recent) {
+			const group = r.groupId
+				? ` group ${r.groupId.slice(0, 8)}${r.groupSize ? ` · ${r.step !== undefined ? `step ${r.step}/` : ""}${r.groupSize}` : ""}`
+				: "";
 			lines.push(
-				`${statusIcon(r.status)} ${r.kind === "single" ? r.name : `${r.kind}:${r.step ?? ""}:${r.name}`} [${r.model}] ${r.stopReason ?? ""} ${r.durationMs !== undefined ? `${(r.durationMs / 1000).toFixed(1)}s` : "…"}`,
+				`${statusIcon(r.status)} ${r.kind === "single" ? r.name : `${r.kind}:${r.step ?? ""}:${r.name}`} [${r.model}]${group} ${r.stopReason ?? ""} ${r.durationMs !== undefined ? `${(r.durationMs / 1000).toFixed(1)}s` : "…"}`,
 			);
 			lines.push(`   ${r.task}`);
 			const usage = usageLine({
@@ -1261,7 +1287,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("subagents", {
-		description: "Browse subagent runs — live activity, per-run transcripts (arg: name/model filter)",
+		description: "Browse subagent runs — live activity, per-run transcripts (optional case-insensitive multi-term filter)",
 		handler: async (args, ctx) => {
 			if (ctx.mode === "tui" && ctx.hasUI) {
 				await openBrowser(args, ctx);

@@ -25,6 +25,7 @@ import {
 	createReadToolDefinition,
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { applyFastMode, isLunaModel } from "../fast-mode.ts";
 import { applyAgentPolicy } from "./policy.ts";
 import { randomUUID } from "node:crypto";
 
@@ -373,6 +374,7 @@ export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Pro
 				tools: buildTools(spec, opts.defaultCwd, model, spec.thinking) as never,
 				messages: [],
 			},
+			onPayload: (payload, requestModel) => (isLunaModel(requestModel) ? applyFastMode(payload, true) : payload),
 		});
 	}
 

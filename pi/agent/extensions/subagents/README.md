@@ -37,7 +37,7 @@ The `subagent` tool is available to the main agent with three modes:
 | `task`          | string            | Task text (single mode)                                                                                                                                                                                                                                    |
 | `tasks`         | array             | Independent tasks, run sequentially by default (parallel mode; `parallelLimit` opt-in)                                                                                                                                                                     |
 | `chain`         | array             | Ordered tasks; `{previous}` in a task text is replaced with the previous result (chain mode)                                                                                                                                                               |
-| `model`         | string            | Arbitrary model: `"provider/id"`, `"provider/*"`, or bare id — validated against the model registry before running                                                                                                                                         |
+| `model`         | string            | Arbitrary model: `"provider/id"`, `"provider/*"`, or bare id — validated against the model registry before running. Native OpenAI models whose id/name contains `luna` always use priority fast mode.                                                                                                                                         |
 | `agent`         | string            | Agent definition name (from agent files)                                                                                                                                                                                                                   |
 | `systemPrompt`  | string            | Inline system prompt (overrides agent prompt)                                                                                                                                                                                                              |
 | `tools`         | array             | Tool allowlist (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`)                                                                                                                                                                                     |
@@ -71,6 +71,7 @@ Subagents are stateless by default. To make one remember across calls:
 
 ### Budgets and recovery
 
+- Luna fast mode is enforced at the provider-payload boundary for in-process subagents, so it cannot be bypassed by a caller or by the main-session fast-mode toggle.
 - `timeoutSec`: aborts the subagent after N seconds (honored even mid-stream).
 - `maxTurns`: bounds tool loops per invocation. At the boundary the runner allows one explicit finalization turn; if the model still requests tools, the result includes the partial transcript and remains resumable when `keepSession` was enabled.
 - Parent abort (Ctrl+C / goal-mode interrupt) propagates to synchronous subagent calls; background groups continue until completion or session shutdown.
@@ -153,17 +154,26 @@ the session output behind it. The selected run row is highlighted with
 `selectedBg`:
 
 - **List view** — every run in the session (live first, then newest first),
-  with status (running/ok/error), model, elapsed time, and usage. Navigate
-  with `↑/↓` (`j`/`k`), page with `PgUp/PgDn`; `Enter` (or `l`) opens a run.
+  with status (running/ok/error), model, elapsed time, task preview, usage, and
+  group progress (`step N/M` and completed count when available). The list
+  adapts to terminal height and keeps the selected run stable as live entries
+  update. Navigate with `↑/↓` (`j`/`k`), page with `PgUp/PgDn`; `Enter` (or
+  `l`) opens a run.
 - **Detail view** — per-run transcript: streamed thinking, tool calls with
   their arguments, tool results (with errors highlighted), the final output,
-  and usage. Prose (thinking/text) wraps to the panel width; code rows (tool
-  arguments, tool output) keep full width and scroll horizontally with
-  `←/→` (`h`/`l`) — the footer shows the column offset. Scroll vertically
-  with `↑/↓`; `g`/`G` jump to top/bottom; `Backspace` returns to the list;
-  Esc closes. Live runs refresh automatically.
-- An optional filter argument (`/subagents <agent-or-model>` ) narrows the
-  list.
+  group context, and usage. Prose (thinking/text) wraps to the panel width;
+  code rows (tool arguments, tool output) keep full width and scroll
+  horizontally with `←/→` (`h`/`l`) — the footer shows the column offset. Scroll
+  vertically with `↑/↓`; `g`/`G` jump to top/bottom; `Backspace` returns to the
+  list; Esc closes. Live runs refresh automatically. Display and persisted
+  transcript caps are called out visibly when content is partial; older
+  records without the optional metadata remain readable.
+- An optional filter argument (`/subagents <terms>`) narrows the list. Matching
+  is trimmed, case-insensitive, and treats whitespace-separated terms as an
+  AND query across name, model, task, kind, status, stop reason, group id, and
+  session id. The same filter is used by the plain-text fallback.
+- The browser honors configured `tui.select.*` selection/cancel bindings while
+  retaining the legacy arrow, `j`/`k`, Enter, Escape, and Ctrl+C keys.
 - In non-TUI modes (print/RPC), `/subagents` falls back to a plain-text
   widget listing the most recent runs.
 
