@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Helium Chromium integration fixture</title>
+		<style>
+			:root {
+				color-scheme: light;
+				font-family: system-ui, sans-serif;
+			}
+			body {
+				margin: 0;
+				color: #1f2937;
+				background: #f8fafc;
+			}
+			main {
+				width: min(56rem, calc(100% - 2rem));
+				margin: 0 auto;
+				padding: 2rem 0;
+			}
+			section,
+			form {
+				margin: 1rem 0;
+				padding: 1rem;
+				background: white;
+				border: 1px solid #cbd5e1;
+				border-radius: 0.5rem;
+			}
+			label {
+				display: block;
+				margin: 0.75rem 0;
+			}
+			input {
+				display: block;
+				box-sizing: border-box;
+				width: 100%;
+				max-width: 28rem;
+				padding: 0.5rem;
+				margin-top: 0.25rem;
+			}
+			button {
+				padding: 0.5rem 0.75rem;
+			}
+			nav {
+				display: flex;
+				gap: 1rem;
+				margin-top: 0.75rem;
+			}
+			.long-page {
+				height: 1800px;
+				margin-top: 1rem;
+				padding: 1rem;
+				background: linear-gradient(#dbeafe, #fef3c7);
+			}
+		</style>
+	</head>
+	<body>
+		<main>
+			<h1>Local synthetic browser fixture</h1>
+			<p>This page is served from loopback and never submits a form or contacts an external site.</p>
+
+			<section id="interactive-region" aria-label="Rerender target">
+				<h2>Initial interactive content</h2>
+				<button id="initial-action" type="button">Initial action</button>
+				<label
+					>Nickname <input id="nickname" name="nickname" type="text" aria-label="Synthetic nickname"
+				/></label>
+			</section>
+
+			<form action="/login" accept-charset="UTF-8" method="post">
+				<input name="utf8" type="hidden" value="&#x2713;" />
+				<input
+					type="hidden"
+					name="authenticity_token"
+					value="fixture-authenticity-token"
+				/>
+				<div class="form--group">
+					<label class="form--label-splash form--label" aria-live="polite" aria-atomic="true" for="session_email">
+						<span>Email</span>
+					</label>
+					<input autocomplete="email" class=" form--textInput" type="email" name="session[email]" id="session_email" />
+				</div>
+				<div class="form--group">
+					<label class="form--label-splash form--label" aria-live="polite" aria-atomic="true" for="session_password">
+						<span>Password</span>
+					</label>
+					<input
+						autocomplete="current-password"
+						class=" form--textInput"
+						type="password"
+						name="session[password]"
+						id="session_password"
+					/>
+				</div>
+				<div class="form--group form--group-sideBySideContainer">
+					<div class="form--group form--group-sideBySide">
+						<span class="form--choice form--choice-block">
+							<input name="session[remember_me]" type="hidden" value="0" />
+							<input
+								class="form--label-splash"
+								aria-label="Remember me, email login"
+								id="session_remember_me"
+								aria-labelledby="session_remember_me_label"
+								type="checkbox"
+								value="1"
+								name="session[remember_me]"
+							/>
+							<label id="session_remember_me_label" for="session_remember_me" class="checkbox-label form--label form--checkboxLabel">Remember me</label>
+						</span>
+					</div>
+					<div class="form--group form--group-sideBySide form--group-sideBySide-right">
+						<a class="form--link" href="/reset_password">Forgot your password?</a>
+					</div>
+				</div>
+				<div class="form--group">
+					<input type="submit" name="commit" value="Log In" class="tiiBtn tiiBtn-primarySplash tiiBtn-full" data-disable-with="Log In" />
+				</div>
+				<div class="form--group">
+					<div class="formDividerWithText">
+						<h2 aria-label="Or log in with School credentials or Google" class="formDividerWithText--text">Or log in with</h2>
+					</div>
+				</div>
+				<div class="form--group">
+					<div class="tiiBtnContainer tiiBtnContainer-equalWidth">
+						<a class="tiiBtn tiiBtn-tertiary js-omniauthChoice" href="/saml">
+							<span class="tiiBtn--textWithIcon">School Credentials</span>
+						</a>
+						<a class="tiiBtn tiiBtn-tertiary js-omniauthChoice" href="/auth/google_oauth2">
+							<span class="tiiBtn--textWithIcon">Google</span>
+						</a>
+					</div>
+				</div>
+				<div class="form--group">
+					<span class="form--choice form--choice-block">
+						<input name="session[remember_me_sso]" type="hidden" value="0" />
+						<input
+							class="form--label-splash"
+							aria-label="Remember me, SSO login"
+							id="session_remember_me_sso"
+							aria-labelledby="session_remember_me_sso_label"
+							type="checkbox"
+							value="1"
+							name="session[remember_me_sso]"
+						/>
+						<label id="session_remember_me_sso_label" for="session_remember_me_sso" class="checkbox-label form--label form--checkboxLabel">Remember me</label>
+					</span>
+				</div>
+			</form>
+
+			<div class="long-page" aria-label="Bounded screenshot content">
+				Tall synthetic content for screenshot bounds.
+			</div>
+		</main>
+		<script>
+			window.__submitted = false;
+			document.querySelector("form[action='/login']").addEventListener("submit", function (event) {
+				event.preventDefault();
+				window.__submitted = true;
+			});
+			window.rerenderFixture = function () {
+				document.querySelector("#interactive-region").innerHTML =
+					"<h2>Rerendered interactive content</h2>" +
+					'<button id="rerendered-action" type="button">Rerendered action</button>';
+			};
+		</script>
+	</body>
+</html>

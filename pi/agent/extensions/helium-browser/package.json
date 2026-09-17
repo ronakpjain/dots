@@ -1,0 +1,34 @@
+{
+  "name": "helium-browser",
+  "version": "1.0.0",
+  "description": "Pi extension for safe Helium browser control over CDP",
+  "main": "index.ts",
+  "type": "module",
+  "private": true,
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --allowImportingTsExtensions index.ts",
+    "test": "bun test ../../tests/helium-browser*.test.ts",
+    "test:integration": "HELIUM_BROWSER_INTEGRATION=1 bun test integration/helium-browser-chromium.integration.test.ts",
+    "check": "bun run typecheck && bun run test"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.3.0",
+    "typebox": "^1.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "typescript": "^6.0.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
