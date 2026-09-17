@@ -276,8 +276,10 @@ for _, server in ipairs(servers) do
 						forwardSearchAfter = true,
 					},
 					forwardSearch = {
-						executable = "/Users/ronak/.local/bin/zathura-texlab",
+						executable = "/usr/bin/open",
 						args = {
+							"-a",
+							"Preview",
 							"%p",
 						},
 					},
