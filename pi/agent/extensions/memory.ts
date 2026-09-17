@@ -12,6 +12,14 @@ const MAX_MEMORY_CONTENT = 20_000;
 const MAX_RETURNED_CONTENT = 4_000;
 const MAX_SEARCH_CONTENT = 1_200;
 const DEFAULT_LIMIT = 5;
+const MEMORY_CAPABILITY_PROMPT =
+	"[MEMORY CAPABILITY] Persistent memory is available through the memory tool. Memory contents are only loaded after an explicit retrieve call; use focused queries or known ids when exact details matter. The tool also supports explicit archive, restore, delete, merge, and stats maintenance actions.";
+const MEMORY_WORKFLOW_PROMPT = [
+	"[MEMORY WORKFLOW]",
+	"Use the memory tool proactively. For any non-trivial request involving project work, an ongoing task, a personal preference, a prior decision, or an established constraint, make a focused memory retrieve call before acting or making assumptions; this should normally be the first tool call. If no memory matches, continue with the task rather than dumping the full store.",
+	"Before the final response, review whether the user stated an explicit preference, durable fact, decision, or reusable project constraint. Save genuinely durable information with memory action=create, or update an existing item with action=edit after retrieving it. If the user says to remember something, saving it is required unless they cancel or the information is unsafe to retain.",
+	"Never save passwords, API keys, OTPs, payment data, or other secrets, and do not save transient one-off details or speculative assumptions. Avoid duplicate memories, and do not claim that something was remembered unless the memory tool actually saved it.",
+].join("\n");
 
 type MemoryAction = "create" | "edit" | "retrieve" | "archive" | "restore" | "delete" | "merge" | "stats";
 
@@ -183,15 +191,26 @@ function retrieveMemories(
 	const candidates = store.memories.filter((memory) => includeArchived || !memory.archived);
 	if (id) return candidates.filter((memory) => memory.id === id).slice(0, 1);
 
-	const terms = (query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
-	return candidates
-		.filter((memory) => {
-			if (terms.length === 0) return true;
+	const terms = [...new Set((query ?? "").toLowerCase().split(/\s+/).filter(Boolean))];
+	if (terms.length === 0) {
+		return candidates.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, limit);
+	}
+
+	const matching = candidates
+		.map((memory) => {
 			const haystack = [memory.id, memory.title, memory.content, ...memory.tags].join(" ").toLowerCase();
-			return terms.every((term) => haystack.includes(term));
+			return { memory, matches: terms.filter((term) => haystack.includes(term)).length };
 		})
-		.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-		.slice(0, limit);
+		.filter((item) => item.matches > 0);
+	// Preserve strict matching when it produces results, but fall back to
+	// ranked partial matches for natural-language queries. This keeps focused
+	// searches precise while preventing a single extra query word from hiding
+	// otherwise useful memories.
+	const strict = matching.filter((item) => item.matches === terms.length);
+	return (strict.length > 0 ? strict : matching)
+		.sort((a, b) => b.matches - a.matches || b.memory.updatedAt.localeCompare(a.memory.updatedAt))
+		.slice(0, limit)
+		.map((item) => item.memory);
 }
 
 function memoryStats(store: MemoryStore): MemoryStats {
@@ -209,19 +228,20 @@ function textResult(text: string, details: MemoryDetails) {
 
 export default function memoryExtension(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n[MEMORY CAPABILITY] Persistent memory is available through the memory tool. Use focused retrieve queries or known ids; memory contents are never loaded automatically. The tool also supports explicit archive, restore, delete, merge, and stats maintenance actions.`,
+		systemPrompt: [event.systemPrompt, MEMORY_CAPABILITY_PROMPT, MEMORY_WORKFLOW_PROMPT].join("\n\n"),
 	}));
 
 	pi.registerTool({
 		name: "memory",
 		label: "Memory",
 		description:
-			"Create, edit, retrieve, archive, restore, delete, merge, and inspect persistent memories stored in a local JSON file. Retrieve before editing when you do not already know a memory id.",
-		promptSnippet: "Create, edit, and retrieve persistent user memories",
+			"Create, edit, retrieve, archive, restore, delete, merge, and inspect persistent memories stored in a local JSON file. Retrieve relevant context before acting; retrieve before editing when you do not already know a memory id.",
+		promptSnippet: "Retrieve relevant context and save durable user memories",
 		promptGuidelines: [
-			"Use memory with action=retrieve when relevant persistent context may exist; prefer a focused query or known id and a small limit rather than retrieving the whole store.",
-			"Use memory with action=create for durable facts, preferences, decisions, or project context the user wants remembered.",
-			"Use memory with action=edit only after retrieving the target memory or when its exact id is already known.",
+			"Use memory with action=retrieve as the first tool call for non-trivial project, ongoing-task, preference, prior-decision, or established-constraint requests; use a focused query or known id and a small limit rather than retrieving the whole store.",
+			"Use memory with action=create when the user explicitly asks to remember something or when a genuinely durable fact, preference, decision, or project constraint should be preserved; review for this before the final response.",
+			"Use memory with action=edit only after retrieving the target memory or when its exact id is already known, and update an existing memory instead of creating a duplicate.",
+			"Never save passwords, API keys, OTPs, payment data, other secrets, transient one-off details, or speculative assumptions with memory.",
 			"Use archive/restore/delete/merge/stats only for explicit memory maintenance; merge archives the source after combining it into the target, and stats never returns memory content.",
 		],
 		parameters: MemoryParams,
