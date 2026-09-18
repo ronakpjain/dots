@@ -26,7 +26,6 @@ import {
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { applyFastMode, isLunaModel } from "../fast-mode.ts";
-import { applyAgentPolicy } from "./policy.ts";
 import { randomUUID } from "node:crypto";
 
 export interface SubagentTaskSpec {
@@ -278,10 +277,6 @@ type AgentToolLike = {
 };
 
 export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Promise<SubagentRunResult> {
-	// Defense in depth: the extension resolves named profiles before reaching
-	// this runner, but enforce them here too for every direct runner call.
-	spec = { ...spec, ...applyAgentPolicy(spec.name, spec) };
-
 	const startedAt = new Date().toISOString();
 	const startMs = Date.now();
 

@@ -17,31 +17,20 @@ child processes are spawned:
   the default is still sequential (`parallelLimit: 1`) to keep behavior
   predictable.
 
-## Work modes
-
-The separate `work-mode` extension controls when this tool is available:
-
-- `/mode orchestration` pins the main session to Sol/low and strongly directs it
-  to delegate through subagents.
-- `/mode build` leaves the current model alone and blocks subagent launches.
-
-The subagent extension remains responsible only for subagent execution and
-monitoring; mode enforcement lives in `agent/extensions/work-mode/`.
-
 ## Usage
 
-The `subagent` tool is available to the main agent with three modes:
+The `subagent` tool is available to the main agent at all times, with three modes:
 
 | Field           | Type              | Description                                                                                                                                                                                                                                                |
 | --------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `task`          | string            | Task text (single mode)                                                                                                                                                                                                                                    |
 | `tasks`         | array             | Independent tasks, run sequentially by default (parallel mode; `parallelLimit` opt-in)                                                                                                                                                                     |
 | `chain`         | array             | Ordered tasks; `{previous}` in a task text is replaced with the previous result (chain mode)                                                                                                                                                               |
-| `model`         | string            | Arbitrary model: `"provider/id"`, `"provider/*"`, or bare id — validated against the model registry before running. Native OpenAI models whose id/name contains `luna` always use priority fast mode.                                                                                                                                         |
+| `model`         | string            | Arbitrary model: `"provider/id"`, `"provider/*"`, or bare id — validated against the model registry before running. Overridden by your session-wide subagent model choice unless that choice is `auto`. Native OpenAI models whose id/name contains `luna` always use priority fast mode.                                                                                                                                         |
 | `agent`         | string            | Agent definition name (from agent files)                                                                                                                                                                                                                   |
 | `systemPrompt`  | string            | Inline system prompt (overrides agent prompt)                                                                                                                                                                                                              |
 | `tools`         | array             | Tool allowlist (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`)                                                                                                                                                                                     |
-| `thinking`      | string            | Reasoning level for the subagent model: `off` (default — cheap & fast), `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (model-dependent). Raise it for harder tasks that benefit from reasoning; the level is passed straight through to the provider. |
+| `thinking`      | string            | Reasoning level for the subagent model: `off` (default — cheap & fast), `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (model-dependent). Overridden by your session-wide subagent thinking choice unless that choice is `auto`. |
 | `timeoutSec`    | number            | Abort the subagent after N seconds                                                                                                                                                                                                                         |
 | `maxTurns`      | number            | Assistant-turn budget; the runner reserves one finalization turn at the boundary                                                                                                                                                                           |
 | `cwd`           | string            | Working directory for the subagent                                                                                                                                                                                                                         |
@@ -87,24 +76,31 @@ Frontmatter keys: `name`, `description`, `model`, `tools`, `thinking`,
 `worker`, `reviewer`) in `agent/agents/`. The reusable orchestration playbook is
 `agent/skills/subagent-orchestration/SKILL.md`.
 
-### Bundled profile policy
+## Model choice
 
-The named bundled agents have runtime-enforced controls:
+Subagents use the model and thinking level **you** choose, not one the launching
+agent picks:
 
-| Agent      | Model                       | Thinking | Tools                                   | Timeout / turns |
-| ---------- | --------------------------- | -------: | --------------------------------------- | --------------: |
-| `planner`  | `openai-codex/gpt-5.6-sol`  | `medium` | read, grep, find, ls                    |       240s / 18 |
-| `reviewer` | `openai-codex/gpt-5.6-sol`  |    `low` | read, grep, find, ls, bash              |       240s / 22 |
-| `scout`    | `openai-codex/gpt-5.6-luna` | `medium` | read, grep, find, ls, bash              |       180s / 18 |
-| `worker`   | `openai-codex/gpt-5.6-luna` |  `xhigh` | read, bash, edit, write, grep, find, ls |       600s / 40 |
-
-Their model, thinking level, tool allowlist, and budgets cannot be overridden
-by request fields. Inline and other custom agents remain configurable.
+- The first subagent launch in a session asks for a model and a thinking level.
+- The answer is remembered for the rest of the session; you are asked once.
+- At the end of the prompt you can opt to save it globally
+  (`<agentDir>/subagent-model.json`) so future sessions skip the prompt.
+- `/subagent-model` re-opens the prompt at any time, `/subagent-model status`
+  shows the session and global choices, and `/subagent-model reset` clears them.
+- Both dialogs offer `auto`, which defers to the agent file or the caller's
+  per-task request instead of overriding it.
+- The choice applies to every subagent, including the bundled
+  `planner`/`reviewer`/`scout`/`worker` agents. Their frontmatter provides the
+  fallback model, thinking, tool allowlist, and budgets used when the choice is
+  `auto`; those are sensible defaults, not a lock.
+- Launches are serial (`executionMode: "sequential"`) so the prompt cannot
+  overlap another tool call, and a cancelled prompt stops the launch instead of
+  guessing a model.
 
 ## Orchestrator pattern (strong planner + cheap workers)
 
 Run the main pi session on your strongest model and delegate heavy or parallelizable
-work to cheap worker models via `subagent`:
+work to subagents:
 
 - Decompose broad work into focused tasks with explicit expected outputs. A reliable
   default is scout/planner → focused worker → reviewer.
@@ -116,10 +112,9 @@ work to cheap worker models via `subagent`:
   `[Session: ...]` handle, resume that context with `sessionId` and a narrower task.
 - Choose `maxTurns`/`timeoutSec` from task complexity and inspect every result status;
   a partial result is not completion.
-- Every session's system prompt includes these orchestration controls and the live
-  cheapest configured model catalog, so the planner can choose workers deliberately.
-  In orchestration mode, the full `subagent-orchestration` skill is also loaded
-  before each task so context-rich handoff rules are available before delegation.
+- Every session's system prompt includes a delegation reminder so the agent uses
+  subagents whenever focused research, implementation, or review would help. There
+  is no mode gating: subagents are available at all times.
 - `/subagents` opens a live browser showing per-run cost, activity, and transcripts.
 
 ## Monitoring & inspection
@@ -192,9 +187,14 @@ output with a `Ctrl+O` hint).
   running), `renderRunResults` (final view), and the interactive
   `SubagentsBrowser` overlay used by `/subagents`.
 - `agents.ts` — agent discovery + frontmatter parsing.
-- `index.ts` — tool registration, live-run registry, `/subagents` command,
-  TUI renderers.
-- Deterministic tests (stub provider, no network): `bun test
-/tmp/subagent-tests/runner-inproc.test.ts` (compile `runner.ts` into
-  `/tmp/subagent-tests/dist` first via `tsconfig.subagents.emit.json`, since
-  Bun resolves bare specifiers from the test file's directory).
+- `preference.ts` — the user-owned model/thinking choice: session state, the
+  `subagent-model.json` global file, the ask-once prompt, and the override
+  applied to every task spec.
+- `index.ts` — tool registration, live-run registry, `/subagents` and
+  `/subagent-model` commands, the delegation reminder, TUI renderers.
+- Deterministic tests (no network, no TUI): `bun test pi/agent/tests/` covers
+  `preference.test.ts` (choice parsing, prompting, resolution) and
+  `subagent-wiring.test.ts` (registration, restore, prompt injection) in
+  addition to the runner and UI tests. `runner-inproc.test.ts` lives outside the
+  repo and compiles `runner.ts` first via `tsconfig.subagents.emit.json`, since
+  Bun resolves bare specifiers from the test file's directory.

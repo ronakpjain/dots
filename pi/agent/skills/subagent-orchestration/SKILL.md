@@ -73,7 +73,7 @@ Put stable role, tool, mutation, and reporting rules in `systemPrompt`; put dyna
 
 ## When to delegate
 
-Use `subagent` whenever one or more focused delegated tasks would materially improve the work. Choose delegation based on task complexity, independence, context isolation, and expected efficiency—not on a minimum number of subagent runs. Do not add redundant subagents merely to justify delegation.
+Use `subagent` whenever one or more focused delegated tasks would materially improve the work. Choose delegation based on task complexity, independence, context isolation, and expected efficiency—not on a minimum number of subagent runs. Do not add redundant subagents merely to justify delegation. Subagents are available at all times; there is no mode that blocks them, and the user chooses the model once per session.
 
 ## Default workflow
 
@@ -89,10 +89,10 @@ Use `subagent` whenever one or more focused delegated tasks would materially imp
 ## Controls
 
 - `agent`: use a named role when its tools and instructions fit the task.
-- `model`: choose a cheap model for routine scouting and a stronger model for planning, implementation, or review.
+- `model`: the user owns this. Pi asks for a subagent model on the first launch of a session and applies it to every run, so leave `model` unset unless the user chose `auto` and the task genuinely needs a specific model.
 - `tools`: restrict the worker to the smallest useful allowlist; use read-only tools for scouts/planners/reviewers.
 - `cwd`: set the repository or project directory explicitly when it differs from the parent, and state it in the handoff.
-- `thinking`: use `off`/`low` for routine workers and higher reasoning for difficult planning or review.
+- `thinking`: also user-owned by default (same ask-once prompt); set it only when the choice is `auto` and the task calls for a different level.
 - `maxTurns`: choose a real budget for the work. Rough defaults: scout 18, planner 18, reviewer 22, worker 40. Do not use a tiny budget merely to prevent loops.
 - `timeoutSec`: set a wall-clock limit appropriate to the task.
 - `parallelLimit`: control concurrency for independent tasks; leave it at 1 for dependent or resource-sensitive work.

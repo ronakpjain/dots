@@ -54,7 +54,20 @@ import {
 	SubagentsBrowser,
 	type LiveRun,
 } from "./ui.ts";
-import { applyAgentPolicy } from "./policy.ts";
+import {
+	SUBAGENT_PREFERENCE_ENTRY_TYPE,
+	applyPreference,
+	clearGlobalPreference,
+	describePreference,
+	getSessionPreference,
+	loadGlobalPreference,
+	promptForPreference,
+	resolvePreference,
+	restoredPreference,
+	saveGlobalPreference,
+	setSessionPreference,
+	type SubagentPreference,
+} from "./preference.ts";
 import { TOKEN_USAGE_EVENT } from "../token-tracker.ts";
 
 // ---------------------------------------------------------------------------
@@ -93,7 +106,7 @@ const TaskItem = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				'Arbitrary model: "provider/id", "provider/*", or bare id; ignored for policy-locked bundled agents',
+				'/Arbitrary model: "provider/id", "provider/*", or bare id; overridden by the user\'s session-wide subagent model choice when one is set',
 		}),
 	),
 	systemPrompt: Type.Optional(Type.String({ description: "Inline system prompt (overrides agent file prompt)" })),
@@ -124,7 +137,7 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				'Arbitrary model: "provider/id", "provider/*", or bare id (single mode); ignored for policy-locked bundled agents',
+				'Arbitrary model: "provider/id", "provider/*", or bare id (single mode); overridden by the user\'s session-wide subagent model choice when one is set',
 		}),
 	),
 	systemPrompt: Type.Optional(
@@ -335,6 +348,7 @@ function buildTask(
 	item: TaskItemType,
 	agents: ReturnType<typeof discoverAgents>["agents"],
 	ctx: Parameters<typeof resolveModel>[1],
+	preference: SubagentPreference | undefined,
 	step?: number,
 	previousOutput?: string,
 ): { ok: true; task: ResolvedTask } | { ok: false; error: string; suggestions?: string[] } {
@@ -346,15 +360,18 @@ function buildTask(
 	}
 
 	const systemPrompt = item.systemPrompt ?? agent?.systemPrompt ?? "";
-	// Named bundled profiles are policy-locked. Inline and custom agents keep
-	// the existing request-over-agent precedence.
-	const controls = applyAgentPolicy(item.agent, {
-		model: item.model ?? agent?.model,
-		tools: item.tools ?? agent?.tools,
-		thinking: item.thinking ?? agent?.thinking,
-		timeoutSec: item.timeoutSec ?? agent?.timeoutSec,
-		maxTurns: item.maxTurns ?? agent?.maxTurns,
-	});
+	// The user's session preference owns model + thinking; agent files and the
+	// caller's request stay as fallbacks when the preference is "auto".
+	const controls = applyPreference(
+		{
+			model: item.model ?? agent?.model,
+			tools: item.tools ?? agent?.tools,
+			thinking: item.thinking ?? agent?.thinking,
+			timeoutSec: item.timeoutSec ?? agent?.timeoutSec,
+			maxTurns: item.maxTurns ?? agent?.maxTurns,
+		},
+		preference,
+	);
 
 	const resolved = resolveModel(controls.model, ctx);
 	if (!resolved.ok) {
@@ -724,10 +741,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
+		// The user is asked for a model on the first launch; keep launches serial so
+		// that prompt cannot overlap another tool call.
+		executionMode: "sequential",
 		description: [
 			"Delegate tasks to subagents with isolated context windows and explicit orchestration controls. Use background:true when the main thread should continue while they run.",
 			"Single: {task}. Parallel: {tasks:[...], parallelLimit}. Chain: {chain:[...], onFailure, {previous}}.",
-			'Model is arbitrary: "provider/id", "provider/*", or bare id; validated before running. Bundled named-agent profiles are policy-locked. Native OpenAI Luna models always use priority fast mode.',
+			'Model and thinking level are chosen by the user: the first launch in a session asks, and the answer is reused for the session (optionally saved globally). Native OpenAI Luna models always use priority fast mode.',
 			"Use focused tasks with an explicit expected output; do not make one worker own discovery, implementation, and review.",
 			"Use parallel for independent tasks, chain for dependencies, and keepSession/sessionId to continue partial work without restarting.",
 			"maxTurns reserves a finalization turn; if a run still fails, its result includes partial output and a session id when keepSession was enabled.",
@@ -738,13 +758,13 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		parameters: SubagentParams,
 		promptGuidelines: [
-			"Use subagent whenever one or more focused delegated tasks would materially improve the work; stay in the main thread when delegation would add unnecessary overhead.",
+			"Use subagent proactively whenever one or more focused delegated tasks would materially improve the work; there is no mode gating and the main thread can keep working while they run.",
 			"Use subagent to delegate independent, parallelizable work to a fresh context window; set parallelLimit to 2-4 when concurrency is useful.",
 			"When delegation is beneficial and independent work remains, set background:true, continue independent main-thread work, then use subagent_status or subagent_wait instead of idling.",
 			"Prefer a scout/planner → focused worker → reviewer workflow instead of one broad worker call.",
 			"Use subagent chain with {previous} for dependent phases; set onFailure to continue only when later phases can recover from partial evidence.",
 			"Use keepSession when a task may need follow-up; resume a max-turn or partial run with its returned sessionId and a narrower task.",
-			"Prefer task-specific systemPrompt and tools allowlists so subagents stay focused and finish within their turn budget. For planner, reviewer, scout, and worker, model/tools/thinking/budget overrides are ignored.",
+			"Prefer task-specific systemPrompt and tools allowlists so subagents stay focused and finish within their turn budget; model and thinking come from the user's session preference, so do not set them.",
 			"When a native OpenAI model id/name contains Luna, the runner enforces priority fast mode at the provider payload boundary.",
 		],
 
@@ -809,6 +829,26 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			// The user owns the subagent model + thinking level. Ask once per session
+			// (or reuse the session/global choice) before any work is scheduled.
+			const resolution = await resolvePreference(ctx);
+			if (resolution.source === "cancelled") {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Subagent launch canceled: the user did not choose a subagent model. Ask the user which model to use, then retry.",
+						},
+					],
+					details: {},
+					isError: true,
+				};
+			}
+			if ((resolution.source === "prompted" || resolution.source === "global") && resolution.preference) {
+				pi.appendEntry(SUBAGENT_PREFERENCE_ENTRY_TYPE, resolution.preference);
+			}
+			const preference = resolution.preference;
+
 			const background = params.background === true;
 			const backgroundController = background ? new AbortController() : undefined;
 			const executionSignal = backgroundController?.signal ?? parentSignal;
@@ -843,7 +883,7 @@ export default function (pi: ExtensionAPI) {
 				step?: number,
 				previousOutput?: string,
 			): Promise<SubagentRunResult> => {
-				const resolved = buildTask(item, agents, ctx, step, previousOutput);
+				const resolved = buildTask(item, agents, ctx, preference, step, previousOutput);
 				if (!resolved.ok) {
 					const errText = resolved.suggestions?.length
 						? `${resolved.error} Did you mean: ${resolved.suggestions.join(", ")}?`
@@ -1295,5 +1335,92 @@ export default function (pi: ExtensionAPI) {
 				renderTextList(args, ctx);
 			}
 		},
+	});
+
+	// The user owns the subagent model + thinking level for the session.
+	const choosePreference = async (ctx: ExtensionContext): Promise<void> => {
+		if (!ctx.hasUI) {
+			ctx.ui.notify("Choosing a subagent model requires an interactive session.", "warning");
+			return;
+		}
+		const result = await promptForPreference(ctx);
+		if (result.cancelled || !result.preference) {
+			ctx.ui.notify("Subagent model choice cancelled.", "info");
+			return;
+		}
+		setSessionPreference(result.preference);
+		pi.appendEntry(SUBAGENT_PREFERENCE_ENTRY_TYPE, result.preference);
+		if (result.persistGlobally) await saveGlobalPreference(result.preference);
+		ctx.ui.notify(
+			`Subagents will use ${describePreference(result.preference)}${result.persistGlobally ? " (saved for future sessions)" : " (this session)"}.`,
+			"info",
+		);
+	};
+
+	pi.registerCommand("subagent-model", {
+		description: "Choose the model and thinking level subagents use (remembered per session; optional global save)",
+		handler: async (args, ctx) => {
+			const action = args.trim().toLowerCase();
+			if (action === "status") {
+				const session = getSessionPreference();
+				const global = await loadGlobalPreference();
+				ctx.ui.notify(
+					[
+						`Session: ${session ? describePreference(session) : "not chosen yet (asked on the first subagent launch)"}`,
+						`Global: ${global ? describePreference(global) : "not saved"}`,
+					].join("\n"),
+					"info",
+				);
+				return;
+			}
+			if (action === "reset") {
+				setSessionPreference(undefined);
+				const global = await loadGlobalPreference();
+				if (!global) {
+					ctx.ui.notify("Subagent model reset; the next launch asks again.", "info");
+					return;
+				}
+				if (!ctx.hasUI) {
+					ctx.ui.notify(
+						`Session choice cleared; the saved global choice (${describePreference(global)}) still applies.`,
+						"info",
+					);
+					return;
+				}
+				const clearGlobal = await ctx.ui.confirm(
+					"Clear the saved global subagent model?",
+					`Saved globally: ${describePreference(global)}.`,
+				);
+				if (clearGlobal) {
+					await clearGlobalPreference();
+					ctx.ui.notify("Subagent model reset; the next launch asks again.", "info");
+					return;
+				}
+				ctx.ui.notify(
+					`Session choice cleared; the saved global choice (${describePreference(global)}) still applies.`,
+					"info",
+				);
+				return;
+			}
+			if (action !== "" && action !== "select" && action !== "set") {
+				ctx.ui.notify("Usage: /subagent-model [select|status|reset]", "warning");
+				return;
+			}
+			await choosePreference(ctx);
+		},
+	});
+
+	pi.on("session_start", (_event, ctx) => {
+		setSessionPreference(restoredPreference(ctx.sessionManager.getBranch()));
+	});
+
+	pi.on("before_agent_start", (event) => {
+		const preference = getSessionPreference();
+		const choice = preference
+			? `The user already chose the subagent model for this session (${describePreference(preference)}); do not ask for one again and do not set model/thinking per task.`
+			: "The user is asked to choose the subagent model and thinking level on the first launch of each session.";
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n[SUBAGENT DELEGATION] Subagents run in isolated context windows and are available at all times, with no mode gating. Delegate proactively whenever focused research, implementation, or review would materially improve the work, and keep the main thread productive with background:true while they run. ${choice}`,
+		};
 	});
 }
