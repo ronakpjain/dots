@@ -19,6 +19,7 @@ import {
 	resolvePreference,
 	restoredPreference,
 	saveGlobalPreference,
+	selectableModels,
 	setSessionPreference,
 	type PreferenceDialogContext,
 } from "../extensions/subagents/preference.ts";
@@ -154,7 +155,48 @@ describe("model choices", () => {
 		}));
 		const choices = buildModelChoices(many);
 		expect(choices).toHaveLength(25);
-		expect(choices[0]!.description).toBe("free");
+			expect(choices[0]!.description).toBe("free");
+	});
+});
+
+describe("selectable models", () => {
+	const extra = { provider: "other", id: "extra-model", cost: { input: 9, output: 9 } };
+
+	test("restricts selection to the session's scoped models", () => {
+		const ctx = {
+			hasUI: true,
+			ui: { select: async () => undefined, input: async () => undefined, confirm: async () => false },
+			modelRegistry: { getAvailable: () => [sol, luna, extra], hasConfiguredAuth: () => true },
+			scopedModels: [{ model: luna }],
+		} as PreferenceDialogContext;
+		expect(selectableModels(ctx).map((model) => `${model.provider}/${model.id}`)).toEqual([
+			"openai-codex/gpt-5.6-luna",
+		]);
+	});
+
+	test("falls back to all authenticated models when unscoped", () => {
+		const ctx = {
+			hasUI: true,
+			ui: { select: async () => undefined, input: async () => undefined, confirm: async () => false },
+			modelRegistry: {
+				getAvailable: () => [sol, luna],
+				hasConfiguredAuth: (model: { provider: string }) => model.provider === "openai-codex",
+			},
+		} as PreferenceDialogContext;
+		expect(selectableModels(ctx)).toHaveLength(2);
+	});
+
+	test("never offers scoped models without configured auth", () => {
+		const ctx = {
+			hasUI: true,
+			ui: { select: async () => undefined, input: async () => undefined, confirm: async () => false },
+			modelRegistry: {
+				getAvailable: () => [sol, luna],
+				hasConfiguredAuth: (model: { id: string }) => model.id === "gpt-5.6-sol",
+			},
+			scopedModels: [{ model: luna }, { model: sol }],
+		} as PreferenceDialogContext;
+		expect(selectableModels(ctx).map((model) => model.id)).toEqual(["gpt-5.6-sol"]);
 	});
 });
 
@@ -232,6 +274,25 @@ describe("prompting for the preference", () => {
 			}),
 		);
 		expect(result.cancelled).toBe(true);
+	});
+
+	test("offers only scoped models when scoping is configured", async () => {
+		let offered: string[] = [];
+		await promptForPreference(
+			ctx({
+				scopedModels: [{ model: sol }],
+				ui: {
+					select: async (title: string, options: string[]) => {
+						if (title.startsWith("Which model")) offered = options;
+						return undefined;
+					},
+					input: async () => undefined,
+					confirm: async () => false,
+				},
+			}),
+		);
+		expect(offered.some((option) => option.includes("gpt-5.6-sol"))).toBe(true);
+		expect(offered.some((option) => option.includes("gpt-5.6-luna"))).toBe(false);
 	});
 });
 

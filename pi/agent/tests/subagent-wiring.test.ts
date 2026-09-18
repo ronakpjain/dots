@@ -100,17 +100,31 @@ describe("subagents extension wiring", () => {
 		await command.handler("status", statusCtx);
 		expect(notices.join("\n")).toContain("Session: not chosen yet");
 
+		let offered: string[] = [];
 		const selectCtx = {
 			hasUI: true,
-			ui: { ...interactiveUi, notify: (message: string) => notices.push(message) },
+			ui: {
+				...interactiveUi,
+				select: async (title: string, options: string[]) => {
+					if (title.startsWith("Which model")) offered = options;
+					return options[0]!;
+				},
+				notify: (message: string) => notices.push(message),
+			},
 			modelRegistry: {
 				getAvailable: () => [
 					{ provider: "openai-codex", id: "gpt-5.6-luna", name: "Luna", contextWindow: 200_000, cost: { input: 1, output: 8 } },
+					{ provider: "openai-codex", id: "gpt-5.6-sol", name: "Sol", contextWindow: 400_000, cost: { input: 2, output: 16 } },
 				],
 				hasConfiguredAuth: () => true,
 			},
+			scopedModels: [
+				{ model: { provider: "openai-codex", id: "gpt-5.6-luna", name: "Luna", contextWindow: 200_000, cost: { input: 1, output: 8 } } },
+			],
 		};
 		await command.handler("", selectCtx);
+		expect(offered.some((option) => option.includes("gpt-5.6-luna"))).toBe(true);
+		expect(offered.some((option) => option.includes("gpt-5.6-sol"))).toBe(false);
 		expect(getSessionPreference()).toEqual({ model: "openai-codex/gpt-5.6-luna", thinking: "auto" });
 		expect(pi.entries.at(-1)?.customType).toBe(SUBAGENT_PREFERENCE_ENTRY_TYPE);
 	});

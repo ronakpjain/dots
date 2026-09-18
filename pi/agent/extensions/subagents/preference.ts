@@ -213,13 +213,27 @@ export interface PreferencePromptResult {
 export interface PreferenceDialogContext {
 	hasUI: boolean;
 	ui: Pick<ExtensionContext["ui"], "select" | "input" | "confirm">;
-	modelRegistry: Pick<ExtensionContext["modelRegistry"], "getAvailable" | "hasConfiguredAuth">;
+	modelRegistry: {
+		getAvailable(): readonly SubagentModelInfo[];
+		hasConfiguredAuth(model: SubagentModelInfo): boolean;
+	};
+	/** Session-scoped models (`--models` / `enabledModels`). Empty means unscoped. */
+	scopedModels?: readonly { model: SubagentModelInfo }[];
+}
+
+/**
+ * Models the user may pick: the session's scoped set when scoping is configured
+ * (the same set `/scoped-models` shows), otherwise every authenticated model.
+ * Models without configured auth are never offered.
+ */
+export function selectableModels(ctx: PreferenceDialogContext): SubagentModelInfo[] {
+	const scoped = (ctx.scopedModels ?? []).map((entry) => entry.model);
+	const catalogue = scoped.length > 0 ? scoped : ctx.modelRegistry.getAvailable();
+	return catalogue.filter((model) => ctx.modelRegistry.hasConfiguredAuth(model));
 }
 
 export async function promptForPreference(ctx: PreferenceDialogContext): Promise<PreferencePromptResult> {
-	const choices = buildModelChoices(
-		ctx.modelRegistry.getAvailable().filter((model) => ctx.modelRegistry.hasConfiguredAuth(model)),
-	);
+	const choices = buildModelChoices(selectableModels(ctx));
 	if (choices.length === 0) return { persistGlobally: false, cancelled: true };
 
 	const modelOptions = [

@@ -82,6 +82,10 @@ Subagents use the model and thinking level **you** choose, not one the launching
 agent picks:
 
 - The first subagent launch in a session asks for a model and a thinking level.
+- The model list is restricted to the session's **scoped models** (the
+  `--models` / `enabledModels` set that `/scoped-models` shows); when no scoping
+  is configured it falls back to every authenticated model. Models without
+  configured auth are never offered.
 - The answer is remembered for the rest of the session; you are asked once.
 - At the end of the prompt you can opt to save it globally
   (`<agentDir>/subagent-model.json`) so future sessions skip the prompt.
