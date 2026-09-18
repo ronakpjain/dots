@@ -14,9 +14,7 @@ import vimModeExtension, {
 	takeVimUndo,
 	type VimCommand,
 	type VimUndoState,
-	workModeIndicator,
 } from "../extensions/vim-mode.ts";
-import { setWorkMode } from "../extensions/work-mode/state.ts";
 
 function command(sequence: string): VimCommand {
 	const parsed = parseVimCommand(sequence);
@@ -487,23 +485,6 @@ describe("vim editor insert transactions", () => {
 		expect(instance.render(30)[0]).toContain("\x1b[1;32m INSERT \x1b[0m");
 		instance.handleInput("\x1b");
 		expect(instance.render(30)[0]).toContain("\x1b[1;36m NORMAL \x1b[0m");
-	});
-
-	test("shows the work mode beside the Vim mode", () => {
-		setWorkMode("build");
-		const instance = editor();
-		const buildIndicator = instance.render(80)[0]!;
-		expect(buildIndicator).toContain("\x1b[1;34m BUILD \x1b[0m");
-		expect(buildIndicator.indexOf(" INSERT ")).toBeLessThan(buildIndicator.indexOf(" BUILD "));
-
-		setWorkMode("orchestration");
-		expect(instance.render(80)[0]).toContain("\x1b[1;33m ORCHESTRATION \x1b[0m");
-		setWorkMode("build");
-
-		expect(workModeIndicator("orchestration")).toEqual({
-			label: " ORCHESTRATION ",
-			color: "\x1b[1;33m",
-		});
 	});
 
 	test("renders a background on selected characters but not unselected text", () => {

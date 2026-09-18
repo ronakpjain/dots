@@ -6,16 +6,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { CURSOR_MARKER, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { getWorkMode, type WorkMode } from "./work-mode/state.ts";
 
 export type VimMode = "INSERT" | "NORMAL" | "VISUAL" | "VISUAL_LINE";
 export type VimSelectionKind = "characterwise" | "linewise";
-
-export function workModeIndicator(mode: WorkMode): { label: string; color: string } {
-	return mode === "orchestration"
-		? { label: " ORCHESTRATION ", color: "\x1b[1;33m" }
-		: { label: " BUILD ", color: "\x1b[1;34m" };
-}
 
 export interface VimSelection {
 	anchor: VimCursor;
@@ -1078,15 +1071,10 @@ export class VimEditor extends CustomEditor {
 			label = " NORMAL ";
 			color = "\x1b[1;36m";
 		}
-		const workMode = workModeIndicator(getWorkMode());
-		const border = "─".repeat(Math.max(0, width - visibleWidth(label) - visibleWidth(workMode.label) - 2));
+		const border = "─".repeat(Math.max(0, width - visibleWidth(label) - 1));
 		const borderColor = this.editorTheme.borderColor("─");
 		const decorated =
-			borderColor +
-			`${color}${label}\x1b[0m` +
-			borderColor +
-			`${workMode.color}${workMode.label}\x1b[0m` +
-			this.editorTheme.borderColor(border);
+			borderColor + `${color}${label}\x1b[0m` + this.editorTheme.borderColor(border);
 		lines[0] = truncateToWidth(decorated, width, "");
 		return lines;
 	}
