@@ -1,9 +1,9 @@
 # ── Signals ──────────────────────────────────────────────
-yabai -m signal --add event=dock_did_restart action="sudo yabai --load-sa"
-sudo yabai --load-sa
+yabai -m signal --add event=dock_did_restart action="sudo -n /opt/homebrew/bin/yabai --load-sa"
+sudo -n /opt/homebrew/bin/yabai --load-sa
 
-yabai -m signal --add event=space_changed action="yabai -m window --focus \$(yabai -m query --windows --space | jq .[0].id)"
-yabai -m signal --add event=display_changed action="yabai -m window --focus \$(yabai -m query --windows --space | jq .[0].id)"
+yabai -m signal --add event=space_changed action="wid=\$(yabai -m query --windows --space | jq -r '.[0].id // empty'); [ -z \"\$wid\" ] || yabai -m window --focus \"\$wid\""
+yabai -m signal --add event=display_changed action="wid=\$(yabai -m query --windows --space | jq -r '.[0].id // empty'); [ -z \"\$wid\" ] || yabai -m window --focus \"\$wid\""
 
 yabai -m signal --add event=window_destroyed action="yabai -m query --windows --window &> /dev/null || yabai -m window --focus first"
 yabai -m signal --add event=application_terminated action="yabai -m query --windows --window &> /dev/null || yabai -m window --focus first"
