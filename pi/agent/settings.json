@@ -1,7 +1,7 @@
 {
-  "lastChangelogVersion": "0.85.1",
+  "lastChangelogVersion": "0.87.1",
   "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.6-luna",
+  "defaultModel": "gpt-6-luna",
   "defaultThinkingLevel": "max",
   "hideThinkingBlock": false,
   "enableSkillCommands": true,
@@ -10,9 +10,10 @@
     "https://github.com/carderne/pi-nvim"
   ],
   "enabledModels": [
-    "openai-codex/gpt-5.6-sol",
-    "openai-codex/gpt-5.6-terra",
-    "openai-codex/gpt-5.6-luna"
+    "openai-codex/gpt-6-astra",
+    "openrouter/deepseek/deepseek-v4.1-flash",
+    "openai-codex/gpt-6-luna",
+    "openai-codex/gpt-6-sol"
   ],
-  "tuiMode": "regular"
+  "tuiMode": "fullscreen"
 }
