@@ -188,11 +188,13 @@ const BackgroundStatusParams = Type.Object({
 });
 
 const SubagentHistoryParams = Type.Object({
-	runId: Type.Optional(Type.String({ description: "Read one run's persisted transcript by run id" })),
+	runId: Type.Optional(Type.String({ description: "Read live or completed history for one run" })),
 	groupId: Type.Optional(Type.String({ description: "Limit history to a subagent group id" })),
 	filter: Type.Optional(Type.String({ description: "Case-insensitive AND terms matched against run metadata" })),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum runs to return (default 5)" })),
-	includeTranscript: Type.Optional(Type.Boolean({ description: "Include full assistant/tool transcript instead of final answer only" })),
+	includeTranscript: Type.Optional(
+		Type.Boolean({ description: "Include assistant/tool transcript; for active runs, include retained live events and current streamed text" }),
+	),
 });
 
 const SubagentCancelParams = Type.Object({
@@ -653,6 +655,36 @@ function formatHistoryRuns(runs: LiveRun[], includeTranscript: boolean): string 
 			if (truncated) break;
 		}
 		if (truncated) break;
+		if (run.status === "running") {
+			if (!add("Live activity (most recent retained events):")) break;
+			for (const activity of run.activities) {
+				const at = `[+${formatElapsed(activity.at)}]`;
+				let detail: string;
+				switch (activity.kind) {
+					case "message":
+						detail = `assistant (message preview): ${activity.text ?? ""}`;
+						break;
+					case "thinking":
+						detail = `assistant: ${activity.text ?? ""}`;
+						break;
+					case "tool":
+						detail = `tool ${activity.toolName ?? "unknown"}(${activity.args ?? activity.argsPreview ?? ""})`;
+						break;
+					case "toolResult":
+						detail = `${activity.isError ? "tool error" : "tool result"} ${activity.toolName ?? "unknown"}: ${activity.resultText ?? activity.resultPreview ?? ""}`;
+						break;
+					case "status":
+						detail = `status: ${activity.text ?? ""}`;
+						break;
+				}
+				if (!add(`${at} ${detail}`)) break;
+			}
+			if (!truncated && run.currentThinking && !add(`Current streamed assistant text: ${run.currentThinking}`)) break;
+			if (!truncated && run.activities.length === 0 && !run.currentThinking) {
+				add("[no live assistant or tool activity yet]");
+			}
+		}
+		if (truncated) break;
 		if (run.transcriptTruncated && !add("[Stored transcript was truncated before this history view.]")) break;
 	}
 
@@ -954,7 +986,7 @@ export default function (pi: ExtensionAPI) {
 			"Model choices are keyed by agent definition name; unnamed tasks use the default or inline type and do not inherit another type's choice.",
 			"Use parallel for independent tasks, chain for dependencies, and keepSession/sessionId to continue partial work without restarting.",
 			"maxTurns reserves a finalization turn; if a run still fails, its result includes partial output and a session id when keepSession was enabled.",
-			`Every group runs in the background after the launch tool returns and has a ${DEFAULT_SUBAGENT_TIMEOUT_SEC}s default hard timeout; set timeoutSec higher for longer work. Continue independent work or return control to the user; do not wait for subagent results. Use subagent_status for run ids, subagent_history for persisted transcripts, and subagent_cancel to stop one run or a whole group.`,
+			`Every group runs in the background after the launch tool returns and has a ${DEFAULT_SUBAGENT_TIMEOUT_SEC}s default hard timeout; set timeoutSec higher for longer work. Continue independent work or return control to the user; do not wait for subagent results. Use subagent_status for run ids, subagent_history with includeTranscript for live or persisted history, and subagent_cancel to stop one run or a whole group.`,
 			"thinking, tools, cwd, timeoutSec, maxTurns, parallelLimit, and onFailure are orchestration controls, not decoration.",
 			"Luna subagents always use OpenAI priority fast mode; callers cannot disable or override that service tier.",
 			`Agents: ${formatAgentList(discoverAgents(process.cwd(), "user").agents, 5).text}.`,
@@ -963,7 +995,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use subagent proactively whenever one or more focused delegated tasks would materially improve the work; there is no mode gating and the main thread can keep working while they run.",
 			"Use subagent to delegate independent, parallelizable work to a fresh context window; set parallelLimit to 2-4 when concurrency is useful.",
-			"When delegation is beneficial, launch the task and immediately continue independent main-thread work. If no useful work remains, return control to the user; completed results interject automatically. Use subagent_status for live snapshots, subagent_history to inspect prior transcripts, and subagent_cancel to stop an unwanted run/group.",
+			"When delegation is beneficial, launch the task and immediately continue independent main-thread work. If no useful work remains, return control to the user; completed results interject automatically. Use subagent_status for live snapshots, subagent_history to inspect live or prior transcripts, and subagent_cancel to stop an unwanted run/group.",
 			NO_DUPLICATE_WORK_DIRECTIVE,
 			"Prefer a scout/planner → focused worker → reviewer workflow instead of one broad worker call.",
 			"Use subagent chain with {previous} for dependent phases; set onFailure to continue only when later phases can recover from partial evidence.",
@@ -1381,7 +1413,7 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_history",
 		label: "Subagent history",
 		description:
-			"Read this session's persisted subagent runs and transcripts. Filter by runId, groupId, or metadata; includeTranscript reveals assistant, thinking, and tool history. Output is capped.",
+			"Read live or persisted subagent history by runId, groupId, or metadata. For a running run, includeTranscript returns completed messages plus recent tool events and current streamed assistant text. Output is capped.",
 		parameters: SubagentHistoryParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, rawContext) {
 			const ctx = rawContext as ExtensionContext;
@@ -1763,7 +1795,7 @@ export default function (pi: ExtensionAPI) {
 				? `The user already chose subagent models per type (${entries.map(([type, preference]) => `${type}: ${describePreference(preference)}`).join(", ")}); do not ask again for those types. For a new type, ask on its first launch.`
 				: "The user is asked to choose the subagent model and thinking level on the first launch of each session's subagent type.";
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n[SUBAGENT DELEGATION] Subagents run in isolated context windows and are available at all times, with no mode gating. Delegate proactively whenever focused research, implementation, or review would materially improve the work. Every subagent launch is non-blocking and has a ${DEFAULT_SUBAGENT_TIMEOUT_SEC}s default hard timeout (set timeoutSec higher for long tasks); continue independent work or return control to the user. Completed groups automatically interject their capped result into this session. Use subagent_status for live snapshots and run ids, subagent_history to inspect past transcripts, and subagent_cancel to stop one run or an entire group; do not wait or poll for completion. ${NO_DUPLICATE_WORK_DIRECTIVE} ${choice}`,
+			systemPrompt: `${event.systemPrompt}\n\n[SUBAGENT DELEGATION] Subagents run in isolated context windows and are available at all times, with no mode gating. Delegate proactively whenever focused research, implementation, or review would materially improve the work. Every subagent launch is non-blocking and has a ${DEFAULT_SUBAGENT_TIMEOUT_SEC}s default hard timeout (set timeoutSec higher for long tasks); continue independent work or return control to the user. Completed groups automatically interject their capped result into this session. Use subagent_status for live snapshots and run ids, subagent_history to inspect the transcript so far or past transcripts, and subagent_cancel to stop one run or an entire group; do not wait or poll for completion. ${NO_DUPLICATE_WORK_DIRECTIVE} ${choice}`,
 		};
 	});
 }

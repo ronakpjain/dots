@@ -82,7 +82,7 @@ Use `subagent` whenever one or more focused delegated tasks would materially imp
 3. **Identify only the remaining unknowns.** If discovery is needed, give the scout the known map and ask targeted questions; do not commission a second broad reconnaissance pass.
 4. **Decompose** the request into narrow tasks with an explicit expected output, context package, scope, and validation.
 5. **Fan out independent work** with `tasks` and `parallelLimit: 2-4`. Keep parallel tasks read-only or ensure their mutation targets do not overlap.
-6. **Never block on delegated work**: every subagent launch is non-blocking. Continue independent discovery, implementation, or validation; if no useful work remains, return control to the user. Use `subagent_status` for live snapshots/run ids, `subagent_history` to inspect prior transcripts, and `subagent_cancel` to stop one run or an entire group—there is intentionally no wait tool.
+6. **Never block on delegated work**: every subagent launch is non-blocking. Continue independent discovery, implementation, or validation; if no useful work remains, return control to the user. Use `subagent_status` for live snapshots/run ids, `subagent_history` to inspect prior transcripts or a running agent's retained live activity (`includeTranscript: true`), and `subagent_cancel` to stop one run or an entire group—there is intentionally no wait tool.
 7. **Chain dependent work** with `chain` and `{previous}`. A reliable implementation flow is scout/planner → focused worker → reviewer, with each phase receiving the relevant accumulated context.
 8. **Synthesize and verify** the results in the orchestrator. A worker's partial or failed result is evidence, not completion; reconcile it with the handoff and run the final checks yourself.
 

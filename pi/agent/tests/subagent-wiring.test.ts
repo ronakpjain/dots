@@ -50,6 +50,34 @@ function fakePi(): FakePi {
 	return state;
 }
 
+function toolThenHangProvider() {
+	let calls = 0;
+	return {
+		streamSimple: async () => {
+			if (calls++ > 0) return new Promise<never>(() => {});
+			const message = {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "I found the live path." },
+					{ type: "toolCall", id: "live-history-call", name: "bash", arguments: { command: "printf live-history-output" } },
+				],
+				api: "openai-completions",
+				provider: "test",
+				model: "model",
+				usage: { input: 1, output: 1, totalTokens: 2, cost: { total: 0 } },
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			};
+			const stream = (async function* () {
+				yield { type: "start", partial: message };
+				yield { type: "done", reason: "toolUse", message };
+			})();
+			(stream as any).result = () => message;
+			return stream;
+		},
+	};
+}
+
 const interactiveUi = {
 	select: async (title: string, options: string[]) => {
 		if (title.startsWith("Which model")) return options[0]!;
@@ -198,10 +226,11 @@ describe("subagents extension wiring", () => {
 		expect(result.content[0]?.text).toContain("completed group result will be interjected automatically");
 	});
 
-	test("lets the main agent cancel one live subagent by runId", async () => {
+	test("lets the main agent inspect and cancel a live subagent by runId", async () => {
 		setSessionPreference({ model: "test/model", thinking: "off" });
 		const pi = fakePi();
 		(subagentsExtension as (api: unknown) => void)(pi.api);
+		const hangingProvider = toolThenHangProvider();
 		const context = {
 			cwd: process.cwd(),
 			hasUI: false,
@@ -214,7 +243,7 @@ describe("subagents extension wiring", () => {
 				getAvailable: () => [
 					{ provider: "test", id: "model", name: "Test", contextWindow: 1024, maxTokens: 1024 },
 				],
-				getProvider: () => ({ streamSimple: () => new Promise<never>(() => {}) }),
+				getProvider: () => hangingProvider,
 				getApiKeyForProvider: async () => undefined,
 			},
 		};
@@ -238,6 +267,22 @@ describe("subagents extension wiring", () => {
 		}
 		const runId = statusText.match(/runId ([a-f0-9-]+)/)?.[1];
 		expect(runId).toBeTruthy();
+
+		let transcript = "";
+		for (let attempt = 0; attempt < 40 && !transcript.includes("live-history-output"); attempt++) {
+			const history = (await pi.tools.get("subagent_history")!.execute!(
+				"live-history",
+				{ runId, includeTranscript: true },
+				undefined,
+				undefined,
+				context,
+			)) as { content: Array<{ text?: string }> };
+			transcript = history.content[0]?.text ?? "";
+			if (!transcript.includes("live-history-output")) await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		expect(transcript).toContain("Live activity");
+		expect(transcript).toContain("I found the live path.");
+		expect(transcript).toContain("live-history-output");
 
 		const cancel = pi.tools.get("subagent_cancel")!;
 		const canceled = (await cancel.execute!("cancel-run", { runId }, undefined, undefined, context)) as {

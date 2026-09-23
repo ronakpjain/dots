@@ -43,7 +43,7 @@ The `subagent` tool is available to the main agent at all times, with three mode
 
 Every single, parallel, and chain request returns immediately while the group continues in-process. The result includes a group id. Continue independent work in the main session, or return control to the user when there is nothing useful to do.
 
-When every run in a group finishes, the extension automatically interjects a capped completion message into the parent session with `pi.sendMessage()` using steering delivery. It queues like a user steering message while the parent is working and triggers a continuation when the parent is idle. The message includes the group summary and is visible in the transcript. `subagent_status` provides a non-blocking live snapshot and run ids; the main agent can use `subagent_history` to retrieve persisted run transcripts and `subagent_cancel` to cancel one run (`runId`) or a whole group (`groupId`). There is intentionally no wait tool.
+When every run in a group finishes, the extension automatically interjects a capped completion message into the parent session with `pi.sendMessage()` using steering delivery. It queues like a user steering message while the parent is working and triggers a continuation when the parent is idle. The message includes the group summary and is visible in the transcript. `subagent_status` provides a non-blocking live snapshot and run ids; the main agent can use `subagent_history` to inspect persisted transcripts or, with `includeTranscript: true`, the completed messages and retained live events/current streamed text of a running subagent. Live activity is a bounded recent tail; `subagent_cancel` stops one run (`runId`) or a whole group (`groupId`). There is intentionally no wait tool.
 
 Groups are canceled when the session shuts down. Stale completions from a shutdown or session switch are not interjected into the replacement session. This behavior is enforced by the extension rather than being an opt-in flag.
 
@@ -182,7 +182,7 @@ the session output behind it. The selected run row is highlighted with
 - In non-TUI modes (print/RPC), `/subagents` falls back to a plain-text
   widget listing the most recent runs.
 
-The launch tool renders only its immediate acknowledgement. Completed groups also interject their capped result into the parent session automatically; `/subagents` remains available for interactive history, while the main agent uses `subagent_status`, `subagent_history`, and `subagent_cancel` tools for run control and transcript inspection.
+The launch tool renders only its immediate acknowledgement. Completed groups also interject their capped result into the parent session automatically; `/subagents` remains available for interactive history, while the main agent uses `subagent_status`, `subagent_history` (including live activity with `includeTranscript: true`), and `subagent_cancel` for run control and transcript inspection.
 
 ## Development
 
