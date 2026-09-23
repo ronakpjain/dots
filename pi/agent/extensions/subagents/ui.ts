@@ -35,7 +35,11 @@ export interface RunActivity {
 	at: number;
 	text?: string;
 	toolName?: string;
+	/** Full serialized tool arguments; the preview remains for compact views. */
+	args?: string;
 	argsPreview?: string;
+	/** Full text tool output for expanded live views. */
+	resultText?: string;
 	resultPreview?: string;
 	isError?: boolean;
 }
@@ -49,7 +53,15 @@ export interface LiveRun {
 	step?: number;
 	name: string;
 	model: string;
+	/** Exact task prompt sent by the main agent. */
 	task: string;
+	/** Resolved subagent instructions and controls, shown in the detail view. */
+	systemPrompt?: string;
+	tools?: string[];
+	thinking?: string;
+	cwd?: string;
+	timeoutSec?: number;
+	maxTurns?: number;
 	status: "running" | "ok" | "error";
 	/** epoch ms */
 	startTime: number;
@@ -165,15 +177,19 @@ export function runDisplayName(r: { kind: "single" | "parallel" | "chain"; step?
 // Activity lines
 // ---------------------------------------------------------------------------
 
-export function activityLine(a: RunActivity, theme: Theme): string {
+export function activityLine(a: RunActivity, theme: Theme, expanded = false): string {
 	switch (a.kind) {
-		case "tool":
-			return `  ${theme.fg("toolTitle", `🔧 ${a.toolName}`)} ${theme.fg("dim", a.argsPreview ?? "")}`;
-		case "toolResult":
+		case "tool": {
+			const args = expanded ? (a.args ?? a.argsPreview ?? "") : (a.argsPreview ?? a.args ?? "");
+			return `  ${theme.fg("toolTitle", `🔧 ${a.toolName}`)} ${theme.fg("dim", args)}`;
+		}
+		case "toolResult": {
+			const result = expanded ? (a.resultText ?? a.resultPreview ?? "") : (a.resultPreview ?? a.resultText ?? "");
 			if (a.isError) {
-				return `  ${theme.fg("error", `✗ ${a.toolName}`)}${a.resultPreview ? ` ${theme.fg("error", preview(a.resultPreview, 90))}` : ""}`;
+				return `  ${theme.fg("error", `✗ ${a.toolName}`)}${result ? ` ${theme.fg("error", expanded ? result : preview(result, 90))}` : ""}`;
 			}
-			return `  ${theme.fg("success", `✓ ${a.toolName}`)}${a.resultPreview ? ` ${theme.fg("dim", preview(a.resultPreview, 90))}` : ""}`;
+			return `  ${theme.fg("success", `✓ ${a.toolName}`)}${result ? ` ${theme.fg("dim", expanded ? result : preview(result, 90))}` : ""}`;
+		}
 		case "message":
 			return `  ${theme.fg("accent", "💬")} ${theme.fg("dim", preview(a.text ?? "", 110))}`;
 		case "thinking":
@@ -229,7 +245,7 @@ export function messageSegments(messages: AgentMessage[]): TranscriptSegment[] {
 				} else if (part.type === "thinking" && part.thinking?.trim()) {
 					segments.push({ type: "thinking", turn, text: part.thinking });
 				} else if (part.type === "toolCall") {
-					const args = preview(JSON.stringify(part.arguments), 140);
+					const args = JSON.stringify(part.arguments);
 					pending.set(part.id, { name: part.name, args });
 					segments.push({ type: "toolCall", turn, name: part.name, args });
 				}
@@ -256,15 +272,23 @@ function runHeaderLine(r: SubagentRunResult, theme: Theme): string {
 	return `${icon} ${theme.fg("accent", r.name)}${stop} · ${theme.fg("dim", r.model)} · ${theme.fg("dim", formatElapsed(r.durationMs ?? 0))}`;
 }
 
-function appendSegment(container: Container, seg: TranscriptSegment, mdTheme: MarkdownTheme, theme: Theme): void {
+function appendSegment(
+	container: Container,
+	seg: TranscriptSegment,
+	mdTheme: MarkdownTheme,
+	theme: Theme,
+	expanded = false,
+): void {
 	switch (seg.type) {
 		case "text":
 			container.addChild(new Spacer(1));
-			container.addChild(new Markdown(truncateBytes(seg.text, 6000), 0, 0, mdTheme));
+			container.addChild(new Markdown(expanded ? seg.text : truncateBytes(seg.text, 6000), 0, 0, mdTheme));
 			break;
 		case "thinking":
 			container.addChild(new Spacer(1));
-			container.addChild(new Text(theme.fg("thinkingLow", `💭 ${truncateBytes(seg.text, 2000)}`), 0, 0));
+			container.addChild(
+				new Text(theme.fg("thinkingLow", `💭 ${expanded ? seg.text : truncateBytes(seg.text, 2000)}`), 0, 0),
+			);
 			break;
 		case "toolCall":
 			container.addChild(new Spacer(1));
@@ -280,7 +304,8 @@ function appendSegment(container: Container, seg: TranscriptSegment, mdTheme: Ma
 			container.addChild(
 				new Text(seg.isError ? theme.fg("error", `✗ ${seg.name}`) : theme.fg("success", `✓ ${seg.name}`), 0, 0),
 			);
-			if (seg.text) container.addChild(new Text(theme.fg("toolOutput", truncateBytes(seg.text, 4000)), 1, 0));
+			if (seg.text)
+				container.addChild(new Text(theme.fg("toolOutput", expanded ? seg.text : truncateBytes(seg.text, 4000)), 1, 0));
 			break;
 	}
 }
@@ -362,7 +387,7 @@ export function renderRunResults(
 	for (const r of results) {
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(runHeaderLine(r, theme), 0, 0));
-		container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", preview(r.task, 120)), 0, 0));
+		container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", expanded ? r.task : preview(r.task, 120)), 0, 0));
 		if (isFailedResult(r) && r.errorMessage) {
 			container.addChild(new Text(theme.fg("error", r.errorMessage), 0, 0));
 		}
@@ -375,14 +400,14 @@ export function renderRunResults(
 					);
 					lastTurn = seg.turn;
 				}
-				appendSegment(container, seg, mdTheme, theme);
+				appendSegment(container, seg, mdTheme, theme, expanded);
 			}
 		}
 		const final = getFinalOutput(r.messages);
 		if (final) {
 			container.addChild(new Spacer(1));
 			if (expanded) container.addChild(new Text(theme.fg("muted", "Final output:"), 0, 0));
-			container.addChild(new Markdown(truncateBytes(final, 8000), 0, 0, mdTheme));
+			container.addChild(new Markdown(expanded ? final : truncateBytes(final, 8000), 0, 0, mdTheme));
 		} else if (!expanded && isFailedResult(r)) {
 			container.addChild(new Text(theme.fg("error", r.stderr || "(no output)"), 0, 0));
 		}
@@ -411,6 +436,49 @@ type PanelBg = "selectedBg" | "customMessageBg" | "toolPendingBg";
 /** A rendered detail row: code rows keep full width and scroll horizontally; others wrap. */
 type BodyLine = { text: string; code: boolean };
 
+function appendSectionHeading(lines: BodyLine[], theme: Theme, width: number, label: string): void {
+	const prefix = `  ── ${label} `;
+	const fill = "─".repeat(Math.max(0, width - 2 - visibleWidth(prefix)));
+	lines.push({ text: theme.fg("borderMuted", `${prefix}${fill}`), code: false });
+}
+
+function appendWrappedSection(
+	lines: BodyLine[],
+	theme: Theme,
+	width: number,
+	label: string,
+	text: string,
+	color: "dim" | "thinkingLow" = "dim",
+): void {
+	appendSectionHeading(lines, theme, width, label);
+	const innerWidth = Math.max(1, width - 6);
+	const value = text.trim() ? text : "(none)";
+	for (const line of wrapTextWithAnsi(theme.fg(color, value), innerWidth)) {
+		lines.push({ text: `    ${line}`, code: false });
+	}
+}
+
+function appendKeyValueSection(
+	lines: BodyLine[],
+	theme: Theme,
+	width: number,
+	label: string,
+	fields: Array<[string, string]>,
+): void {
+	appendSectionHeading(lines, theme, width, label);
+	for (const [name, value] of fields) {
+		const prefix = `    ${name}: `;
+		const valueWidth = Math.max(1, width - 2 - visibleWidth(prefix));
+		const wrapped = wrapTextWithAnsi(theme.fg("dim", value || "(none)"), valueWidth);
+		for (let i = 0; i < wrapped.length; i++) {
+			lines.push({
+				text: `${i === 0 ? theme.fg("muted", prefix) : " ".repeat(prefix.length)}${wrapped[i]}`,
+				code: false,
+			});
+		}
+	}
+}
+
 function groupContext(run: LiveRun, runs: LiveRun[], allRuns: LiveRun[] = runs): string | undefined {
 	if (!run.groupId) return undefined;
 	const groupRuns = allRuns.filter((candidate) => candidate.groupId === run.groupId);
@@ -420,10 +488,16 @@ function groupContext(run: LiveRun, runs: LiveRun[], allRuns: LiveRun[] = runs):
 	return `group ${run.groupId.slice(0, 8)} · ${step}${completed}/${planned} done`;
 }
 
-function transcriptBodyLines(messages: AgentMessage[], theme: Theme, width: number, capChars: number): BodyLine[] {
+function transcriptBodyLines(
+	messages: AgentMessage[],
+	theme: Theme,
+	width: number,
+	capChars: number,
+	expanded = false,
+): BodyLine[] {
 	const lines: BodyLine[] = [];
 	let lastTurn = 0;
-	let budget = capChars;
+	let budget = expanded ? Number.POSITIVE_INFINITY : capChars;
 	const innerWidth = Math.max(1, width - 2);
 	// code rows are never wrapped or truncated (they scroll horizontally); prose rows wrap.
 	const pushStyled = (styled: string, code: boolean) => {
@@ -435,7 +509,7 @@ function transcriptBodyLines(messages: AgentMessage[], theme: Theme, width: numb
 	};
 	const pushNotice = (text: string) => lines.push({ text: theme.fg("warning", `  ⚠ ${text}`), code: false });
 	for (const seg of messageSegments(messages)) {
-		if (budget <= 0) {
+		if (Number.isFinite(budget) && budget <= 0) {
 			pushNotice("transcript display truncated; more content is not shown");
 			break;
 		}
@@ -445,32 +519,34 @@ function transcriptBodyLines(messages: AgentMessage[], theme: Theme, width: numb
 		}
 		switch (seg.type) {
 			case "text": {
-				const t = truncateBytes(seg.text, Math.min(4000, Math.max(1, budget)));
-				if (t !== seg.text) pushNotice("message text truncated for display");
+				const t = expanded ? seg.text : truncateBytes(seg.text, Math.min(4000, Math.max(1, budget)));
+				if (!expanded && t !== seg.text) pushNotice("message text truncated for display");
 				budget -= Math.min(budget, t.length);
 				for (const l of t.split("\n")) pushStyled(`  💬 ${l}`, false);
 				break;
 			}
 			case "thinking": {
-				const t = truncateBytes(seg.text, Math.min(1500, Math.max(1, budget)));
-				if (t !== seg.text) pushNotice("thinking text truncated for display");
+				const t = expanded ? seg.text : truncateBytes(seg.text, Math.min(1500, Math.max(1, budget)));
+				if (!expanded && t !== seg.text) pushNotice("thinking text truncated for display");
 				budget -= Math.min(budget, t.length);
 				for (const l of t.split("\n")) {
 					pushStyled(theme.fg("thinkingLow", `  💭 ${l}`), false);
 				}
 				break;
 			}
-			case "toolCall":
-				pushStyled(`  ${theme.fg("toolTitle", `🔧 ${seg.name}`)} ${theme.fg("dim", seg.args)}`, true);
+			case "toolCall": {
+				const args = expanded ? seg.args : preview(seg.args, 140);
+				pushStyled(`  ${theme.fg("toolTitle", `🔧 ${seg.name}`)} ${theme.fg("dim", args)}`, true);
 				break;
+			}
 			case "toolResult": {
 				lines.push({
 					text: seg.isError ? theme.fg("error", `  ✗ ${seg.name}`) : theme.fg("success", `  ✓ ${seg.name}`),
 					code: false,
 				});
 				if (seg.text) {
-					const t = truncateBytes(seg.text, Math.min(3000, Math.max(1, budget)));
-					if (t !== seg.text) pushNotice("tool output truncated for display");
+					const t = expanded ? seg.text : truncateBytes(seg.text, Math.min(3000, Math.max(1, budget)));
+					if (!expanded && t !== seg.text) pushNotice("tool output truncated for display");
 					budget -= Math.min(budget, t.length);
 					for (const l of t.split("\n")) pushStyled(theme.fg("toolOutput", `    ${l}`), true);
 				}
@@ -486,6 +562,7 @@ export class SubagentsBrowser implements Component {
 	private selected = 0;
 	private selectedRunId?: string;
 	private detailRunId?: string;
+	private detailExpanded = false;
 	private scroll = 0;
 	private scrollX = 0;
 	private timer: ReturnType<typeof setInterval> | null = null;
@@ -550,6 +627,12 @@ export class SubagentsBrowser implements Component {
 					run.name,
 					run.model,
 					run.task,
+					run.systemPrompt,
+					run.tools,
+					run.thinking,
+					run.cwd,
+					run.timeoutSec,
+					run.maxTurns,
 					run.status,
 					run.startTime,
 					run.endTime,
@@ -742,6 +825,14 @@ export class SubagentsBrowser implements Component {
 			this.tui.requestRender();
 			return;
 		}
+		if (data === "o" || data === "O" || matchesKey(data, Key.ctrl("o"))) {
+			this.detailExpanded = !this.detailExpanded;
+			this.scroll = 0;
+			this.scrollX = 0;
+			this.invalidate();
+			this.tui.requestRender();
+			return;
+		}
 		const hStep = Math.max(1, Math.floor((this.cachedWidth - 2) / 2));
 		if (matchesKey(data, Key.left) || data === "h") this.scrollX = Math.max(0, this.scrollX - hStep);
 		else if (matchesKey(data, Key.right) || data === "l") this.scrollX += hStep;
@@ -791,13 +882,13 @@ export class SubagentsBrowser implements Component {
 	}
 
 	private listRunLimit(): number {
-		// A run uses two rows (summary + task); reserve room for borders, header,
-		// and footer so small terminals do not get an over-tall overlay.
+		// A run uses three rows (summary + metadata + prompt); reserve room for
+		// borders, header, and footer so small terminals do not get over-tall.
 		const rows = this.terminalRows();
 		if (rows === undefined) return BROWSER_MAX_ROWS;
 		return Math.max(
 			1,
-			Math.min(BROWSER_MAX_ROWS, Math.floor(Math.max(1, this.viewportRows() - 8) / 2)),
+			Math.min(BROWSER_MAX_ROWS, Math.floor(Math.max(1, this.viewportRows() - 8) / 3)),
 		);
 	}
 
@@ -808,7 +899,9 @@ export class SubagentsBrowser implements Component {
 		const active = runs.filter((r) => r.status === "running").length;
 		const totalCost = runs.reduce((s, r) => s + r.usage.cost, 0);
 		const title = th.fg("accent", th.bold(" Subagents "));
-		const summary = ` ${runs.length} runs · ${active} active · $${totalCost.toFixed(4)}`;
+		const summaryParts = [`${runs.length} runs`, `${active} active`];
+		if (totalCost > 0) summaryParts.push(`$${totalCost.toFixed(4)}`);
+		const summary = ` ${summaryParts.join(" · ")}`;
 		const filler = th.fg(
 			"borderMuted",
 			"─".repeat(Math.max(0, width - 2 - visibleWidth(title) - visibleWidth(summary))),
@@ -834,13 +927,16 @@ export class SubagentsBrowser implements Component {
 			if (start > 0) lines.push(this.boxed(`  ${th.fg("dim", `… ${start} older runs`)}`, width));
 			for (let i = start; i < end; i++) {
 				const r = runs[i]!;
-				const indent = i === this.selected ? th.fg("accent", "▍") : " ";
-				const line = `${indent}${this.listRow(r, runs, allRuns, width)}`;
-				lines.push(i === this.selected ? this.boxed(line, width, "selectedBg") : this.boxed(line, width));
-				const task = preview(r.task, 160);
+				const selected = i === this.selected;
+				const bg: PanelBg = selected ? "selectedBg" : SubagentsBrowser.PANEL_BG;
+				const indent = selected ? th.fg("accent", "▍ ") : "  ";
+				const line = `${indent}${this.listRow(r, width)}`;
+				lines.push(this.boxed(line, width, bg));
+				lines.push(this.boxed(this.listMetaRow(r, runs, allRuns, width), width, bg));
+				const task = preview(r.task, width < 55 ? 100 : 160);
 				const error = r.status === "error" && r.errorMessage ? ` · ${preview(r.errorMessage, 100)}` : "";
 				lines.push(
-					this.boxed(`  ${th.fg("muted", "Task: ")}${th.fg(error ? "error" : "dim", `${task}${error}`)}`, width),
+					this.boxed(`    ${th.fg(error ? "error" : "dim", `${task}${error}`)}`, width, bg),
 				);
 			}
 			if (end < runs.length)
@@ -849,12 +945,13 @@ export class SubagentsBrowser implements Component {
 				lines.push(this.boxed(`  ${th.fg("dim", `showing ${start + 1}–${end} of ${runs.length}`)}`, width));
 		}
 		lines.push(this.blankRow(width));
-		lines.push(this.boxed(th.fg("dim", " ↑/↓ j/k navigate · enter inspect · esc close"), width));
+		const footer = width < 36 ? " ↑↓ move · enter · esc" : " ↑↓/jk move · enter open · esc close";
+		lines.push(this.boxed(th.fg("dim", footer), width));
 		lines.push(this.boxBorder(width, false));
 		return lines;
 	}
 
-	private listRow(r: LiveRun, runs: LiveRun[], allRuns: LiveRun[], width: number): string {
+	private listRow(r: LiveRun, width: number): string {
 		const th = this.theme;
 		const icon = statusIcon(r.status);
 		const elapsed =
@@ -865,23 +962,24 @@ export class SubagentsBrowser implements Component {
 					: "…";
 		const status =
 			r.status === "running"
-				? th.fg("accent", `running ${elapsed}`)
+				? th.fg("accent", `running · ${elapsed}`)
 				: r.status === "ok"
-					? th.fg("success", `ok ${elapsed}`)
-					: th.fg("error", `error ${elapsed}`);
-		const parts = [
-			icon,
-			status,
-			th.fg("accent", preview(runDisplayName(r), width < 45 ? 40 : 90)),
-		];
+					? th.fg("success", `ok · ${elapsed}`)
+					: th.fg("error", `error · ${elapsed}`);
+		return [icon, th.fg("accent", th.bold(preview(runDisplayName(r), width < 45 ? 36 : 80))), status].join(" · ");
+	}
+
+	private listMetaRow(r: LiveRun, runs: LiveRun[], allRuns: LiveRun[], width: number): string {
+		const th = this.theme;
+		const parts: string[] = [];
 		const group = groupContext(r, runs, allRuns);
-		if (group) parts.push(th.fg("dim", group));
-		if (width >= 70) parts.push(th.fg("dim", r.model));
-		if (width >= 105) {
+		if (group) parts.push(group);
+		if (width >= 45) parts.push(`model: ${r.model}`);
+		if (width >= 100) {
 			const u = usageLine(r.usage);
-			if (u) parts.push(th.fg("dim", u));
+			if (u) parts.push(u);
 		}
-		return parts.join(" · ");
+		return `    ${th.fg("dim", parts.length > 0 ? parts.join(" · ") : "details available on enter")}`;
 	}
 
 	private renderDetail(run: LiveRun, width: number, runs: LiveRun[], allRuns: LiveRun[]): string[] {
@@ -896,46 +994,68 @@ export class SubagentsBrowser implements Component {
 					: "…";
 		const status =
 			run.status === "running"
-				? th.fg("accent", `running ${elapsed}`)
+				? th.fg("accent", `RUNNING · ${elapsed}`)
 				: run.status === "ok"
-					? th.fg("success", `ok ${elapsed}`)
-					: th.fg("error", `error ${elapsed}`);
+					? th.fg("success", `OK · ${elapsed}`)
+					: th.fg("error", `ERROR · ${elapsed}`);
 		lines.push(this.boxBorder(width, true));
-		lines.push(
-			this.boxed(
-				`${icon} ${th.fg("accent", th.bold(runDisplayName(run)))} · ${th.fg("dim", run.model)} · ${status}`,
-				width,
-			),
-		);
+		lines.push(this.boxed(`  ${icon} ${th.fg("accent", th.bold(runDisplayName(run)))}`, width));
+		lines.push(this.boxed(`  ${status} · ${th.fg("dim", `model: ${run.model}`)}`, width));
 		const u = usageLine(run.usage);
-		if (u) lines.push(this.boxed(th.fg("dim", u), width));
-		if (run.errorMessage) lines.push(this.boxed(th.fg("error", run.errorMessage), width));
-		if (run.sessionId) lines.push(this.boxed(th.fg("dim", `session: ${run.sessionId}`), width));
+		if (u) lines.push(this.boxed(th.fg("dim", `  usage: ${u}`), width));
+		if (run.errorMessage) lines.push(this.boxed(th.fg("error", `  error: ${run.errorMessage}`), width));
+		if (run.sessionId) lines.push(this.boxed(th.fg("dim", `  session: ${run.sessionId}`), width));
 		const group = groupContext(run, runs, allRuns);
-		if (group) lines.push(this.boxed(th.fg("dim", group), width));
-		lines.push(this.boxed(th.fg("muted", `Task: ${run.task}`), width));
-		if (run.transcriptTruncated) {
-			lines.push(
-				this.boxed(
-					th.fg("warning", "⚠ transcript was shortened before storage; displayed content is partial"),
-					width,
-				),
-			);
-		}
+		if (group) lines.push(this.boxed(th.fg("dim", `  ${group}`), width));
 		lines.push(this.blankRow(width));
 
 		const innerWidth = Math.max(1, width - 2);
-		let body: BodyLine[];
-		if (run.messages && run.messages.length > 0) {
-			body = transcriptBodyLines(run.messages, th, width, BROWSER_DETAIL_CAP);
-		} else if (run.activities && run.activities.length > 0) {
-			body = run.activities.flatMap((a) =>
-				wrapTextWithAnsi(`${th.fg("dim", `+${formatElapsed(a.at)}`)} ${activityLine(a, th)}`, innerWidth).map(
-					(text) => ({ text, code: false }),
+		const body: BodyLine[] = [];
+		appendWrappedSection(body, th, width, "Prompt · main agent → subagent", run.task);
+		if (run.systemPrompt?.trim()) {
+			appendWrappedSection(body, th, width, "System prompt", run.systemPrompt);
+		}
+		appendKeyValueSection(body, th, width, "Config", [
+			["tools", run.tools?.length ? run.tools.join(", ") : "default"],
+			["thinking", run.thinking ?? "default"],
+			["cwd", run.cwd ?? "session directory"],
+			["timeout", run.timeoutSec ? `${run.timeoutSec}s` : "default"],
+			["max turns", run.maxTurns ? String(run.maxTurns) : "default"],
+		]);
+
+		const appendActivities = (label: string): void => {
+			appendSectionHeading(body, th, width, label);
+			if (run.activities.length === 0) {
+				body.push({ text: th.fg("dim", "    No activity recorded."), code: false });
+				return;
+			}
+			body.push(
+				...run.activities.flatMap((a) =>
+					wrapTextWithAnsi(
+						`${th.fg("dim", `    +${formatElapsed(a.at)}`)} ${activityLine(a, th, this.detailExpanded)}`,
+						innerWidth,
+					).map((text) => ({ text, code: false })),
 				),
 			);
-		} else {
-			body = [{ text: th.fg("dim", "No activity recorded for this run."), code: false }];
+		};
+
+		const hasMessages = run.messages.length > 0;
+		const hasActivities = run.activities.length > 0;
+		if (run.status === "running" && hasActivities) appendActivities("Live activity");
+		if (run.status === "running" && run.currentThinking) {
+			appendWrappedSection(body, th, width, "Current thinking", run.currentThinking, "thinkingLow");
+		}
+		if (hasMessages) {
+			appendSectionHeading(body, th, width, "Transcript");
+			if (run.transcriptTruncated) {
+				body.push({
+					text: th.fg("warning", "    ⚠ transcript was shortened before storage; expand only reveals available content"),
+					code: false,
+				});
+			}
+			body.push(...transcriptBodyLines(run.messages, th, width, BROWSER_DETAIL_CAP, this.detailExpanded));
+		} else if (run.status !== "running" || !hasActivities) {
+			appendActivities("Activity");
 		}
 
 		const maxCodeWidth = body.reduce((m, l) => (l.code ? Math.max(m, visibleWidth(l.text)) : m), 0);
@@ -963,13 +1083,15 @@ export class SubagentsBrowser implements Component {
 		}
 
 		lines.push(this.blankRow(width));
-		const hints = [`↑/↓ scroll`];
-		if (body.length > detailRows) {
+		const compact = width < 36;
+		const hints = compact ? ["↑↓ scroll"] : ["↑/↓ scroll"];
+		if (body.length > detailRows && !compact) {
 			const pct = Math.min(100, Math.round((end / body.length) * 100));
-			hints.unshift(` ${pct}% (${body.length} lines)`);
+			hints.unshift(` ${pct}% · ${body.length} lines`);
 		}
-		if (hasOverflow) hints.push(`←/→ h/l horiz${this.scrollX > 0 ? ` · col ${this.scrollX}` : ""}`);
-		hints.push("backspace back · esc close");
+		if (hasOverflow && !compact) hints.push("←/→ horiz");
+		hints.push(compact ? (this.detailExpanded ? "o compact" : "o expand") : this.detailExpanded ? "o collapse" : "o expand");
+		hints.push(compact ? "esc close" : "backspace back · esc close");
 		lines.push(this.boxed(th.fg("dim", ` ${hints.join(" · ")}`), width));
 		lines.push(this.boxBorder(width, false));
 		return lines;

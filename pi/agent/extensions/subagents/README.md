@@ -26,28 +26,26 @@ The `subagent` tool is available to the main agent at all times, with three mode
 | `task`          | string            | Task text (single mode)                                                                                                                                                                                                                                    |
 | `tasks`         | array             | Independent tasks, run sequentially by default (parallel mode; `parallelLimit` opt-in)                                                                                                                                                                     |
 | `chain`         | array             | Ordered tasks; `{previous}` in a task text is replaced with the previous result (chain mode)                                                                                                                                                               |
-| `model`         | string            | Arbitrary model: `"provider/id"`, `"provider/*"`, or bare id — validated against the model registry before running. Overridden by your session-wide subagent model choice unless that choice is `auto`. Native OpenAI models whose id/name contains `luna` always use priority fast mode.                                                                                                                                         |
+| `model`         | string            | Arbitrary model: `"provider/id"`, `"provider/*"`, or bare id — validated against the model registry before running. Overridden by your choice for this subagent type unless that choice is `auto`. Native OpenAI models whose id/name contains `luna` always use priority fast mode.                                                                                                                                         |
 | `agent`         | string            | Agent definition name (from agent files)                                                                                                                                                                                                                   |
 | `systemPrompt`  | string            | Inline system prompt (overrides agent prompt)                                                                                                                                                                                                              |
 | `tools`         | array             | Tool allowlist (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`)                                                                                                                                                                                     |
-| `thinking`      | string            | Reasoning level for the subagent model: `off` (default — cheap & fast), `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (model-dependent). Overridden by your session-wide subagent thinking choice unless that choice is `auto`. |
-| `timeoutSec`    | number            | Abort the subagent after N seconds                                                                                                                                                                                                                         |
+| `thinking`      | string            | Reasoning level for the subagent model: `off` (default — cheap & fast), `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (model-dependent). Overridden by your choice for this subagent type unless that choice is `auto`. |
+| `timeoutSec`    | number            | Hard deadline in seconds (default 600; increase for longer tasks)                                                                                                                                                                                                                         |
 | `maxTurns`      | number            | Assistant-turn budget; the runner reserves one finalization turn at the boundary                                                                                                                                                                           |
 | `cwd`           | string            | Working directory for the subagent                                                                                                                                                                                                                         |
 | `parallelLimit` | number            | Maximum concurrent tasks in parallel mode (1–8)                                                                                                                                                                                                            |
 | `onFailure`     | `stop`/`continue` | Chain policy; default `stop`, use `continue` only for recoverable best-effort pipelines                                                                                                                                                                    |
 | `keepSession`   | bool              | Return a `sessionId` to continue this context window later                                                                                                                                                                                                 |
 | `sessionId`     | string            | Continue an existing context window (from a prior `keepSession`)                                                                                                                                                                                           |
-| `background`    | bool              | Return immediately while the group runs; use `subagent_status` and `subagent_wait` to monitor and collect results                                                                                                                                          |
 
-### Background execution
+### Non-blocking execution
 
-Set `background: true` on a single, parallel, or chain request to return immediately while the group continues in-process. The result includes a group id. Continue independent work in the main session, then use:
+Every single, parallel, and chain request returns immediately while the group continues in-process. The result includes a group id. Continue independent work in the main session, or return control to the user when there is nothing useful to do.
 
-- `subagent_status` — inspect active or completed groups;
-- `subagent_wait` — wait for one group and collect its final output (a timeout does not cancel it).
+When every run in a group finishes, the extension automatically interjects a capped completion message into the parent session with `pi.sendMessage()` using steering delivery. It queues like a user steering message while the parent is working and triggers a continuation when the parent is idle. The message includes the group summary and is visible in the transcript. `subagent_status` provides a non-blocking live snapshot and run ids; the main agent can use `subagent_history` to retrieve persisted run transcripts and `subagent_cancel` to cancel one run (`runId`) or a whole group (`groupId`). There is intentionally no wait tool.
 
-Background groups are canceled when the session shuts down. The default remains synchronous when `background` is omitted.
+Groups are canceled when the session shuts down. Stale completions from a shutdown or session switch are not interjected into the replacement session. This behavior is enforced by the extension rather than being an opt-in flag.
 
 ### Multi-turn sessions
 
@@ -61,9 +59,9 @@ Subagents are stateless by default. To make one remember across calls:
 ### Budgets and recovery
 
 - Luna fast mode is enforced at the provider-payload boundary for in-process subagents, so it cannot be bypassed by a caller or by the main-session fast-mode toggle.
-- `timeoutSec`: aborts the subagent after N seconds (honored even mid-stream).
+- `timeoutSec`: aborts the subagent after N seconds (honored even mid-stream); absent an override, every run has a 600-second hard deadline. After requesting abort, the runner gives the provider/tool up to one second to settle, then returns partial results and discards an unresponsive cached context.
 - `maxTurns`: bounds tool loops per invocation. At the boundary the runner allows one explicit finalization turn; if the model still requests tools, the result includes the partial transcript and remains resumable when `keepSession` was enabled.
-- Parent abort (Ctrl+C / goal-mode interrupt) propagates to synchronous subagent calls; background groups continue until completion or session shutdown.
+- The parent turn never owns an active subagent run: canceling the current turn does not interrupt a launched group. Use `subagent_cancel` to stop one run or all work in a group; queued parallel and chain work is skipped after group cancellation. Groups are also canceled at session shutdown.
 - Prefer a larger budget for implementation/review work than for scouting. Do not set an artificially low budget just to make a task look bounded.
 
 ## Agent files
@@ -81,25 +79,32 @@ Frontmatter keys: `name`, `description`, `model`, `tools`, `thinking`,
 Subagents use the model and thinking level **you** choose, not one the launching
 agent picks:
 
-- The first subagent launch in a session asks for a model and a thinking level.
+- The first launch of each subagent type asks for a model and a thinking level.
+- Choices are keyed by the agent definition name (`planner`, `reviewer`,
+  `scout`, `worker`). Unnamed tasks use separate `default` or `inline` buckets;
+  a choice never leaks from one type to another.
 - The model list is restricted to the session's **scoped models** (the
   `--models` / `enabledModels` set that `/scoped-models` shows); when no scoping
   is configured it falls back to every authenticated model. Models without
   configured auth are never offered.
-- The answer is remembered for the rest of the session; you are asked once.
-- At the end of the prompt you can opt to save it globally
-  (`<agentDir>/subagent-model.json`) so future sessions skip the prompt.
-- `/subagent-model` re-opens the prompt at any time, `/subagent-model status`
-  shows the session and global choices, and `/subagent-model reset` clears them.
-- Both dialogs offer `auto`, which defers to the agent file or the caller's
-  per-task request instead of overriding it.
-- The choice applies to every subagent, including the bundled
-  `planner`/`reviewer`/`scout`/`worker` agents. Their frontmatter provides the
-  fallback model, thinking, tool allowlist, and budgets used when the choice is
-  `auto`; those are sensible defaults, not a lock.
-- Launches are serial (`executionMode: "sequential"`) so the prompt cannot
-  overlap another tool call, and a cancelled prompt stops the launch instead of
-  guessing a model.
+- Each answer is remembered for that type for the rest of the session. At the
+  end of the prompt you can opt to save it globally
+  (`<agentDir>/subagent-model.json`) so future sessions skip that type's prompt.
+- `/subagent-model` opens a full settings menu for choosing, inspecting, or
+  resetting typed choices. The argument form
+  `/subagent-model [select|status|reset] [subagent-type]` remains available;
+  `/subagent-model worker` is shorthand for selecting `worker`.
+- The thinking dialog is filtered to the selected model's supported levels;
+  models without reasoning expose only `off` (plus `auto`). Both dialogs offer
+  `auto`, which defers to the agent file or the caller's per-task request
+  instead of overriding it.
+- A choice applies only to the selected subagent type. Each bundled
+  `planner`/`reviewer`/`scout`/`worker` agent retains its own frontmatter
+  fallback model, thinking, tool allowlist, and budgets when that type's choice
+  is `auto`.
+- Launch requests are serial (`executionMode: "sequential"`) so the model-choice
+  prompt cannot overlap another tool call, and a cancelled prompt stops the launch
+  instead of guessing a model. The subagent work itself is always non-blocking.
 
 ## Orchestrator pattern (strong planner + cheap workers)
 
@@ -126,15 +131,13 @@ work to subagents:
 ### Live visibility while runs happen
 
 - Every run is persisted with `pi.appendEntry("subagent-run", …)` plus a
-  `"subagent-run-detail"` entry carrying the full per-run transcript
-  (truncated) for later inspection.
-- While a `subagent` tool call is executing, the tool result is **streamed**:
-  a throttled live dashboard (running status, thinking previews, tool calls and
-  their results, usage) is pushed via `onUpdate`, so the TUI shows subagents
-  working in real time instead of a frozen spinner.
+  `"subagent-run-detail"` entry carrying the exact task prompt, resolved launch
+  controls, raw per-run transcript, and a bounded live activity tail for later
+  inspection. Older records may be marked partial when they predate raw storage.
 - `index.ts` keeps an in-memory registry of live runs merged with persisted
-  entries, so the browser works during and after runs (even across extension
-  reloads within the session).
+  entries, so `/subagents` shows active work and completed runs without keeping
+  the launching tool call open (even across extension reloads within the
+  session).
 
 ### Persistent token accounting
 
@@ -153,20 +156,23 @@ the session output behind it. The selected run row is highlighted with
 `selectedBg`:
 
 - **List view** — every run in the session (live first, then newest first),
-  with status (running/ok/error), model, elapsed time, task preview, usage, and
-  group progress (`step N/M` and completed count when available). The list
-  adapts to terminal height and keeps the selected run stable as live entries
-  update. Navigate with `↑/↓` (`j`/`k`), page with `PgUp/PgDn`; `Enter` (or
-  `l`) opens a run.
-- **Detail view** — per-run transcript: streamed thinking, tool calls with
-  their arguments, tool results (with errors highlighted), the final output,
-  group context, and usage. Prose (thinking/text) wraps to the panel width;
-  code rows (tool arguments, tool output) keep full width and scroll
-  horizontally with `←/→` (`h`/`l`) — the footer shows the column offset. Scroll
-  vertically with `↑/↓`; `g`/`G` jump to top/bottom; `Backspace` returns to the
-  list; Esc closes. Live runs refresh automatically. Display and persisted
-  transcript caps are called out visibly when content is partial; older
-  records without the optional metadata remain readable.
+  with a predictable three-line layout: status/name, metadata (group/model/
+  usage when there is room), and an indented prompt preview. Selected runs are
+  highlighted as a block, so status and prompt stay visually associated. The
+  list adapts to terminal height and keeps the selected run stable as live
+  entries update. Navigate with `↑/↓` (`j`/`k`), page with `PgUp/PgDn`; `Enter`
+  (or `l`) opens a run.
+- **Detail view** — uses labeled `Prompt`, `System prompt`, `Config`, `Live
+  activity`/`Activity`, and `Transcript` sections. It shows the exact task
+  prompt sent by the main agent, resolved launch controls, streamed thinking,
+  tool calls, tool results (with errors highlighted), and final output. Prose
+  wraps to the panel width; code rows (tool arguments, tool output) keep full
+  width and scroll horizontally with `←/→` (`h`/`l`). Press `o` (or `Ctrl+o`)
+  to expand/collapse display caps and reveal raw stored content; the footer
+  shows the current mode. Scroll vertically with `↑/↓`; `g`/`G` jump to
+  top/bottom; `Backspace` returns to the list; Esc closes. Live runs refresh
+  automatically. Display and storage truncation notices are called out
+  visibly; older records without the optional metadata remain readable.
 - An optional filter argument (`/subagents <terms>`) narrows the list. Matching
   is trimmed, case-insensitive, and treats whitespace-separated terms as an
   AND query across name, model, task, kind, status, stop reason, group id, and
@@ -176,24 +182,21 @@ the session output behind it. The selected run row is highlighted with
 - In non-TUI modes (print/RPC), `/subagents` falls back to a plain-text
   widget listing the most recent runs.
 
-When the tool finishes, `renderResult` renders the final per-run results
-(expanded view shows the full transcript inline; collapsed shows the final
-output with a `Ctrl+O` hint).
+The launch tool renders only its immediate acknowledgement. Completed groups also interject their capped result into the parent session automatically; `/subagents` remains available for interactive history, while the main agent uses `subagent_status`, `subagent_history`, and `subagent_cancel` tools for run control and transcript inspection.
 
 ## Development
 
 - `runner.ts` — `runSubagent()`: resolves model/provider/auth, builds the
   in-process agent with a minimal mock extension context for the built-in
-  tools, watchdogs, session cache, usage accumulation, and a throttled live
-  event stream (`RunnerEvent`: `message`, `tool`, `toolResult`, `thinking`,
-  `status`) consumed by `index.ts` for the dashboard/browser.
-- `ui.ts` — TUI building blocks: `renderLiveDashboard` (streamed while
-  running), `renderRunResults` (final view), and the interactive
+  tools, watchdogs, session cache, usage accumulation, and live events
+  (`RunnerEvent`: `message`, `tool`, `toolResult`, `thinking`, `status`) consumed
+  by the browser.
+- `ui.ts` — TUI building blocks: run/result formatting and the interactive
   `SubagentsBrowser` overlay used by `/subagents`.
 - `agents.ts` — agent discovery + frontmatter parsing.
-- `preference.ts` — the user-owned model/thinking choice: session state, the
-  `subagent-model.json` global file, the ask-once prompt, and the override
-  applied to every task spec.
+- `preference.ts` — the user-owned per-subagent-type model/thinking choices:
+  session state, the typed `subagent-model.json` global file, the per-type
+  ask-once prompt, and the override applied to matching task specs.
 - `index.ts` — tool registration, live-run registry, `/subagents` and
   `/subagent-model` commands, the delegation reminder, TUI renderers.
 - Deterministic tests (no network, no TUI): `bun test pi/agent/tests/` covers

@@ -16,10 +16,11 @@
  *   - Multi-turn prompting: `keepSession: true` returns a sessionId; passing
  *     that `sessionId` later continues the SAME context window (memory)
  *   - Watchdogs: per-task timeout and maxTurns abort the subagent
- *   - Background groups that continue after the launch tool returns, with status/wait controls
- *   - Abort propagation from the parent agent's signal for synchronous runs; background groups stop on session shutdown
+ *   - Every launch returns immediately; groups continue in the background and expose non-blocking status
+ *   - Completed groups interject a capped result into the parent session as a follow-up
+ *   - Background groups stop on session shutdown
  *   - Monitoring: run records persisted via pi.appendEntry; `/subagents`
- *     command lists active/recent runs with usage; streaming TUI updates
+ *     command lists active/recent runs with usage and live activity
  *   - Output caps so subagent results never flood the orchestrator's context
  */
 
@@ -38,14 +39,13 @@ import {
 	emptyUsage,
 	getFinalOutput,
 	runSubagent,
+	DEFAULT_SUBAGENT_TIMEOUT_SEC,
 } from "./runner.ts";
 import {
 	formatTokens,
 	formatElapsed,
 	isFailedResult,
-	liveDashboardText,
 	preview,
-	renderLiveDashboard,
 	renderRunResults,
 	statusIcon,
 	truncateBytes,
@@ -55,18 +55,26 @@ import {
 	type LiveRun,
 } from "./ui.ts";
 import {
+	DEFAULT_SUBAGENT_TYPE,
+	INLINE_SUBAGENT_TYPE,
 	SUBAGENT_PREFERENCE_ENTRY_TYPE,
 	applyPreference,
 	clearGlobalPreference,
+	clearGlobalPreferenceForType,
 	describePreference,
-	getSessionPreference,
-	loadGlobalPreference,
+	getSessionPreferences,
+	loadGlobalPreferences,
+	normalizeSubagentType,
 	promptForPreference,
 	resolvePreference,
-	restoredPreference,
-	saveGlobalPreference,
+	restoredPreferences,
+	saveGlobalPreferenceForType,
 	setSessionPreference,
+	setSessionPreferences,
+	supportedThinkingLevels,
+	THINKING_LEVELS,
 	type SubagentPreference,
+	type SubagentThinking,
 } from "./preference.ts";
 import { TOKEN_USAGE_EVENT } from "../token-tracker.ts";
 
@@ -76,21 +84,22 @@ import { TOKEN_USAGE_EVENT } from "../token-tracker.ts";
 
 const DEFAULT_CONCURRENCY = 1; // sequential by default
 const MAX_PARALLEL_TASKS = 8;
-const PARENT_OUTPUT_CAP = 50 * 1024; // per-task cap for text returned to the parent LLM
+const PARENT_OUTPUT_CAP = 50 * 1024; // cap text returned or interjected into the parent LLM
 const RUN_ENTRY_TYPE = "subagent-run";
 const RUN_DETAIL_ENTRY_TYPE = "subagent-run-detail";
-const UPDATE_THROTTLE_MS = 200;
-// Caps for the persisted per-run transcript (browsable via /subagents after the fact).
-const MESSAGE_TEXT_CAP = 4000;
-const MESSAGE_RESULT_CAP = 2000;
-const MAX_STORED_ACTIVITIES = 200;
+// Bound the live event log; completed transcripts retain the raw AgentMessage history.
+// Detail rendering deliberately keeps the full transcript available for expansion.
+const MAX_STORED_ACTIVITIES = 300;
+const SUBAGENT_COMPLETION_MESSAGE_TYPE = "subagent-completion";
+const NO_DUPLICATE_WORK_DIRECTIVE =
+	"Do not duplicate work assigned to a running subagent: after launching one, do not independently repeat its investigation, implementation, or review. Work only on non-overlapping tasks and use the subagent's completion result instead of recreating its work.";
 // ---------------------------------------------------------------------------
 // Types & helpers
 // ---------------------------------------------------------------------------
 
 const ThinkingLevelSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, {
 	description:
-		"Reasoning level for the subagent model. Default: off (cheap & fast). Raise to low/high for harder tasks that benefit from reasoning; not all models support every level.",
+		"Reasoning level for the subagent model. Default: off (cheap & fast). Raise to low/high for harder tasks that benefit from reasoning; the chooser filters levels to the selected model's capabilities.",
 });
 
 const FailurePolicySchema = StringEnum(["stop", "continue"] as const, {
@@ -106,13 +115,15 @@ const TaskItem = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				'/Arbitrary model: "provider/id", "provider/*", or bare id; overridden by the user\'s session-wide subagent model choice when one is set',
+				'/Arbitrary model: "provider/id", "provider/*", or bare id; overridden by the user\'s choice for this subagent type when one is set',
 		}),
 	),
 	systemPrompt: Type.Optional(Type.String({ description: "Inline system prompt (overrides agent file prompt)" })),
 	tools: Type.Optional(Type.Array(Type.String(), { description: "Tool allowlist for this subagent" })),
 	thinking: Type.Optional(ThinkingLevelSchema),
-	timeoutSec: Type.Optional(Type.Number({ description: "Kill the subagent after this many seconds" })),
+	timeoutSec: Type.Optional(
+		Type.Number({ minimum: 1, description: `Hard timeout in seconds (default ${DEFAULT_SUBAGENT_TIMEOUT_SEC})` }),
+	),
 	maxTurns: Type.Optional(
 		Type.Integer({
 			minimum: 1,
@@ -137,7 +148,7 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				'Arbitrary model: "provider/id", "provider/*", or bare id (single mode); overridden by the user\'s session-wide subagent model choice when one is set',
+				'Arbitrary model: "provider/id", "provider/*", or bare id (single mode); overridden by the user\'s choice for this subagent type when one is set',
 		}),
 	),
 	systemPrompt: Type.Optional(
@@ -145,7 +156,9 @@ const SubagentParams = Type.Object({
 	),
 	tools: Type.Optional(Type.Array(Type.String(), { description: "Tool allowlist (single mode)" })),
 	thinking: Type.Optional(ThinkingLevelSchema),
-	timeoutSec: Type.Optional(Type.Number({ description: "Kill after this many seconds (single mode)" })),
+	timeoutSec: Type.Optional(
+		Type.Number({ minimum: 1, description: `Hard timeout in seconds (default ${DEFAULT_SUBAGENT_TIMEOUT_SEC})` }),
+	),
 	maxTurns: Type.Optional(
 		Type.Integer({
 			minimum: 1,
@@ -155,12 +168,6 @@ const SubagentParams = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent" })),
 	sessionId: Type.Optional(Type.String({ description: "Continue an existing subagent context window" })),
 	keepSession: Type.Optional(Type.Boolean({ description: "Save the session so it can be continued later" })),
-	background: Type.Optional(
-		Type.Boolean({
-			description:
-				"Return immediately and let this group run in the background; use subagent_status/subagent_wait for progress and results",
-		}),
-	),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel mode: array of tasks to run concurrently" })),
 	chain: Type.Optional(
 		Type.Array(TaskItem, { description: "Chain mode: sequential dependent steps, {previous} = prior step output" }),
@@ -177,22 +184,33 @@ const SubagentParams = Type.Object({
 });
 
 const BackgroundStatusParams = Type.Object({
-	groupId: Type.Optional(
-		Type.String({ description: "Background group id returned by subagent with background:true" }),
-	),
+	groupId: Type.Optional(Type.String({ description: "Group id returned by subagent" })),
 });
 
-const BackgroundWaitParams = Type.Object({
-	groupId: Type.String({ description: "Background group id returned by subagent with background:true" }),
-	timeoutSec: Type.Optional(
-		Type.Number({
-			minimum: 0,
-			description: "Stop waiting after this many seconds; the background group keeps running",
-		}),
-	),
+const SubagentHistoryParams = Type.Object({
+	runId: Type.Optional(Type.String({ description: "Read one run's persisted transcript by run id" })),
+	groupId: Type.Optional(Type.String({ description: "Limit history to a subagent group id" })),
+	filter: Type.Optional(Type.String({ description: "Case-insensitive AND terms matched against run metadata" })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum runs to return (default 5)" })),
+	includeTranscript: Type.Optional(Type.Boolean({ description: "Include full assistant/tool transcript instead of final answer only" })),
+});
+
+const SubagentCancelParams = Type.Object({
+	runId: Type.Optional(Type.String({ description: "Cancel one active run" })),
+	groupId: Type.Optional(Type.String({ description: "Cancel every active run in a group" })),
 });
 
 type TaskItemType = Static<typeof TaskItem>;
+
+/** Identify the preference bucket that owns a task's model choice. */
+function subagentTypeForTask(item: Pick<TaskItemType, "agent" | "systemPrompt">): string {
+	if (item.agent?.trim()) return normalizeSubagentType(item.agent);
+	return item.systemPrompt ? INLINE_SUBAGENT_TYPE : DEFAULT_SUBAGENT_TYPE;
+}
+
+function preferenceEntryData(subagentType: string, preference: SubagentPreference): Record<string, unknown> {
+	return { subagentType, ...preference };
+}
 
 interface ResolvedTask extends SubagentTaskSpec {
 	agentSource?: string;
@@ -207,12 +225,23 @@ type GroupExecutionResult = {
 	isError: boolean;
 };
 
-type BackgroundWaitDetails = {
-	groupId: string;
-	status: "missing" | "running" | "completed";
-	mode?: RunKind;
-	results?: SubagentRunResult[];
-};
+/** Build the parent-session message emitted when a detached group finishes. */
+export function formatSubagentCompletionMessage(
+	groupId: string,
+	result: Pick<GroupExecutionResult, "mode" | "text" | "isError">,
+): string {
+	const status = result.isError ? "failed" : "completed";
+	return truncateBytes(
+		[
+			`Background ${result.mode} subagent group ${groupId} ${status}.`,
+			"",
+			result.text,
+			"",
+			"Review the result and continue the main task as appropriate.",
+		].join("\n"),
+		PARENT_OUTPUT_CAP,
+	);
+}
 
 interface BackgroundGroup {
 	groupId: string;
@@ -258,6 +287,8 @@ interface ResolvedModel {
 	name: string;
 	contextWindow: number;
 	maxTokens: number;
+	reasoning?: boolean;
+	thinkingLevelMap?: Partial<Record<SubagentThinking, string | null>>;
 }
 
 function matchesPattern(model: { provider: string; id: string; name: string }, pattern: string): boolean {
@@ -279,7 +310,15 @@ export function resolveModel(
 	requested: string | undefined,
 	ctx: Pick<ExtensionContext, "model"> & {
 		modelRegistry: {
-			getAvailable(): { provider: string; id: string; name: string; contextWindow: number; maxTokens: number }[];
+			getAvailable(): {
+				provider: string;
+				id: string;
+				name: string;
+				contextWindow: number;
+				maxTokens: number;
+				reasoning?: boolean;
+				thinkingLevelMap?: Partial<Record<SubagentThinking, string | null>>;
+			}[];
 		};
 	},
 ): { ok: true; model: ResolvedModel } | { ok: false; error: string; suggestions: string[] } {
@@ -297,6 +336,8 @@ export function resolveModel(
 					name: current.name,
 					contextWindow: current.contextWindow,
 					maxTokens: current.maxTokens,
+					reasoning: current.reasoning,
+					thinkingLevelMap: current.thinkingLevelMap,
 				},
 			};
 		}
@@ -318,6 +359,8 @@ export function resolveModel(
 				name: exact.name,
 				contextWindow: exact.contextWindow,
 				maxTokens: exact.maxTokens,
+				reasoning: exact.reasoning,
+				thinkingLevelMap: exact.thinkingLevelMap,
 			},
 		};
 	}
@@ -340,6 +383,20 @@ export function resolveModel(
 // Task resolution
 // ---------------------------------------------------------------------------
 
+function compatibleThinkingLevel(model: ResolvedModel, thinking: string | undefined): string | undefined {
+	if (!thinking || thinking === "auto") return thinking;
+	const supported = supportedThinkingLevels(model);
+	if (supported.includes(thinking as SubagentThinking)) return thinking;
+
+	const requestedIndex = THINKING_LEVELS.indexOf(thinking as SubagentThinking);
+	if (requestedIndex < 0) return supported[0];
+	return (
+		supported.find((level) => THINKING_LEVELS.indexOf(level) >= requestedIndex) ??
+		[...supported].reverse().find((level) => THINKING_LEVELS.indexOf(level) < requestedIndex) ??
+		supported[0]
+	);
+}
+
 function taskPreview(t: TaskItemType): string {
 	return preview(t.task);
 }
@@ -360,8 +417,8 @@ function buildTask(
 	}
 
 	const systemPrompt = item.systemPrompt ?? agent?.systemPrompt ?? "";
-	// The user's session preference owns model + thinking; agent files and the
-	// caller's request stay as fallbacks when the preference is "auto".
+	// The user's preference for this subagent type owns model + thinking; agent
+	// files and the caller's request stay as fallbacks when the preference is "auto".
 	const controls = applyPreference(
 		{
 			model: item.model ?? agent?.model,
@@ -391,8 +448,8 @@ function buildTask(
 			systemPrompt,
 			model: resolved.model.modelId,
 			tools: controls.tools,
-			thinking: controls.thinking,
-			timeoutSec: controls.timeoutSec,
+			thinking: compatibleThinkingLevel(resolved.model, controls.thinking),
+			timeoutSec: controls.timeoutSec ?? DEFAULT_SUBAGENT_TIMEOUT_SEC,
 			maxTurns: controls.maxTurns,
 			cwd: item.cwd,
 			sessionId: item.sessionId,
@@ -423,25 +480,9 @@ function resultOutput(r: SubagentRunResult): string {
 	return capped;
 }
 
-/** Truncate message payloads so persisted detail entries stay small. */
-function truncateMessagesForStorage(messages: AgentMessage[]): { messages: AgentMessage[]; truncated: boolean } {
-	let truncated = false;
-	const capPart = <T extends { type?: string; text?: string }>(part: T, cap: number): T => {
-		if (part.type !== "text" || typeof part.text !== "string") return part;
-		const text = truncateBytes(part.text, cap);
-		if (text !== part.text) truncated = true;
-		return { ...part, text };
-	};
-	const stored = messages.map((m) => {
-		if (m.role === "assistant") {
-			return { ...m, content: m.content.map((part) => capPart(part, MESSAGE_TEXT_CAP)) } as AgentMessage;
-		}
-		if (m.role === "toolResult") {
-			return { ...m, content: m.content.map((part) => capPart(part, MESSAGE_RESULT_CAP)) } as AgentMessage;
-		}
-		return m;
-	});
-	return { messages: stored, truncated };
+/** Keep the raw transcript in the detail entry; the browser applies reversible display caps. */
+function messagesForStorage(messages: AgentMessage[]): { messages: AgentMessage[]; truncated: boolean } {
+	return { messages, truncated: false };
 }
 
 /** Full per-run detail record persisted alongside the summary entry. */
@@ -453,7 +494,7 @@ function toDetailRecord(
 	live: LiveRun,
 ): LiveRun {
 	const startedAt = new Date(r.startedAt).getTime();
-	const storedMessages = truncateMessagesForStorage(r.messages);
+	const storedMessages = messagesForStorage(r.messages);
 	return {
 		runId: live.runId,
 		groupId,
@@ -463,6 +504,12 @@ function toDetailRecord(
 		name: r.name,
 		model: r.model,
 		task: r.task,
+		systemPrompt: live.systemPrompt,
+		tools: live.tools ? [...live.tools] : undefined,
+		thinking: live.thinking,
+		cwd: live.cwd,
+		timeoutSec: live.timeoutSec,
+		maxTurns: live.maxTurns,
 		status: isFailedResult(r) ? "error" : "ok",
 		startTime: startedAt,
 		endTime: startedAt + (r.durationMs ?? 0),
@@ -519,6 +566,100 @@ function toRunRecord(
 	};
 }
 
+const HISTORY_TRUNCATION_NOTICE = `\n[history output truncated at ${Math.floor(PARENT_OUTPUT_CAP / 1024)} KiB]`;
+const HISTORY_BODY_CAP = PARENT_OUTPUT_CAP - Buffer.byteLength(HISTORY_TRUNCATION_NOTICE, "utf8");
+
+function formatHistoryRuns(runs: LiveRun[], includeTranscript: boolean): string {
+	const lines: string[] = [];
+	let usedBytes = 0;
+	let truncated = false;
+	const add = (line: string): boolean => {
+		const remaining = HISTORY_BODY_CAP - usedBytes;
+		if (remaining <= 0) {
+			truncated = true;
+			return false;
+		}
+		const lineBytes = Buffer.byteLength(line, "utf8");
+		if (lineBytes + 1 <= remaining) {
+			lines.push(line);
+			usedBytes += lineBytes + 1;
+			return true;
+		}
+		const markerBytes = Buffer.byteLength("… [truncated]", "utf8");
+		if (remaining > markerBytes + 1) {
+			lines.push(truncateBytes(line, remaining - markerBytes - 1));
+		}
+		usedBytes = HISTORY_BODY_CAP;
+		truncated = true;
+		return false;
+	};
+
+	for (let runIndex = 0; runIndex < runs.length; runIndex++) {
+		const run = runs[runIndex]!;
+		if (runIndex > 0 && !add("---")) break;
+		const headers = [
+			`Run ${run.runId}`,
+			`Group: ${run.groupId} · ${run.kind}${run.step !== undefined ? ` step ${run.step}` : ""}`,
+			`Agent: ${run.name} · ${run.model}`,
+			`Status: ${run.status}${run.stopReason ? ` · ${run.stopReason}` : ""}`,
+			`Started: ${new Date(run.startTime).toISOString()}`,
+		];
+		if (run.endTime !== undefined) headers.push(`Duration: ${formatElapsed(run.endTime - run.startTime)}`);
+		if (run.errorMessage) headers.push(`Error: ${run.errorMessage}`);
+		headers.push(`Task: ${run.task}`);
+		if (run.systemPrompt) headers.push(`System prompt: ${run.systemPrompt}`);
+		if (run.tools?.length) headers.push(`Tools: ${run.tools.join(", ")}`);
+		if (run.thinking) headers.push(`Thinking: ${run.thinking}`);
+		if (run.timeoutSec !== undefined) headers.push(`Timeout: ${run.timeoutSec}s`);
+		if (run.maxTurns !== undefined) headers.push(`Max turns: ${run.maxTurns}`);
+		if (run.sessionId) headers.push(`Session: ${run.sessionId}`);
+		for (const header of headers) if (!add(header)) break;
+		if (truncated) break;
+
+		if (!includeTranscript) {
+			const finalOutput = getFinalOutput(run.messages ?? []);
+			if (finalOutput && !add(`Final answer: ${truncateBytes(finalOutput, 6_000)}`)) break;
+			if (!finalOutput && run.status === "running") {
+				if (run.currentThinking && !add(`Current thinking: ${truncateBytes(run.currentThinking, 2_000)}`)) break;
+				for (const activity of run.activities.slice(-8)) {
+					const recent = activity.text || activity.toolName || activity.kind;
+					if (!add(`Recent activity: ${recent}`)) break;
+				}
+			}
+			if (truncated) break;
+			continue;
+		}
+
+		if (!add("Transcript:")) break;
+		let turn = 0;
+		for (const message of run.messages ?? []) {
+			if (message.role === "assistant") {
+				turn++;
+				for (const part of message.content) {
+					if (part.type === "text" && part.text.trim() && !add(`[turn ${turn}] assistant: ${part.text}`)) break;
+					if (part.type === "thinking" && part.thinking?.trim() && !add(`[turn ${turn}] thinking: ${part.thinking}`)) break;
+					if (part.type === "toolCall" && !add(`[turn ${turn}] tool ${part.name}(${JSON.stringify(part.arguments)})`)) break;
+				}
+			} else if (message.role === "toolResult") {
+				let hasText = false;
+				for (const part of message.content) {
+					if (part.type !== "text") continue;
+					hasText = true;
+					const label = message.isError ? "tool error" : "tool result";
+					if (!add(`[turn ${turn}] ${label} ${message.toolName}: ${part.text}`)) break;
+				}
+				if (!hasText && !add(`[turn ${turn}] tool result ${message.toolName}`)) break;
+			}
+			if (truncated) break;
+		}
+		if (truncated) break;
+		if (run.transcriptTruncated && !add("[Stored transcript was truncated before this history view.]")) break;
+	}
+
+	const body = lines.join("\n");
+	return truncated ? `${body}${HISTORY_TRUNCATION_NOTICE}` : body;
+}
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -529,10 +670,48 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- Live run registry (browsable via /subagents while running) ----
 	const liveRuns = new Map<string, LiveRun>();
+	const runControllers = new Map<string, AbortController>();
 	const backgroundGroups = new Map<string, BackgroundGroup>();
+	let sessionShuttingDown = false;
+	let sessionGeneration = 0;
+
+	const interjectGroupCompletion = (groupId: string, result: GroupExecutionResult, generation: number): void => {
+		// A session switch/reload aborts old groups; do not deliver their stale
+		// results into the replacement session. The generation check also covers
+		// a delayed promise settling after the replacement session starts.
+		if (sessionShuttingDown || generation !== sessionGeneration) return;
+		try {
+			const pending = pi.sendMessage(
+				{
+					customType: SUBAGENT_COMPLETION_MESSAGE_TYPE,
+					content: formatSubagentCompletionMessage(groupId, result),
+					display: true,
+					details: {
+						groupId,
+						mode: result.mode,
+						status: result.isError ? "error" : "ok",
+						resultCount: result.results.length,
+					},
+				},
+				// Steer the parent as soon as the current turn's tool work yields; when
+				// idle, triggerTurn starts a continuation immediately. This mirrors a
+				// user steering message instead of waiting behind the follow-up queue.
+				{ deliverAs: "steer", triggerTurn: true },
+			);
+			void Promise.resolve(pending).catch(() => {
+				// The host may expose sendMessage as a fire-and-forget API. If its
+				// async implementation rejects during shutdown, keep the group result
+				// available through subagent_status without an unhandled rejection.
+			});
+		} catch {
+			// The session can close between the shutdown check and this callback.
+			// The result remains available through /subagents in that case.
+		}
+	};
 
 	const trimActivities = (live: LiveRun) => {
-		if (live.activities.length > 300) live.activities.splice(0, live.activities.length - 300);
+		if (live.activities.length > MAX_STORED_ACTIVITIES)
+			live.activities.splice(0, live.activities.length - MAX_STORED_ACTIVITIES);
 	};
 
 	const startLiveRun = (
@@ -551,6 +730,12 @@ export default function (pi: ExtensionAPI) {
 			name: spec.name,
 			model: spec.model,
 			task: spec.task,
+			systemPrompt: spec.systemPrompt,
+			tools: spec.tools ? [...spec.tools] : undefined,
+			thinking: spec.thinking,
+			cwd: spec.cwd,
+			timeoutSec: spec.timeoutSec,
+			maxTurns: spec.maxTurns,
 			status: "running",
 			startTime: Date.now(),
 			usage: emptyUsage(),
@@ -571,24 +756,31 @@ export default function (pi: ExtensionAPI) {
 					if (text) live.activities.push({ kind: "message", at, text: truncateBytes(text, 600) });
 				}
 				break;
-			case "tool":
+			case "tool": {
+				const args = JSON.stringify(event.args);
 				live.activities.push({
 					kind: "tool",
 					at,
 					toolName: event.name,
-					argsPreview: preview(JSON.stringify(event.args), 90),
+					args,
+					argsPreview: preview(args, 90),
 				});
 				break;
-			case "toolResult":
+			}
+			case "toolResult": {
+				const args = JSON.stringify(event.args);
 				live.activities.push({
 					kind: "toolResult",
 					at,
 					toolName: event.name,
-					argsPreview: preview(JSON.stringify(event.args), 90),
+					args,
+					argsPreview: preview(args, 90),
+					resultText: event.resultText,
 					resultPreview: event.resultPreview,
 					isError: event.isError,
 				});
 				break;
+			}
 			case "thinking":
 				live.currentThinking = event.text;
 				break;
@@ -611,6 +803,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const persistRun = (
+		generation: number,
 		groupId: string,
 		kind: LiveRun["kind"],
 		r: SubagentRunResult,
@@ -618,6 +811,7 @@ export default function (pi: ExtensionAPI) {
 		live: LiveRun,
 		ctx?: ExtensionContext,
 	) => {
+		if (sessionShuttingDown || generation !== sessionGeneration) return;
 		pi.appendEntry(RUN_ENTRY_TYPE, toRunRecord(groupId, kind, r, step, live.runId, live.groupSize));
 		pi.appendEntry(RUN_DETAIL_ENTRY_TYPE, toDetailRecord(groupId, kind, r, step, live));
 
@@ -657,7 +851,9 @@ export default function (pi: ExtensionAPI) {
 		step?: number,
 		ctx?: ExtensionContext,
 		groupSize?: number,
+		generation = sessionGeneration,
 	) => {
+		if (sessionShuttingDown || generation !== sessionGeneration) return;
 		const live: LiveRun = {
 			runId: randomUUID(),
 			groupId,
@@ -678,7 +874,7 @@ export default function (pi: ExtensionAPI) {
 			sessionId: r.sessionId,
 		};
 		liveRuns.set(live.runId, live);
-		persistRun(groupId, kind, r, step, live, ctx);
+		persistRun(generation, groupId, kind, r, step, live, ctx);
 	};
 
 	// Merge the in-memory registry with persisted detail entries for the browser.
@@ -721,14 +917,19 @@ export default function (pi: ExtensionAPI) {
 			const elapsed =
 				(group.completedAt ? Date.parse(group.completedAt) : Date.now()) - Date.parse(group.startedAt);
 			const icon = statusIcon(group.status === "running" ? "running" : group.status === "ok" ? "ok" : "error");
-			lines.push(`${icon} ${group.groupId} · ${group.mode} · ${group.status} · ${formatElapsed(elapsed)}`);
+			const groupStatus = group.status === "running" && group.controller.signal.aborted ? "cancelling" : group.status;
+			lines.push(`${icon} ${group.groupId} · ${group.mode} · ${groupStatus} · ${formatElapsed(elapsed)}`);
 			if (runs.length === 0) {
 				lines.push("  (no subagent runs have started yet)");
 			} else {
 				for (const run of runs) {
 					const detail =
-						run.status === "running" ? "running" : run.errorMessage || run.stopReason || "finished";
-					lines.push(`  ${statusIcon(run.status)} ${run.name} · ${run.model} · ${detail}`);
+						run.status === "running"
+							? runControllers.get(run.runId)?.signal.aborted
+								? "cancelling"
+								: "running"
+							: run.errorMessage || run.stopReason || "finished";
+					lines.push(`  ${statusIcon(run.status)} ${run.name} · ${run.model} · runId ${run.runId} · ${detail}`);
 				}
 			}
 			if (group.result && group.status !== "running") {
@@ -742,16 +943,18 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		// The user is asked for a model on the first launch; keep launches serial so
-		// that prompt cannot overlap another tool call.
+		// that prompt cannot overlap another tool call. Execution itself is always
+		// detached below, so this never waits for a subagent to finish.
 		executionMode: "sequential",
 		description: [
-			"Delegate tasks to subagents with isolated context windows and explicit orchestration controls. Use background:true when the main thread should continue while they run.",
+			"Delegate tasks to subagents with isolated context windows. Every launch returns immediately; continue independent work or return control to the user. Completed groups automatically interject a capped result into the parent session as a follow-up.",
 			"Single: {task}. Parallel: {tasks:[...], parallelLimit}. Chain: {chain:[...], onFailure, {previous}}.",
-			'Model and thinking level are chosen by the user: the first launch in a session asks, and the answer is reused for the session (optionally saved globally). Native OpenAI Luna models always use priority fast mode.',
+			'Model and thinking level are chosen by the user: the first launch of each subagent type asks, and the answer is reused only for that type (optionally saved globally). Native OpenAI Luna models always use priority fast mode.',
 			"Use focused tasks with an explicit expected output; do not make one worker own discovery, implementation, and review.",
+			"Model choices are keyed by agent definition name; unnamed tasks use the default or inline type and do not inherit another type's choice.",
 			"Use parallel for independent tasks, chain for dependencies, and keepSession/sessionId to continue partial work without restarting.",
 			"maxTurns reserves a finalization turn; if a run still fails, its result includes partial output and a session id when keepSession was enabled.",
-			"Background groups keep running after the launch tool returns, so continue independent main-thread work and synchronize with subagent_wait only at dependency points.",
+			`Every group runs in the background after the launch tool returns and has a ${DEFAULT_SUBAGENT_TIMEOUT_SEC}s default hard timeout; set timeoutSec higher for longer work. Continue independent work or return control to the user; do not wait for subagent results. Use subagent_status for run ids, subagent_history for persisted transcripts, and subagent_cancel to stop one run or a whole group.`,
 			"thinking, tools, cwd, timeoutSec, maxTurns, parallelLimit, and onFailure are orchestration controls, not decoration.",
 			"Luna subagents always use OpenAI priority fast mode; callers cannot disable or override that service tier.",
 			`Agents: ${formatAgentList(discoverAgents(process.cwd(), "user").agents, 5).text}.`,
@@ -760,16 +963,24 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use subagent proactively whenever one or more focused delegated tasks would materially improve the work; there is no mode gating and the main thread can keep working while they run.",
 			"Use subagent to delegate independent, parallelizable work to a fresh context window; set parallelLimit to 2-4 when concurrency is useful.",
-			"When delegation is beneficial and independent work remains, set background:true, continue independent main-thread work, then use subagent_status or subagent_wait instead of idling.",
+			"When delegation is beneficial, launch the task and immediately continue independent main-thread work. If no useful work remains, return control to the user; completed results interject automatically. Use subagent_status for live snapshots, subagent_history to inspect prior transcripts, and subagent_cancel to stop an unwanted run/group.",
+			NO_DUPLICATE_WORK_DIRECTIVE,
 			"Prefer a scout/planner → focused worker → reviewer workflow instead of one broad worker call.",
 			"Use subagent chain with {previous} for dependent phases; set onFailure to continue only when later phases can recover from partial evidence.",
 			"Use keepSession when a task may need follow-up; resume a max-turn or partial run with its returned sessionId and a narrower task.",
-			"Prefer task-specific systemPrompt and tools allowlists so subagents stay focused and finish within their turn budget; model and thinking come from the user's session preference, so do not set them.",
+			"Prefer task-specific systemPrompt and tools allowlists so subagents stay focused and finish within their turn budget; model and thinking come from the user's preference for that subagent type, so do not set them.",
 			"When a native OpenAI model id/name contains Luna, the runner enforces priority fast mode at the provider payload boundary.",
 		],
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const parentSignal = signal ?? new AbortController().signal;
+			const launchGeneration = sessionGeneration;
+			const staleLaunch = (): boolean => sessionShuttingDown || launchGeneration !== sessionGeneration;
+			const canceledForSessionChange = () => ({
+				content: [{ type: "text" as const, text: "Subagent launch canceled because the session changed during setup." }],
+				details: {},
+				isError: true,
+			});
 			const groupId = randomUUID();
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
@@ -819,6 +1030,7 @@ export default function (pi: ExtensionAPI) {
 						"Run project-local agents?",
 						`Agents: ${names}\nSource: ${discovery.projectAgentsDir}\n\nProject agents are repo-controlled. Continue only for trusted repositories.`,
 					);
+					if (staleLaunch()) return canceledForSessionChange();
 					if (!ok) {
 						return {
 							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
@@ -829,53 +1041,45 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// The user owns the subagent model + thinking level. Ask once per session
-			// (or reuse the session/global choice) before any work is scheduled.
-			const resolution = await resolvePreference(ctx);
-			if (resolution.source === "cancelled") {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "Subagent launch canceled: the user did not choose a subagent model. Ask the user which model to use, then retry.",
-						},
-					],
-					details: {},
-					isError: true,
-				};
-			}
-			if ((resolution.source === "prompted" || resolution.source === "global") && resolution.preference) {
-				pi.appendEntry(SUBAGENT_PREFERENCE_ENTRY_TYPE, resolution.preference);
-			}
-			const preference = resolution.preference;
+			if (staleLaunch()) return canceledForSessionChange();
 
-			const background = params.background === true;
-			const backgroundController = background ? new AbortController() : undefined;
-			const executionSignal = backgroundController?.signal ?? parentSignal;
-			const dashboardOnUpdate = background ? undefined : onUpdate;
+			// Resolve each requested agent type independently. A planner's choice must
+			// never become the worker's choice, even when both run in one group.
+			const preferenceItems: TaskItemType[] = params.tasks ?? params.chain ?? (hasSingle ? [params as TaskItemType] : []);
+			const preferenceTypes = [...new Set(preferenceItems.map((item) => subagentTypeForTask(item)))];
+			const preferencesByType = new Map<string, SubagentPreference>();
+			for (const subagentType of preferenceTypes) {
+				const resolution = await resolvePreference(ctx, subagentType, { shouldCancel: staleLaunch });
+				if (staleLaunch()) return canceledForSessionChange();
+				if (resolution.source === "cancelled") {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Subagent launch canceled: the user did not choose a model for the "${subagentType}" subagent type. Ask the user which model to use, then retry.`,
+							},
+						],
+						details: {},
+						isError: true,
+					};
+				}
+				if ((resolution.source === "prompted" || resolution.source === "global") && resolution.preference) {
+					pi.appendEntry(
+						SUBAGENT_PREFERENCE_ENTRY_TYPE,
+						preferenceEntryData(subagentType, resolution.preference),
+					);
+				}
+				if (resolution.preference) preferencesByType.set(subagentType, resolution.preference);
+			}
+
+			// Subagent execution is always detached from the parent turn. The parent
+			// signal is only used for the preflight cancellation check above; active
+			// groups live until completion or session shutdown.
+			const backgroundController = new AbortController();
+			const executionSignal = backgroundController.signal;
 			const mode: RunKind = hasSingle ? "single" : hasChain ? "chain" : "parallel";
 			// Display-only context; the runner and scheduling limits remain unchanged.
 			const groupSize = hasSingle ? 1 : hasChain ? params.chain!.length : params.tasks!.length;
-
-			const makeDetails = (results: SubagentRunResult[], resultMode: RunKind, live?: LiveRun[]) => ({
-				mode: resultMode,
-				results,
-				live,
-			});
-
-			// Throttled streaming updates — stream a live per-subagent dashboard.
-			let lastUpdate = 0;
-			const emitDashboard = (resultMode: RunKind, force = false) => {
-				if (!dashboardOnUpdate) return;
-				const now = Date.now();
-				if (!force && now - lastUpdate < UPDATE_THROTTLE_MS) return;
-				lastUpdate = now;
-				const live = [...liveRuns.values()].filter((r) => r.groupId === groupId);
-				dashboardOnUpdate({
-					content: [{ type: "text", text: liveDashboardText(live) }],
-					details: makeDetails([], resultMode, live),
-				});
-			};
 
 			const runOne = async (
 				item: TaskItemType,
@@ -883,6 +1087,7 @@ export default function (pi: ExtensionAPI) {
 				step?: number,
 				previousOutput?: string,
 			): Promise<SubagentRunResult> => {
+				const preference = preferencesByType.get(subagentTypeForTask(item));
 				const resolved = buildTask(item, agents, ctx, preference, step, previousOutput);
 				if (!resolved.ok) {
 					const errText = resolved.suggestions?.length
@@ -902,39 +1107,65 @@ export default function (pi: ExtensionAPI) {
 						startedAt: new Date().toISOString(),
 						durationMs: 0,
 					};
-					recordFinishedRun(groupId, resultMode, result, step, ctx, groupSize);
-					emitDashboard(resultMode, true);
+					recordFinishedRun(groupId, resultMode, result, step, ctx, groupSize, launchGeneration);
 					return result;
 				}
 
 				const spec = resolved.task;
 				const live = startLiveRun(groupId, resultMode, spec, step, groupSize);
+				const runController = new AbortController();
+				const abortRunWithGroup = () => runController.abort();
+				if (executionSignal.aborted) runController.abort();
+				else executionSignal.addEventListener("abort", abortRunWithGroup, { once: true });
+				runControllers.set(live.runId, runController);
 
-				const result = await runSubagent(spec, {
-					defaultCwd: ctx.cwd,
-					getModel: (id) =>
-						ctx.modelRegistry
-							.getAvailable()
-							.find((m) => `${m.provider}/${m.id}` === id || m.id === id) as never,
-					getProvider: (providerId) => ctx.modelRegistry.getProvider(providerId) as never,
-					getApiKey: async (providerId) => {
-						try {
-							return await ctx.modelRegistry.getApiKeyForProvider(providerId);
-						} catch {
+				let result: SubagentRunResult;
+				try {
+					result = await runSubagent(spec, {
+						defaultCwd: ctx.cwd,
+						getModel: (id) =>
+							ctx.modelRegistry
+								.getAvailable()
+								.find((m) => `${m.provider}/${m.id}` === id || m.id === id) as never,
+						getProvider: (providerId) => ctx.modelRegistry.getProvider(providerId) as never,
+						getApiKey: async (providerId) => {
+							try {
+								return await ctx.modelRegistry.getApiKeyForProvider(providerId);
+							} catch {
 							return undefined;
-						}
-					},
-					sessionCache,
-					signal: executionSignal,
-					onEvent: (event) => {
-						applyRunnerEvent(live, event);
-						emitDashboard(resultMode);
-					},
-				});
+							}
+						},
+						sessionCache,
+						signal: runController.signal,
+						onEvent: (event) => {
+							applyRunnerEvent(live, event);
+						},
+					});
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					result = {
+						name: spec.name,
+						task: spec.task,
+						exitCode: 1,
+						messages: [],
+						stderr: message,
+						usage: emptyUsage(),
+						model: spec.model,
+						stopReason: "error",
+						errorMessage: message,
+						timeoutKilled: false,
+						maxTurnsKilled: false,
+						aborted: false,
+						startedAt: new Date(live.startTime).toISOString(),
+						durationMs: Date.now() - live.startTime,
+					};
+				} finally {
+					executionSignal.removeEventListener("abort", abortRunWithGroup);
+					runControllers.delete(live.runId);
+				}
 
 				finalizeLiveRun(live, result);
-				persistRun(groupId, resultMode, result, step, live, ctx);
-				emitDashboard(resultMode, true);
+				persistRun(launchGeneration, groupId, resultMode, result, step, live, ctx);
 				return result;
 			};
 
@@ -972,6 +1203,14 @@ export default function (pi: ExtensionAPI) {
 					const continueOnFailure = params.onFailure === "continue";
 					let previousOutput = "";
 					for (let i = 0; i < params.chain!.length; i++) {
+						if (executionSignal.aborted) {
+							return {
+								mode: "chain",
+								results,
+								text: `Chain canceled before step ${i + 1}; no further steps were started.`,
+								isError: true,
+							};
+						}
 						const stepItem = params.chain![i];
 						const result = await runOne(stepItem, "chain", i + 1, previousOutput);
 						results.push(result);
@@ -1040,21 +1279,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			};
 
-			if (!background) {
-				const groupResult = await runGroup();
-				return {
-					content: [{ type: "text", text: groupResult.text }],
-					details: makeDetails(groupResult.results, groupResult.mode),
-					isError: groupResult.isError,
-				};
-			}
-
 			const backgroundGroup: BackgroundGroup = {
 				groupId,
 				mode,
 				status: "running",
 				startedAt: new Date().toISOString(),
-				controller: backgroundController!,
+				controller: backgroundController,
 				promise: Promise.resolve({ mode, results: [], text: "", isError: false }),
 			};
 			backgroundGroups.set(groupId, backgroundGroup);
@@ -1078,6 +1308,10 @@ export default function (pi: ExtensionAPI) {
 					backgroundGroup.status = "error";
 					backgroundGroup.completedAt = new Date().toISOString();
 					return groupResult;
+				})
+				.then((groupResult) => {
+					interjectGroupCompletion(groupId, groupResult, launchGeneration);
+					return groupResult;
 				});
 			void backgroundGroup.promise;
 
@@ -1086,10 +1320,10 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Started background ${mode} group ${groupId} with ${count} subagent run${count === 1 ? "" : "s"}. Continue independent work; use subagent_status with groupId ${groupId} to monitor it and subagent_wait when its results are needed.`,
+						text: `Started non-blocking ${mode} group ${groupId} with ${count} subagent run${count === 1 ? "" : "s"}. Continue independent work or return control to the user; the completed group result will be interjected automatically. Use subagent_status with groupId ${groupId} only for a non-blocking snapshot.`,
 					},
 				],
-				details: { mode, groupId, background: true, results: [] },
+				details: { mode, groupId, nonBlocking: true, results: [] },
 			};
 		},
 
@@ -1099,7 +1333,7 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme, _context) {
 			const scope = args.agentScope ?? "user";
 			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", `[${scope}]`);
-			if (args.background) text += `\n${theme.fg("warning", "background — returns immediately")}`;
+			text += `\n${theme.fg("warning", "non-blocking — returns immediately")}`;
 			if (args.chain) {
 				text += `\n${theme.fg("accent", `chain (${args.chain.length} steps)`)}`;
 				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
@@ -1119,13 +1353,8 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderResult(result, { expanded }, theme, _context) {
-			const details = result.details as
-				{ mode?: string; results?: SubagentRunResult[]; live?: LiveRun[] } | undefined;
-			// Live streaming dashboard (details carried by onUpdate while running).
-			if (details?.live && details.live.length > 0) {
-				return renderLiveDashboard(details.live, expanded, theme);
-			}
-			// Final result.
+			const details = result.details as { mode?: string; results?: SubagentRunResult[] } | undefined;
+			// The launch result is intentionally only a non-blocking acknowledgement.
 			if (!details || !details.results || details.results.length === 0) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
@@ -1134,37 +1363,11 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	type GroupWaitOutcome = { kind: "done"; result: GroupExecutionResult } | { kind: "timeout" } | { kind: "aborted" };
-
-	const waitForGroup = (
-		group: BackgroundGroup,
-		timeoutSec: number | undefined,
-		signal: AbortSignal | undefined,
-	): Promise<GroupWaitOutcome> => {
-		if (group.result && group.status !== "running") return Promise.resolve({ kind: "done", result: group.result });
-		return new Promise((resolve) => {
-			let settled = false;
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			let onAbort: () => void;
-			const finish = (outcome: GroupWaitOutcome) => {
-				if (settled) return;
-				settled = true;
-				if (timer) clearTimeout(timer);
-				signal?.removeEventListener("abort", onAbort);
-				resolve(outcome);
-			};
-			onAbort = () => finish({ kind: "aborted" });
-			group.promise.then((result) => finish({ kind: "done", result }));
-			if (timeoutSec !== undefined) timer = setTimeout(() => finish({ kind: "timeout" }), timeoutSec * 1000);
-			if (signal?.aborted) onAbort();
-			else signal?.addEventListener("abort", onAbort, { once: true });
-		});
-	};
-
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent status",
-		description: "Inspect running or completed background subagent groups. Pass a groupId to inspect one group.",
+		description:
+			"Inspect running or completed subagent groups without waiting. Pass a groupId to inspect one group; run ids are included for individual cancellation and transcript lookup.",
 		parameters: BackgroundStatusParams,
 		async execute(_toolCallId, params) {
 			return {
@@ -1175,65 +1378,82 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "subagent_wait",
-		label: "Wait for subagents",
+		name: "subagent_history",
+		label: "Subagent history",
 		description:
-			"Wait for a background subagent group to finish and return its collected results. A timeout only stops waiting; it does not cancel the group.",
-		parameters: BackgroundWaitParams,
-		async execute(_toolCallId, params, signal) {
-			const group = backgroundGroups.get(params.groupId);
-			if (!group) {
-				return {
-					content: [{ type: "text", text: `No background subagent group found for ${params.groupId}.` }],
-					details: { groupId: params.groupId, status: "missing" as const } as BackgroundWaitDetails,
-					isError: true,
-				};
+			"Read this session's persisted subagent runs and transcripts. Filter by runId, groupId, or metadata; includeTranscript reveals assistant, thinking, and tool history. Output is capped.",
+		parameters: SubagentHistoryParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, rawContext) {
+			const ctx = rawContext as ExtensionContext;
+			const filter = (params.filter ?? "").trim();
+			const matchingRuns = collectRuns(ctx, filter)
+				.filter((run) => !params.runId || run.runId === params.runId)
+				.filter((run) => !params.groupId || run.groupId === params.groupId)
+				.sort((a, b) => b.startTime - a.startTime);
+			const limit = params.runId ? 1 : (params.limit ?? 5);
+			const runs = matchingRuns.slice(0, limit);
+			if (runs.length === 0) {
+				const text = params.runId
+					? `No subagent run found for runId ${params.runId}.`
+					: "No subagent history matched the requested filters.";
+				return { content: [{ type: "text", text }], details: { runIds: [] }, isError: Boolean(params.runId) };
+			}
+			const text = formatHistoryRuns(runs, params.includeTranscript === true);
+			return { content: [{ type: "text", text }], details: { runIds: runs.map((run) => run.runId) } };
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_cancel",
+		label: "Cancel subagent",
+		description:
+			"Request cancellation of exactly one active run by runId, or every active run in a group by groupId. Returns immediately; queued group work is skipped.",
+		parameters: SubagentCancelParams,
+		async execute(_toolCallId, params) {
+			const response = (text: string, isError = false) => ({
+				content: [{ type: "text" as const, text }],
+				details: {},
+				...(isError ? { isError: true as const } : {}),
+			});
+			const hasRunId = typeof params.runId === "string" && params.runId.length > 0;
+			const hasGroupId = typeof params.groupId === "string" && params.groupId.length > 0;
+			if (hasRunId === hasGroupId) {
+				return response("Provide exactly one of runId or groupId to cancel subagent work.", true);
 			}
 
-			const outcome = await waitForGroup(group, params.timeoutSec, signal);
-			if (outcome.kind === "timeout") {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Background group ${params.groupId} is still running after ${params.timeoutSec}s.\n\n${formatBackgroundStatus(params.groupId)}`,
-						},
-					],
-					details: { groupId: params.groupId, status: "running" as const },
-				};
-			}
-			if (outcome.kind === "aborted") {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Stopped waiting for background group ${params.groupId}; the group continues running.`,
-						},
-					],
-					details: { groupId: params.groupId, status: "running" as const },
-					isError: true,
-				};
+			if (hasRunId) {
+				const run = liveRuns.get(params.runId!);
+				if (!run) return response(`Unknown subagent runId ${params.runId}.`, true);
+				if (run.status !== "running") {
+					return response(`Subagent run ${params.runId} has already finished (${run.status}).`);
+				}
+				const controller = runControllers.get(params.runId!);
+				if (!controller) return response(`Subagent run ${params.runId} is no longer active.`);
+				if (controller.signal.aborted) {
+					return response(`Cancellation was already requested for run ${params.runId}.`);
+				}
+				controller.abort();
+				return response(`Cancellation requested for run ${params.runId}.`);
 			}
 
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Background group ${params.groupId} completed.\n\n${truncateBytes(outcome.result.text, PARENT_OUTPUT_CAP)}`,
-					},
-				],
-				details: {
-					groupId: params.groupId,
-					status: "completed" as const,
-					mode: outcome.result.mode,
-					results: outcome.result.results,
-				},
-				isError: outcome.result.isError,
-			};
+			const group = backgroundGroups.get(params.groupId!);
+			if (!group) return response(`Unknown subagent groupId ${params.groupId}.`, true);
+			if (group.status !== "running") {
+				return response(`Subagent group ${params.groupId} has already finished (${group.status}).`);
+			}
+			if (group.controller.signal.aborted) {
+				return response(`Cancellation was already requested for group ${params.groupId}.`);
+			}
+			group.controller.abort();
+			return response(
+				`Cancellation requested for group ${params.groupId}; active runs are aborting and queued work will not start.`,
+			);
 		},
 	});
 
 	pi.on("session_shutdown", () => {
+		sessionShuttingDown = true;
+		sessionGeneration++;
 		for (const group of backgroundGroups.values()) {
 			if (group.status === "running") group.controller.abort();
 		}
@@ -1337,90 +1557,213 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// The user owns the subagent model + thinking level for the session.
-	const choosePreference = async (ctx: ExtensionContext): Promise<void> => {
+	const knownSubagentTypes = async (ctx: ExtensionContext): Promise<string[]> => {
+		const discoveredTypes = discoverAgents(ctx.cwd || process.cwd(), "both").agents.map((agent) => agent.name);
+		const sessionTypes = Object.keys(getSessionPreferences());
+		const globalTypes = Object.keys((await loadGlobalPreferences()) ?? {});
+		return [...new Set([DEFAULT_SUBAGENT_TYPE, INLINE_SUBAGENT_TYPE, ...discoveredTypes, ...sessionTypes, ...globalTypes])].sort(
+			(a, b) => a.localeCompare(b),
+		);
+	};
+
+	// The user owns a separate model + thinking choice for each subagent type.
+	const choosePreference = async (ctx: ExtensionContext, subagentType?: string): Promise<void> => {
+		const generation = sessionGeneration;
+		const isStale = () => sessionShuttingDown || generation !== sessionGeneration;
 		if (!ctx.hasUI) {
 			ctx.ui.notify("Choosing a subagent model requires an interactive session.", "warning");
 			return;
 		}
-		const result = await promptForPreference(ctx);
+
+		let type = subagentType ? normalizeSubagentType(subagentType) : undefined;
+		if (!type) {
+			const types = await knownSubagentTypes(ctx);
+			if (isStale()) return;
+			const selectedType = await ctx.ui.select("Which subagent type should this apply to?", types);
+			if (isStale()) return;
+			if (selectedType === undefined) {
+				ctx.ui.notify("Subagent type selection cancelled.", "info");
+				return;
+			}
+			type = normalizeSubagentType(selectedType);
+		}
+
+		const result = await promptForPreference(ctx, type);
+		if (isStale()) return;
 		if (result.cancelled || !result.preference) {
-			ctx.ui.notify("Subagent model choice cancelled.", "info");
+			ctx.ui.notify(`Subagent model choice for \"${type}\" was cancelled.`, "info");
 			return;
 		}
-		setSessionPreference(result.preference);
-		pi.appendEntry(SUBAGENT_PREFERENCE_ENTRY_TYPE, result.preference);
-		if (result.persistGlobally) await saveGlobalPreference(result.preference);
+		if (result.persistGlobally) {
+			await saveGlobalPreferenceForType(type, result.preference);
+			if (isStale()) return;
+		}
+		if (isStale()) return;
+		setSessionPreference(type, result.preference);
+		pi.appendEntry(SUBAGENT_PREFERENCE_ENTRY_TYPE, preferenceEntryData(type, result.preference));
 		ctx.ui.notify(
-			`Subagents will use ${describePreference(result.preference)}${result.persistGlobally ? " (saved for future sessions)" : " (this session)"}.`,
+			`The \"${type}\" subagent will use ${describePreference(result.preference)}${result.persistGlobally ? " (saved for future sessions)" : " (this session)"}.`,
 			"info",
 		);
 	};
 
+	const formatPreferenceStatus = (
+		label: string,
+		preferences: Record<string, SubagentPreference>,
+		type?: string,
+	): string => {
+		if (type) {
+			const preference = preferences[normalizeSubagentType(type)];
+			return `${label} (\"${normalizeSubagentType(type)}\"): ${preference ? describePreference(preference) : "not chosen yet"}`;
+		}
+		const entries = Object.entries(preferences).sort(([a], [b]) => a.localeCompare(b));
+		if (entries.length === 0) return `${label}: ${label === "Session" ? "not chosen yet (asked on the first subagent launch)" : "not saved"}`;
+		return [`${label}:`, ...entries.map(([name, preference]) => `  ${name}: ${describePreference(preference)}`)].join("\n");
+	};
+
+	const showPreferenceStatus = async (ctx: ExtensionContext, type?: string): Promise<void> => {
+		const session = getSessionPreferences();
+		const global = (await loadGlobalPreferences()) ?? {};
+		ctx.ui.notify(
+			[formatPreferenceStatus("Session", session, type), formatPreferenceStatus("Global", global, type)].join("\n"),
+			"info",
+		);
+	};
+
+	const resetPreferences = async (ctx: ExtensionContext, type?: string): Promise<void> => {
+		if (type) {
+			setSessionPreference(type, undefined);
+			const global = (await loadGlobalPreferences()) ?? {};
+			const saved = global[type];
+			if (!saved) {
+				ctx.ui.notify(`The \"${type}\" subagent model was reset; its next launch asks again.`, "info");
+				return;
+			}
+			if (!ctx.hasUI) {
+				ctx.ui.notify(`Session choice cleared; the saved global choice (${describePreference(saved)}) still applies.`, "info");
+				return;
+			}
+			const clearGlobal = await ctx.ui.confirm(
+				`Clear the saved global model for \"${type}\"?`,
+				`Saved globally: ${describePreference(saved)}.`,
+			);
+			if (clearGlobal) {
+				await clearGlobalPreferenceForType(type);
+				ctx.ui.notify(`The \"${type}\" subagent model was reset; its next launch asks again.`, "info");
+				return;
+			}
+			ctx.ui.notify(`Session choice cleared; the saved global choice (${describePreference(saved)}) still applies.`, "info");
+			return;
+		}
+
+		setSessionPreference(undefined);
+		const global = (await loadGlobalPreferences()) ?? {};
+		if (Object.keys(global).length === 0) {
+			ctx.ui.notify("Subagent model choices reset; the next launch of each type asks again.", "info");
+			return;
+		}
+		if (!ctx.hasUI) {
+			ctx.ui.notify("Session choices cleared; saved global choices still apply.", "info");
+			return;
+		}
+		const clearGlobal = await ctx.ui.confirm(
+			"Clear all saved global subagent models?",
+			Object.entries(global)
+				.map(([name, preference]) => `${name}: ${describePreference(preference)}`)
+				.join("\n"),
+		);
+		if (clearGlobal) {
+			await clearGlobalPreference();
+			ctx.ui.notify("Subagent model choices reset; the next launch of each type asks again.", "info");
+			return;
+		}
+		ctx.ui.notify("Session choices cleared; saved global choices still apply.", "info");
+	};
+
+	const openPreferenceMenu = async (ctx: ExtensionContext): Promise<void> => {
+		if (!ctx.hasUI) {
+			await choosePreference(ctx);
+			return;
+		}
+		const action = await ctx.ui.select("Subagent model settings", [
+			"Choose a model and thinking level",
+			"View current choices",
+			"Reset one subagent type",
+			"Reset all subagent choices",
+		]);
+		if (action === undefined) {
+			ctx.ui.notify("Subagent model menu cancelled.", "info");
+			return;
+		}
+		if (action === "Choose a model and thinking level") {
+			await choosePreference(ctx);
+			return;
+		}
+		if (action === "View current choices") {
+			await showPreferenceStatus(ctx);
+			return;
+		}
+		if (action === "Reset one subagent type") {
+			const type = await ctx.ui.select("Which subagent type should be reset?", await knownSubagentTypes(ctx));
+			if (type !== undefined) await resetPreferences(ctx, normalizeSubagentType(type));
+			return;
+		}
+		await resetPreferences(ctx);
+	};
+
 	pi.registerCommand("subagent-model", {
-		description: "Choose the model and thinking level subagents use (remembered per session; optional global save)",
+		description: "Open the per-subagent-type model and thinking settings menu",
 		handler: async (args, ctx) => {
-			const action = args.trim().toLowerCase();
+			const trimmedArgs = args.trim();
+			if (!trimmedArgs) {
+				await openPreferenceMenu(ctx);
+				return;
+			}
+
+			const tokens = trimmedArgs.split(/\s+/);
+			const first = tokens[0]?.toLowerCase();
+			const knownActions = new Set(["select", "set", "status", "reset"]);
+			const hasExplicitAction = knownActions.has(first ?? "");
+			const action = hasExplicitAction ? first! : "select";
+			// `/subagent-model worker` is shorthand for `select worker`; explicit
+			// actions keep their type in the second token.
+			const typeArgument = hasExplicitAction ? tokens[1] : tokens[0];
+			const type = typeArgument ? normalizeSubagentType(typeArgument) : undefined;
+
 			if (action === "status") {
-				const session = getSessionPreference();
-				const global = await loadGlobalPreference();
-				ctx.ui.notify(
-					[
-						`Session: ${session ? describePreference(session) : "not chosen yet (asked on the first subagent launch)"}`,
-						`Global: ${global ? describePreference(global) : "not saved"}`,
-					].join("\n"),
-					"info",
-				);
+				await showPreferenceStatus(ctx, type);
 				return;
 			}
 			if (action === "reset") {
-				setSessionPreference(undefined);
-				const global = await loadGlobalPreference();
-				if (!global) {
-					ctx.ui.notify("Subagent model reset; the next launch asks again.", "info");
-					return;
-				}
-				if (!ctx.hasUI) {
-					ctx.ui.notify(
-						`Session choice cleared; the saved global choice (${describePreference(global)}) still applies.`,
-						"info",
-					);
-					return;
-				}
-				const clearGlobal = await ctx.ui.confirm(
-					"Clear the saved global subagent model?",
-					`Saved globally: ${describePreference(global)}.`,
-				);
-				if (clearGlobal) {
-					await clearGlobalPreference();
-					ctx.ui.notify("Subagent model reset; the next launch asks again.", "info");
-					return;
-				}
-				ctx.ui.notify(
-					`Session choice cleared; the saved global choice (${describePreference(global)}) still applies.`,
-					"info",
-				);
+				await resetPreferences(ctx, type);
 				return;
 			}
-			if (action !== "" && action !== "select" && action !== "set") {
-				ctx.ui.notify("Usage: /subagent-model [select|status|reset]", "warning");
-				return;
-			}
-			await choosePreference(ctx);
+			await choosePreference(ctx, type);
 		},
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		setSessionPreference(restoredPreference(ctx.sessionManager.getBranch()));
+		sessionGeneration++;
+		sessionShuttingDown = false;
+		for (const group of backgroundGroups.values()) {
+			if (group.status === "running") group.controller.abort();
+		}
+		sessionCache.clear();
+		liveRuns.clear();
+		backgroundGroups.clear();
+		runControllers.clear();
+		setSessionPreferences(restoredPreferences(ctx.sessionManager.getBranch()));
 	});
 
 	pi.on("before_agent_start", (event) => {
-		const preference = getSessionPreference();
-		const choice = preference
-			? `The user already chose the subagent model for this session (${describePreference(preference)}); do not ask for one again and do not set model/thinking per task.`
-			: "The user is asked to choose the subagent model and thinking level on the first launch of each session.";
+		const preferences = getSessionPreferences();
+		const entries = Object.entries(preferences).sort(([a], [b]) => a.localeCompare(b));
+		const choice =
+			entries.length > 0
+				? `The user already chose subagent models per type (${entries.map(([type, preference]) => `${type}: ${describePreference(preference)}`).join(", ")}); do not ask again for those types. For a new type, ask on its first launch.`
+				: "The user is asked to choose the subagent model and thinking level on the first launch of each session's subagent type.";
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n[SUBAGENT DELEGATION] Subagents run in isolated context windows and are available at all times, with no mode gating. Delegate proactively whenever focused research, implementation, or review would materially improve the work, and keep the main thread productive with background:true while they run. ${choice}`,
+			systemPrompt: `${event.systemPrompt}\n\n[SUBAGENT DELEGATION] Subagents run in isolated context windows and are available at all times, with no mode gating. Delegate proactively whenever focused research, implementation, or review would materially improve the work. Every subagent launch is non-blocking and has a ${DEFAULT_SUBAGENT_TIMEOUT_SEC}s default hard timeout (set timeoutSec higher for long tasks); continue independent work or return control to the user. Completed groups automatically interject their capped result into this session. Use subagent_status for live snapshots and run ids, subagent_history to inspect past transcripts, and subagent_cancel to stop one run or an entire group; do not wait or poll for completion. ${NO_DUPLICATE_WORK_DIRECTIVE} ${choice}`,
 		};
 	});
 }

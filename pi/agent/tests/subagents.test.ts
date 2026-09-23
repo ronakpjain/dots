@@ -206,6 +206,8 @@ describe("subagent runner cancellation", () => {
 		expect(result.exitCode).toBe(1);
 		expect(result.stopReason).toBe("maxTurns");
 		expect(result.errorMessage).toBe("Exceeded maxTurns=1");
+		expect(stub.invocations).toBe(2);
+		expect(result.messages.some((message) => message.role === "toolResult" && message.isError)).toBe(true);
 	});
 
 	test("uses one finalization turn instead of killing a productive run at the boundary", async () => {
@@ -217,6 +219,31 @@ describe("subagent runner cancellation", () => {
 		expect(result.maxTurnsKilled).toBe(false);
 		expect(getFinalOutput(result.messages)).toBe("DONE AFTER FINALIZATION");
 		expect(stub.invocations).toBe(2);
+	});
+
+	test("forces a timed-out run to settle when the provider ignores abort", async () => {
+		const stub = stubProvider({});
+		const sessionCache = new Map();
+		const hangingProvider = { streamSimple: () => new Promise<never>(() => {}) };
+		const events: RunnerEvent[] = [];
+		const started = Date.now();
+		const result = await runSubagent(
+			spec({ timeoutSec: 0.02, keepSession: true }),
+			opts(stub, {
+				getProvider: () => hangingProvider as never,
+				sessionCache,
+				onEvent: (event) => events.push(event),
+			}),
+		);
+
+		expect(Date.now() - started).toBeLessThan(2_000);
+		expect(result.exitCode).toBe(1);
+		expect(result.timeoutKilled).toBe(true);
+		expect(result.stopReason).toBe("timeout");
+		expect(result.errorMessage).toContain("did not settle");
+		expect(events.some((event) => event.type === "status" && event.text.includes("timeout after 0.02s"))).toBe(true);
+		expect(result.sessionId).toBeUndefined();
+		expect(sessionCache.size).toBe(0);
 	});
 });
 
@@ -323,6 +350,8 @@ describe("subagent ui helpers", () => {
 			const rendered = browser.render(100);
 			expect(rendered.join(" ")).toContain("group group-12");
 			expect(rendered.join(" ")).toContain("step 1/3");
+			expect(rendered.join(" ")).toContain("inspect the implementation");
+			expect(rendered.join(" ")).toContain("model: fake-model");
 			expect(rendered.length).toBeLessThanOrEqual(Math.floor(tui.terminal.rows * 0.8));
 			for (const width of [1, 8, 24, 60]) {
 				for (const line of browser.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(Math.max(1, width));
@@ -373,13 +402,95 @@ describe("subagent ui helpers", () => {
 		try {
 			browser.render(24);
 			browser.handleInput(String.fromCharCode(13));
-			const first = browser.render(24);
-			expect(first.join(" ")).toContain("argument");
-			expect(first.join(" ")).not.toContain("TAIL_ACTIVITY");
-			for (let i = 0; i < 20; i++) browser.handleInput("j");
-			const last = browser.render(24);
+			let sawActivity = false;
+			let sawActivityLabel = false;
+			for (let i = 0; i < 40 && !sawActivity; i++) {
+				const rendered = browser.render(24).join(" ");
+				sawActivity = rendered.includes("argument");
+				sawActivityLabel = sawActivityLabel || rendered.includes("Activity");
+				if (!sawActivity) browser.handleInput("j");
+			}
+			expect(sawActivityLabel).toBe(true);
+			expect(sawActivity).toBe(true);
+			let last = browser.render(24);
+			for (let i = 0; i < 40 && !last.join(" ").includes("TAIL_ACTIVITY"); i++) {
+				browser.handleInput("j");
+				last = browser.render(24);
+			}
 			expect(last.join(" ")).toContain("TAIL_ACTIVITY");
 			for (const line of last) expect(visibleWidth(line)).toBeLessThanOrEqual(24);
+		} finally {
+			browser.dispose();
+		}
+	});
+
+	test("browser detail expands the full prompt and raw transcript", () => {
+		const run = browserRun({
+			task: `${"main-agent prompt ".repeat(40)}PROMPT_TAIL`,
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: `${"transcript ".repeat(600)}TRANSCRIPT_TAIL` }],
+				} as any,
+			],
+		});
+		const browser = new SubagentsBrowser(browserTheme, browserTui(24), () => {}, () => [run]);
+		try {
+			browser.render(60);
+			browser.handleInput(String.fromCharCode(13));
+			const detailTop = browser.render(60).join(" ");
+			expect(detailTop).toContain("Prompt");
+			let sawConfig = false;
+			for (let i = 0; i < 40 && !sawConfig; i++) {
+				sawConfig = browser.render(60).join(" ").includes("Config");
+				if (!sawConfig) browser.handleInput("j");
+			}
+			expect(sawConfig).toBe(true);
+			browser.handleInput("g");
+			let sawPromptTail = false;
+			for (let i = 0; i < 300; i++) {
+				if (browser.render(60).join(" ").includes("PROMPT_TAIL")) {
+					sawPromptTail = true;
+					break;
+				}
+				browser.handleInput("j");
+			}
+			expect(sawPromptTail).toBe(true);
+			browser.handleInput("g");
+			const collapsedStart = browser.render(60).join(" ");
+			expect(collapsedStart).toContain("o expand");
+			expect(collapsedStart).not.toContain("TRANSCRIPT_TAIL");
+
+			browser.handleInput("G");
+			const collapsed = browser.render(60).join(" ");
+			expect(collapsed).toContain("[truncated]");
+			expect(collapsed).not.toContain("TRANSCRIPT_TAIL");
+			browser.handleInput("o");
+			browser.handleInput("G");
+			const expanded = browser.render(60).join(" ");
+			expect(expanded).toContain("o collapse");
+			expect(expanded).toContain("TRANSCRIPT_TAIL");
+		} finally {
+			browser.dispose();
+		}
+	});
+
+	test("browser labels live activity separately from the transcript", () => {
+		const run = browserRun({
+			status: "running",
+			currentThinking: "checking the latest result",
+			activities: [{ kind: "status", at: 4, text: "reading files" }],
+			messages: [{ role: "assistant", content: [{ type: "text", text: "partial answer" }] } as any],
+		});
+		const browser = new SubagentsBrowser(browserTheme, browserTui(60), () => {}, () => [run]);
+		try {
+			browser.render(100);
+			browser.handleInput(String.fromCharCode(13));
+			const rendered = browser.render(100).join(" ");
+			expect(rendered).toContain("Live activity");
+			expect(rendered).toContain("Current thinking");
+			expect(rendered).toContain("Transcript");
+			expect(rendered).toContain("partial answer");
 		} finally {
 			browser.dispose();
 		}
@@ -428,9 +539,15 @@ describe("subagent ui helpers", () => {
 		try {
 			sparseBrowser.render(50);
 			sparseBrowser.handleInput(String.fromCharCode(13));
-			const rendered = sparseBrowser.render(50);
+			let rendered = sparseBrowser.render(50);
 			expect(rendered.length).toBe(Math.floor(sparseTui.terminal.rows * 0.8));
-			expect(rendered.join(" ")).toContain("body-4");
+			let seenBody4 = rendered.join(" ").includes("body-4");
+			for (let i = 0; i < 20 && !seenBody4; i++) {
+				sparseBrowser.handleInput("j");
+				rendered = sparseBrowser.render(50);
+				seenBody4 = rendered.join(" ").includes("body-4");
+			}
+			expect(seenBody4).toBe(true);
 			expect(rendered.join(" ")).toContain("↑/↓ scroll");
 		} finally {
 			sparseBrowser.dispose();
@@ -447,9 +564,15 @@ describe("subagent ui helpers", () => {
 		try {
 			fullBrowser.render(60);
 			fullBrowser.handleInput(String.fromCharCode(13));
-			const rendered = fullBrowser.render(60);
+			let rendered = fullBrowser.render(60);
 			expect(rendered.length).toBeLessThanOrEqual(Math.floor(fullTui.terminal.rows * 0.8));
-			expect(rendered.join(" ")).toContain("full-header-body");
+			let sawFullHeaderBody = rendered.join(" ").includes("full-header-body");
+			for (let i = 0; i < 20 && !sawFullHeaderBody; i++) {
+				fullBrowser.handleInput("j");
+				rendered = fullBrowser.render(60);
+				sawFullHeaderBody = rendered.join(" ").includes("full-header-body");
+			}
+			expect(sawFullHeaderBody).toBe(true);
 			expect(rendered.join(" ")).toContain("↑/↓ scroll");
 		} finally {
 			fullBrowser.dispose();
@@ -496,7 +619,7 @@ describe("subagent ui helpers", () => {
 			runs.unshift(browserRun({ runId: "new", status: "running", task: "new task" }));
 			browser.render(60);
 			browser.handleInput("c");
-			expect(browser.render(60).join(" ")).toContain("Task: second task");
+			expect(browser.render(60).join(" ")).toContain("second task");
 			browser.handleInput("q");
 			expect(closed).toBe(0);
 			expect(calls).toContain("x:tui.select.down");
@@ -522,7 +645,11 @@ describe("subagent ui helpers", () => {
 		try {
 			browser.render(60);
 			browser.handleInput(String.fromCharCode(13));
-			const rendered = browser.render(60).join(" ");
+			let rendered = "";
+			for (let i = 0; i < 120; i++) {
+				rendered += browser.render(60).join(" ");
+				browser.handleInput("j");
+			}
 			expect(rendered).toContain("shortened before storage");
 			expect(rendered).toContain("truncated for display");
 			for (const width of [1, 8, 24, 60]) {

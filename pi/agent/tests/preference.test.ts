@@ -12,15 +12,22 @@ import {
 	applyPreference,
 	buildModelChoices,
 	clearGlobalPreference,
+	clearGlobalPreferenceForType,
 	describePreference,
+	getSessionPreference,
 	loadGlobalPreference,
+	loadGlobalPreferences,
 	parsePreference,
 	promptForPreference,
 	resolvePreference,
 	restoredPreference,
+	restoredPreferences,
 	saveGlobalPreference,
+	saveGlobalPreferenceForType,
+	saveGlobalPreferences,
 	selectableModels,
 	setSessionPreference,
+	supportedThinkingLevels,
 	type PreferenceDialogContext,
 } from "../extensions/subagents/preference.ts";
 
@@ -30,6 +37,7 @@ const luna = {
 	name: "Luna",
 	contextWindow: 200_000,
 	cost: { input: 1, output: 8 },
+	reasoning: true,
 };
 const sol = {
 	provider: "openai-codex",
@@ -37,6 +45,7 @@ const sol = {
 	name: "Sol",
 	contextWindow: 400_000,
 	cost: { input: 2, output: 16 },
+	reasoning: true,
 };
 
 function ctx(overrides: Partial<PreferenceDialogContext> = {}): PreferenceDialogContext {
@@ -102,6 +111,19 @@ describe("preference parsing and restoration", () => {
 		).toEqual({ model: "c/d", thinking: "high" });
 		expect(restoredPreference([])).toBeUndefined();
 	});
+
+	test("restores choices independently for each subagent type", () => {
+		expect(
+			restoredPreferences([
+				{ type: "custom", customType: SUBAGENT_PREFERENCE_ENTRY_TYPE, data: { subagentType: "worker", model: "a/b", thinking: "low" } },
+				{ type: "custom", customType: SUBAGENT_PREFERENCE_ENTRY_TYPE, data: { subagentType: "scout", model: "c/d", thinking: "high" } },
+				{ type: "custom", customType: SUBAGENT_PREFERENCE_ENTRY_TYPE, data: { subagentType: "worker", model: "e/f", thinking: "medium" } },
+			]),
+		).toEqual({
+			worker: { model: "e/f", thinking: "medium" },
+			scout: { model: "c/d", thinking: "high" },
+		});
+	});
 });
 
 describe("applying the preference", () => {
@@ -139,6 +161,26 @@ describe("applying the preference", () => {
 });
 
 describe("model choices", () => {
+	test("limits thinking levels to the selected model's capabilities", () => {
+		expect(supportedThinkingLevels({ provider: "p", id: "plain", reasoning: false })).toEqual(["off"]);
+		expect(
+			supportedThinkingLevels({
+				provider: "p",
+				id: "mapped",
+				reasoning: true,
+				thinkingLevelMap: {
+					off: "off",
+					minimal: "minimal",
+					low: null,
+					medium: "medium",
+					high: null,
+					xhigh: "xhigh",
+					max: null,
+				},
+			}),
+		).toEqual(["off", "minimal", "medium", "xhigh"]);
+	});
+
 	test("deduplicates, sorts, and describes available models", () => {
 		const choices = buildModelChoices([sol, luna, luna]);
 		expect(choices.map((choice) => choice.value)).toEqual(["openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-sol"]);
@@ -276,6 +318,34 @@ describe("prompting for the preference", () => {
 		expect(result.cancelled).toBe(true);
 	});
 
+	test("offers only the selected model's supported thinking levels", async () => {
+		const mapped = {
+			provider: "other",
+			id: "mapped",
+			name: "Mapped",
+			reasoning: true,
+			thinkingLevelMap: { off: "off", minimal: "minimal", low: null, medium: "medium", high: null, xhigh: "xhigh", max: null },
+		};
+		let thinkingOptions: string[] = [];
+		const result = await promptForPreference(
+			ctx({
+				modelRegistry: { getAvailable: () => [mapped], hasConfiguredAuth: () => true },
+				ui: {
+					select: async (title: string, options: string[]) => {
+						if (title.startsWith("Which thinking")) thinkingOptions = options;
+						return options[0]!;
+					},
+					input: async () => undefined,
+					confirm: async () => false,
+				},
+			}),
+		);
+		expect(result.cancelled).toBe(false);
+		expect(thinkingOptions.some((option) => option.startsWith("low —"))).toBe(false);
+		expect(thinkingOptions.some((option) => option.startsWith("high —"))).toBe(false);
+		expect(thinkingOptions.some((option) => option.startsWith("xhigh —"))).toBe(true);
+	});
+
 	test("offers only scoped models when scoping is configured", async () => {
 		let offered: string[] = [];
 		await promptForPreference(
@@ -297,6 +367,16 @@ describe("prompting for the preference", () => {
 });
 
 describe("resolving the preference for a launch", () => {
+	test("keeps session choices isolated by subagent type", () => {
+		setSessionPreference("worker", { model: "worker/model", thinking: "low" });
+		setSessionPreference("scout", { model: "scout/model", thinking: "high" });
+
+		expect(getSessionPreference("worker")).toEqual({ model: "worker/model", thinking: "low" });
+		expect(getSessionPreference("scout")).toEqual({ model: "scout/model", thinking: "high" });
+		expect(getSessionPreference("reviewer")).toBeUndefined();
+		expect(getSessionPreference()).toBeUndefined();
+	});
+
 	test("uses the session choice without prompting", async () => {
 		setSessionPreference({ model: "openai-codex/gpt-5.6-luna", thinking: "low" });
 		let prompted = false;
@@ -309,6 +389,25 @@ describe("resolving the preference for a launch", () => {
 		expect(resolution.source).toBe("session");
 		expect(resolution.preference).toEqual({ model: "openai-codex/gpt-5.6-luna", thinking: "low" });
 		expect(prompted).toBe(false);
+	});
+
+	test("does not reuse another type's global choice", async () => {
+		let prompted = 0;
+		const loadGlobal = async () => ({ worker: { model: "worker/model", thinking: "low" as const } });
+		const worker = await resolvePreference(ctx(), "worker", { loadGlobal });
+		const scout = await resolvePreference(ctx(), "scout", {
+			loadGlobal,
+			prompt: async () => {
+				prompted += 1;
+				return { preference: { model: "scout/model", thinking: "high" }, persistGlobally: false, cancelled: false };
+			},
+		});
+
+		expect(worker.source).toBe("global");
+		expect(scout.source).toBe("prompted");
+		expect(prompted).toBe(1);
+		expect(getSessionPreference("worker")).toEqual({ model: "worker/model", thinking: "low" });
+		expect(getSessionPreference("scout")).toEqual({ model: "scout/model", thinking: "high" });
 	});
 
 	test("adopts the saved global choice into the session", async () => {
@@ -337,6 +436,30 @@ describe("resolving the preference for a launch", () => {
 		expect(saved).toEqual([{ model: "chosen/model", thinking: "medium" }]);
 	});
 
+	test("cancels before applying a choice when the session changes during prompting", async () => {
+		let stale = false;
+		let saved = 0;
+		const resolution = await resolvePreference(ctx(), {
+			shouldCancel: () => stale,
+			loadGlobal: async () => undefined,
+			saveGlobal: async () => {
+				saved++;
+			},
+			prompt: async () => {
+				stale = true;
+				return {
+					preference: { model: "stale/model", thinking: "medium" },
+					persistGlobally: true,
+					cancelled: false,
+				};
+			},
+		});
+
+		expect(resolution.source).toBe("cancelled");
+		expect(saved).toBe(0);
+		expect(getSessionPreference()).toBeUndefined();
+	});
+
 	test("reports unavailable without a UI and cancelled when the user aborts", async () => {
 		expect((await resolvePreference(ctx({ hasUI: false }))).source).toBe("unavailable");
 		const cancelled = await resolvePreference(ctx(), {
@@ -349,6 +472,82 @@ describe("resolving the preference for a launch", () => {
 });
 
 describe("global preference storage", () => {
+	test("round-trips choices by subagent type", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-pref-"));
+		const path = join(dir, "subagent-model.json");
+		const preferences = {
+			worker: { model: "openai-codex/gpt-5.6-luna", thinking: "high" as const },
+			scout: { model: "openai-codex/gpt-5.6-sol", thinking: "low" as const },
+		};
+		try {
+			await saveGlobalPreferences(preferences, path);
+			expect(await loadGlobalPreferences(path)).toEqual(preferences);
+			const raw = JSON.parse(await readFile(path, "utf8"));
+			expect(raw.version).toBe(2);
+			expect(raw.preferences.worker).toEqual(preferences.worker);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves concurrent saves for different subagent types", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-pref-concurrent-"));
+		const path = join(dir, "subagent-model.json");
+		try {
+			const results = await Promise.all([
+				saveGlobalPreferenceForType("worker", { model: "worker/model", thinking: "low" }, path),
+				saveGlobalPreferenceForType("scout", { model: "scout/model", thinking: "high" }, path),
+			]);
+			expect(results).toEqual([true, true]);
+			expect(await loadGlobalPreferences(path)).toEqual({
+				worker: { model: "worker/model", thinking: "low" },
+				scout: { model: "scout/model", thinking: "high" },
+			});
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("serializes a typed reset with a concurrent save", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-pref-reset-concurrent-"));
+		const path = join(dir, "subagent-model.json");
+		try {
+			await saveGlobalPreferences(
+				{
+					worker: { model: "worker/old", thinking: "low" },
+					scout: { model: "scout/old", thinking: "high" },
+				},
+				path,
+			);
+			await Promise.all([
+				saveGlobalPreferenceForType("worker", { model: "worker/new", thinking: "medium" }, path),
+				clearGlobalPreferenceForType("scout", path),
+			]);
+			expect(await loadGlobalPreferences(path)).toEqual({
+				worker: { model: "worker/new", thinking: "medium" },
+			});
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("merges and clears one typed global choice without affecting others", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-pref-"));
+		const path = join(dir, "subagent-model.json");
+		try {
+			await saveGlobalPreferenceForType("worker", { model: "worker/model", thinking: "low" }, path);
+			await saveGlobalPreferenceForType("scout", { model: "scout/model", thinking: "high" }, path);
+			expect(await loadGlobalPreferences(path)).toEqual({
+			worker: { model: "worker/model", thinking: "low" },
+			scout: { model: "scout/model", thinking: "high" },
+		});
+			await clearGlobalPreferenceForType("worker", path);
+			expect(await loadGlobalPreferences(path)).toEqual({ scout: { model: "scout/model", thinking: "high" } });
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("round-trips through the preference file", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-pref-"));
 		const path = join(dir, "subagent-model.json");

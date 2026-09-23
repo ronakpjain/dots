@@ -10,8 +10,8 @@
  * cached in `opts.sessionCache` under a generated sessionId; a later call with
  * that `sessionId` continues the SAME context window in place.
  *
- * Watchdogs: per-run timeout and maxTurns both abort the Agent via its
- * abort controller. Parent abort signals are forwarded too.
+ * Watchdogs: per-run timeouts and parent aborts cancel the Agent; maxTurns
+ * reserves one finalization turn before stopping an unfinished tool loop.
  */
 
 import type { Model, Provider, ThinkingLevel } from "@earendil-works/pi-ai";
@@ -76,9 +76,20 @@ export interface SubagentRunResult {
 export type RunnerEvent =
 	| { type: "message"; message: AgentMessage }
 	| { type: "tool"; name: string; args: Record<string, unknown> }
-	| { type: "toolResult"; name: string; args: Record<string, unknown>; resultPreview: string; isError: boolean }
+	| {
+			type: "toolResult";
+			name: string;
+			args: Record<string, unknown>;
+			resultPreview: string;
+			/** Full text content for the transparent live activity view. */
+			resultText?: string;
+			isError: boolean;
+		}
 	| { type: "thinking"; text: string }
 	| { type: "status"; text: string };
+
+export const DEFAULT_SUBAGENT_TIMEOUT_SEC = 10 * 60;
+const ABORT_SETTLE_GRACE_MS = 1_000;
 
 export interface RunOptions {
 	defaultCwd: string;
@@ -178,16 +189,19 @@ export function assistantText(message: AgentMessage): string {
 		.join("");
 }
 
-/** One-line preview of a tool result (for live dashboards). */
-function toolResultPreview(result: unknown): string {
+/** Full text content of a tool result for the transparent live activity view. */
+function toolResultText(result: unknown): string {
 	const content = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content;
 	if (!Array.isArray(content)) return "";
-	const text = content
+	return content
 		.filter((c): c is { type: string; text: string } => c?.type === "text" && typeof c.text === "string")
 		.map((c) => c.text)
-		.join("\n")
-		.replace(/\s+/g, " ")
-		.trim();
+		.join("\n");
+}
+
+/** One-line preview of a tool result (for live dashboards). */
+function toolResultPreview(result: unknown): string {
+	const text = toolResultText(result).replace(/\s+/g, " ").trim();
 	return text.length > 280 ? `${text.slice(0, 279)}…` : text;
 }
 
@@ -404,12 +418,25 @@ export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Pro
 		});
 	};
 
+	const timeoutSec =
+		typeof spec.timeoutSec === "number" && Number.isFinite(spec.timeoutSec) && spec.timeoutSec > 0
+			? spec.timeoutSec
+			: DEFAULT_SUBAGENT_TIMEOUT_SEC;
+	let abortSettleTimer: ReturnType<typeof setTimeout> | null = null;
+	let forcedAbortSettlement = false;
+	let executionStarted = false;
+	let settleAfterAbort: (() => void) | undefined;
+	const abortSettlement = new Promise<void>((resolve) => {
+		settleAfterAbort = resolve;
+	});
+
 	const abortAgent = (reason: "timeout" | "parent") => {
+		if (result.timeoutKilled || result.aborted) return;
 		if (reason === "timeout") {
 			result.timeoutKilled = true;
 			result.stopReason = "timeout";
-			result.errorMessage = `Timed out after ${spec.timeoutSec}s`;
-			opts.onEvent?.({ type: "status", text: `⏰ ${spec.name}: timeout after ${spec.timeoutSec}s, aborting` });
+			result.errorMessage = `Timed out after ${timeoutSec}s`;
+			opts.onEvent?.({ type: "status", text: `⏰ ${spec.name}: timeout after ${timeoutSec}s, aborting` });
 		} else {
 			result.aborted = true;
 			result.stopReason = "aborted";
@@ -420,13 +447,41 @@ export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Pro
 		} catch {
 			/* already settled */
 		}
+		if (!executionStarted) {
+			settleAfterAbort?.();
+			return;
+		}
+		abortSettleTimer = setTimeout(() => {
+			forcedAbortSettlement = true;
+			result.errorMessage = `${result.errorMessage}; agent did not settle within ${ABORT_SETTLE_GRACE_MS}ms after abort; returning partial results and discarding its context`;
+			if (sessionId && opts.sessionCache?.get(sessionId) === agent) {
+				opts.sessionCache.delete(sessionId);
+				result.sessionId = undefined;
+			}
+			opts.onEvent?.({ type: "status", text: `⚠️ ${spec.name}: agent ignored abort; returning partial results` });
+			settleAfterAbort?.();
+		}, ABORT_SETTLE_GRACE_MS);
 	};
 
-	// A hard abort after the last tool call discards the most useful part of a
-	// run. At the budget boundary, give the agent one explicit finalization turn;
+	// At the budget boundary, give the agent one explicit finalization turn;
 	// only mark the run failed if it still requests tools instead of answering.
-	const stopAtTurnBudget = ({ message }: { message: AgentMessage }): boolean => {
-		if (!maxTurns || turns < maxTurns) return false;
+	// Agent-core calls finishTurn after tool results have been recorded, so block
+	// any tools requested by that finalization response before they can execute.
+	agent.beforeToolCall = async () => {
+		if (!maxTurns || !finalizationRequested || turns < maxTurns) return;
+		return {
+			block: true,
+			reason: "Turn budget reached; no more tools may be called during finalization.",
+			terminate: true,
+		};
+	};
+
+	// Set this per invocation so a cached keepSession agent gets the new budget
+	// and finalization state instead of retaining the first call's closure.
+	agent.finishTurn = async ({ message }) => {
+		if (message.stopReason === "error" || message.stopReason === "aborted") return;
+		if (result.timeoutKilled || result.aborted || !maxTurns || turns < maxTurns) return;
+
 		if (hasToolCalls(message) && !finalizationRequested) {
 			finalizationRequested = true;
 			opts.onEvent?.({
@@ -443,15 +498,12 @@ export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Pro
 				],
 				timestamp: Date.now(),
 			});
-			return false;
+			return { action: "continue" };
 		}
-		if (finalizationRequested && hasToolCalls(message)) markMaxTurns();
-		return true;
-	};
 
-	// Set this per invocation so a cached keepSession agent gets the new budget
-	// and finalization state instead of retaining the first call's closure.
-	agent.shouldStopAfterTurn = stopAtTurnBudget;
+		if (finalizationRequested && hasToolCalls(message)) markMaxTurns();
+		return { action: "end" };
+	};
 
 	// Throttled live "thinking" previews (message_update fires per streamed chunk).
 	const THINKING_THROTTLE_MS = 200;
@@ -463,9 +515,7 @@ export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Pro
 		opts.onEvent?.({ type: "thinking", text });
 	};
 
-	if (spec.timeoutSec) {
-		timeoutTimer = setTimeout(() => abortAgent("timeout"), spec.timeoutSec * 1000);
-	}
+	timeoutTimer = setTimeout(() => abortAgent("timeout"), timeoutSec * 1000);
 
 	const onParentAbort = () => abortAgent("parent");
 	if (opts.signal) {
@@ -500,6 +550,7 @@ export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Pro
 				name: event.toolName,
 				args: toolCallArgs.get(event.toolCallId) ?? {},
 				resultPreview: toolResultPreview(event.result),
+				resultText: toolResultText(event.result),
 				isError: event.isError,
 			});
 		}
@@ -510,15 +561,35 @@ export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Pro
 	});
 
 	try {
-		await agent.prompt(`Task: ${spec.task}`);
-		await agent.waitForIdle();
+		const execution = (async () => {
+			if (result.timeoutKilled || result.aborted) return;
+			executionStarted = true;
+			await agent!.prompt(`Task: ${spec.task}`);
+			await agent!.waitForIdle();
+		})();
+		await Promise.race([execution, abortSettlement]);
+		if (forcedAbortSettlement) result.exitCode = 1;
 	} catch (error) {
 		result.exitCode = 1;
 		if (!result.errorMessage) result.errorMessage = error instanceof Error ? error.message : String(error);
 	} finally {
 		if (timeoutTimer) clearTimeout(timeoutTimer);
+		if (abortSettleTimer) clearTimeout(abortSettleTimer);
 		if (opts.signal) opts.signal.removeEventListener("abort", onParentAbort);
 		unsubscribe();
+	}
+
+	// An abort may reject prompt() before the cached Agent finishes unwinding.
+	// Never hand a still-streaming context back out as a resumable session.
+	if (
+		(result.timeoutKilled || result.maxTurnsKilled || result.aborted) &&
+		agent.state.isStreaming &&
+		sessionId &&
+		opts.sessionCache?.get(sessionId) === agent
+	) {
+		opts.sessionCache.delete(sessionId);
+		sessionId = undefined;
+		result.errorMessage = `${result.errorMessage ?? "Subagent stopped"}; cached context discarded because it remained active`;
 	}
 
 	// ---- Collect results ----
@@ -538,13 +609,13 @@ export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Pro
 		if (failureMessage.errorMessage) result.errorMessage = failureMessage.errorMessage;
 	}
 
-	if (result.timeoutKilled) result.stopReason = "timeout";
-	if (result.maxTurnsKilled) result.stopReason = "maxTurns";
 	if (result.aborted) result.stopReason = "aborted";
+	else if (result.timeoutKilled) result.stopReason = "timeout";
+	else if (result.maxTurnsKilled) result.stopReason = "maxTurns";
 
 	if (result.timeoutKilled || result.maxTurnsKilled || result.aborted) result.exitCode = 1;
 	else if (result.stopReason === "error" || result.stopReason === "aborted") result.exitCode = 1;
 	result.usage.turns = turns;
-	result.sessionId = sessionId;
+	result.sessionId = forcedAbortSettlement ? undefined : sessionId;
 	return result;
 }

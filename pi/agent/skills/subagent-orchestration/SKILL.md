@@ -73,7 +73,7 @@ Put stable role, tool, mutation, and reporting rules in `systemPrompt`; put dyna
 
 ## When to delegate
 
-Use `subagent` whenever one or more focused delegated tasks would materially improve the work. Choose delegation based on task complexity, independence, context isolation, and expected efficiency—not on a minimum number of subagent runs. Do not add redundant subagents merely to justify delegation. Subagents are available at all times; there is no mode that blocks them, and the user chooses the model once per session.
+Use `subagent` whenever one or more focused delegated tasks would materially improve the work. Choose delegation based on task complexity, independence, context isolation, and expected efficiency—not on a minimum number of subagent runs. Do not add redundant subagents merely to justify delegation. Subagents are available at all times; there is no mode that blocks them, and the user chooses the model separately for each subagent type.
 
 ## Default workflow
 
@@ -82,19 +82,19 @@ Use `subagent` whenever one or more focused delegated tasks would materially imp
 3. **Identify only the remaining unknowns.** If discovery is needed, give the scout the known map and ask targeted questions; do not commission a second broad reconnaissance pass.
 4. **Decompose** the request into narrow tasks with an explicit expected output, context package, scope, and validation.
 5. **Fan out independent work** with `tasks` and `parallelLimit: 2-4`. Keep parallel tasks read-only or ensure their mutation targets do not overlap.
-6. **Keep the main thread productive** while delegated work runs: launch qualifying groups with `background: true`, continue independent discovery, implementation, or validation instead of idling, and use `subagent_status`/`subagent_wait` only at genuine dependency or synthesis points.
+6. **Never block on delegated work**: every subagent launch is non-blocking. Continue independent discovery, implementation, or validation; if no useful work remains, return control to the user. Use `subagent_status` for live snapshots/run ids, `subagent_history` to inspect prior transcripts, and `subagent_cancel` to stop one run or an entire group—there is intentionally no wait tool.
 7. **Chain dependent work** with `chain` and `{previous}`. A reliable implementation flow is scout/planner → focused worker → reviewer, with each phase receiving the relevant accumulated context.
 8. **Synthesize and verify** the results in the orchestrator. A worker's partial or failed result is evidence, not completion; reconcile it with the handoff and run the final checks yourself.
 
 ## Controls
 
 - `agent`: use a named role when its tools and instructions fit the task.
-- `model`: the user owns this. Pi asks for a subagent model on the first launch of a session and applies it to every run, so leave `model` unset unless the user chose `auto` and the task genuinely needs a specific model.
+- `model`: the user owns this per subagent type. Pi asks on the first launch of each type and reuses that choice only for matching tasks, so leave `model` unset unless the user chose `auto` and the task genuinely needs a specific model.
 - `tools`: restrict the worker to the smallest useful allowlist; use read-only tools for scouts/planners/reviewers.
 - `cwd`: set the repository or project directory explicitly when it differs from the parent, and state it in the handoff.
-- `thinking`: also user-owned by default (same ask-once prompt); set it only when the choice is `auto` and the task calls for a different level.
+- `thinking`: also user-owned per subagent type (same type-specific prompt); the selector only offers levels supported by the selected model, and `auto` defers to the agent file/task when capabilities are unknown. Set it only when that type's choice is `auto` and the task calls for a different level.
 - `maxTurns`: choose a real budget for the work. Rough defaults: scout 18, planner 18, reviewer 22, worker 40. Do not use a tiny budget merely to prevent loops.
-- `timeoutSec`: set a wall-clock limit appropriate to the task.
+- `timeoutSec`: set a wall-clock limit appropriate to the task; runs default to a 600-second hard deadline, so increase this for longer work.
 - `parallelLimit`: control concurrency for independent tasks; leave it at 1 for dependent or resource-sensitive work.
 - `onFailure: "stop"` (default): stop a dependent chain when a step fails. Use `onFailure: "continue"` only when later steps can recover from partial evidence.
 - `keepSession: true`: request a continuation handle for work likely to need follow-up.
