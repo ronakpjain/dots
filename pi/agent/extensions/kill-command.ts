@@ -1,9 +1,26 @@
-import { createBashToolDefinition, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { matchesKey } from "@earendil-works/pi-tui";
+import {
+	createBashToolDefinition,
+	highlightCode,
+	type ExtensionAPI,
+	type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { matchesKey, Box, Container, Text } from "@earendil-works/pi-tui";
+import { sanitizeToolOutput } from "./tool-results/format.ts";
+import { renderToolResult } from "./tool-results/render.ts";
 
 export const KILL_COMMAND_SHORTCUT = "ctrl+alt+k" as const;
 export const KILL_COMMAND_NAME = "kill-command" as const;
 const KILL_COMMAND_STATUS = "kill-command";
+
+function formatDuration(ms: number): string {
+	const seconds = ms / 1000;
+	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+	const totalSeconds = Math.floor(seconds);
+	const minutes = Math.floor(totalSeconds / 60);
+	const remainder = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${remainder}s`;
+	return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${remainder}s`;
+}
 
 export type RunningCommand = {
 	id: string;
@@ -127,6 +144,52 @@ export default function killCommandExtension(pi: ExtensionAPI): void {
 		const bashTool = createBashToolDefinition(ctx.cwd);
 		pi.registerTool({
 			...bashTool,
+			renderShell: "self",
+			renderCall(args, theme, context) {
+				if (context.executionStarted && context.state.startedAt === undefined) {
+					context.state.startedAt = Date.now();
+					context.state.endedAt = undefined;
+				}
+				const rawCommand = sanitizeToolOutput(typeof args.command === "string" ? args.command : "");
+				const command = rawCommand.slice(0, 4_000);
+				const highlighted = highlightCode(command || "...", "bash").join("\n");
+				const truncated = rawCommand.length > command.length ? "…" : "";
+				const timeout = typeof args.timeout === "number" && args.timeout > 0
+					? theme.fg("muted", ` (timeout ${args.timeout}s)`)
+					: "";
+				const background = context.isPartial ? "toolPendingBg" : context.isError ? "toolErrorBg" : "toolSuccessBg";
+				const box = new Box(0, 0, (text) => theme.bg(background, text));
+				box.addChild(new Text(theme.fg("toolTitle", theme.bold("$ ")) + highlighted + truncated + timeout, 0, 0));
+				return box;
+			},
+			renderResult(result, options, theme, context) {
+				const state = context.state;
+				if (state.startedAt !== undefined && options.isPartial && !state.interval) {
+					state.interval = setInterval(() => context.invalidate(), 1_000);
+				}
+				if (!options.isPartial || context.isError) {
+					state.endedAt ??= Date.now();
+					if (state.interval) {
+						clearInterval(state.interval);
+						state.interval = undefined;
+					}
+				}
+				const container = new Container();
+				container.addChild(
+					renderToolResult("bash", result, options, theme, context, {
+						collapsedSummary: () => (context.isError ? "Command failed" : "Command completed"),
+					}),
+				);
+				if (state.startedAt !== undefined) {
+					const endTime = state.endedAt ?? Date.now();
+					const label = options.isPartial ? "Elapsed" : "Took";
+					container.addChild(new Text(theme.fg("muted", `${label} ${formatDuration(endTime - state.startedAt)}`), 0, 0));
+				}
+				const background = context.isPartial ? "toolPendingBg" : context.isError ? "toolErrorBg" : "toolSuccessBg";
+				const box = new Box(0, 0, (text) => theme.bg(background, text));
+				box.addChild(container);
+				return box;
+			},
 			async execute(toolCallId, params, signal, onUpdate, toolCtx) {
 				const running = commandRegistry.start(toolCallId, params.command);
 				const linked = linkAbortSignals(signal, running.controller.signal);

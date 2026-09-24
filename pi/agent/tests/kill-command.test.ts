@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import killCommandExtension, {
 	KILL_COMMAND_NAME,
 	KILL_COMMAND_SHORTCUT,
@@ -12,13 +13,15 @@ type TestRuntime = {
 	handlers: Map<string, Handler>;
 	commands: Map<string, { handler: Handler }>;
 	shortcuts: Map<string, { handler: Handler }>;
-	tools: Map<string, { execute: Handler }>;
+	tools: Map<string, { execute: Handler; renderCall?: Handler; renderResult?: Handler }>;
 	notifications: string[];
 	statuses: Map<string, string | undefined>;
 	terminalInput?: (data: string) => { consume?: boolean } | undefined;
 	pi: Record<string, unknown>;
 	ctx: Record<string, unknown>;
 };
+
+beforeAll(() => initTheme("dark"));
 
 function testRuntime(): TestRuntime {
 	const runtime = {
@@ -39,7 +42,7 @@ function testRuntime(): TestRuntime {
 		registerCommand: (name: string, definition: { handler: Handler }) => runtime.commands.set(name, definition),
 		registerShortcut: (shortcut: string, definition: { handler: Handler }) =>
 			runtime.shortcuts.set(shortcut, definition),
-		registerTool: (tool: { name: string; execute: Handler }) => runtime.tools.set(tool.name, tool),
+		registerTool: (tool: { name: string; execute: Handler; renderCall?: Handler; renderResult?: Handler }) => runtime.tools.set(tool.name, tool),
 	};
 	runtime.ctx = {
 		mode: "tui",
@@ -102,6 +105,42 @@ describe("command-local cancellation", () => {
 		expect(runtime.shortcuts.has(KILL_COMMAND_SHORTCUT)).toBe(true);
 
 		const tool = runtime.tools.get("bash")!;
+		expect(typeof tool.renderCall).toBe("function");
+		expect(typeof tool.renderResult).toBe("function");
+		const theme = {
+			fg: (_color: string, text: string) => text,
+			bg: (_color: string, text: string) => text,
+			bold: (text: string) => text,
+		};
+		const state = { startedAt: undefined, endedAt: undefined, interval: undefined };
+		const renderContext = {
+			state,
+			lastComponent: undefined,
+			executionStarted: true,
+			args: { command: "if true; then\n  echo ready\nfi" },
+		};
+		const callLines = tool.renderCall!(renderContext.args, theme, renderContext).render(80);
+		const call = callLines.join(" ");
+		const plainCall = call.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+		expect(callLines[0]?.trimStart().startsWith("$ ")).toBe(true);
+		expect(plainCall).toContain("echo ready");
+		expect(call).not.toBe(plainCall);
+		const styledTheme = { ...theme, bg: (color: string, text: string) => `[${color}]${text}` };
+		const completedCall = tool.renderCall!(renderContext.args, styledTheme, { ...renderContext, isPartial: false, isError: false });
+		expect(completedCall.render(80)[0]).toContain("[toolSuccessBg]");
+		const collapsed = tool.renderResult!(
+			{ content: [{ type: "text", text: "secret stdout value" }], details: {} },
+			{ expanded: false, isPartial: false },
+			theme,
+			{ ...renderContext, isError: false, invalidate: () => {} },
+		)
+			.render(80)
+			.join(" ");
+		expect(collapsed).toContain("Command completed");
+		expect(collapsed).toContain("Took ");
+		expect(collapsed).not.toContain("\\nTook");
+		expect(collapsed).toContain("secret stdout value");
+		expect(collapsed).not.toContain("if true; then");
 		const parent = new AbortController();
 		const execution = tool.execute("tool-call-1", { command: "sleep 10" }, parent.signal, undefined, runtime.ctx);
 

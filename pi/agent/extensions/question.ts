@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { renderToolResult } from "./tool-results/render.ts";
 
 interface QuestionOption {
 	label: string;
@@ -147,18 +148,15 @@ export default function questionExtension(pi: ExtensionAPI): void {
 				0,
 			);
 		},
-		renderResult(result, _options, theme) {
-			const details = result.details as QuestionDetails | undefined;
-			if (!details) return new Text(theme.fg("warning", "Question flow finished"), 0, 0);
-			if (details.cancelled) return new Text(theme.fg("warning", "Cancelled"), 0, 0);
-			return new Text(
-				theme.fg(
-					"success",
-					`✓ ${details.answers.length} answer${details.answers.length === 1 ? "" : "s"} received`,
-				),
-				0,
-				0,
-			);
+		renderResult(result, options, theme, context) {
+			return renderToolResult("question", result, options, theme, context, {
+				collapsedSummary: (toolResult) => {
+					const details = toolResult.details as QuestionDetails | undefined;
+					if (!details) return "Question flow finished";
+					if (details.cancelled) return `Cancelled · ${details.answers.length} answers retained`;
+					return `${details.answers.length} answer${details.answers.length === 1 ? "" : "s"} received`;
+				},
+			});
 		},
 	});
 }

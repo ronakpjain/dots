@@ -8,7 +8,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { getMarkdownTheme, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, highlightCode, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	Key,
@@ -24,6 +24,8 @@ import {
 	type MarkdownTheme,
 } from "@earendil-works/pi-tui";
 import { getFinalOutput, type SubagentRunResult, type SubagentUsage } from "./runner.ts";
+import { formatToolOutput, sanitizeToolOutput, toolResultContentText, type FormattedToolOutput } from "../tool-results/format.ts";
+import { collapsedToolResultSummary } from "../tool-results/render.ts";
 
 // ---------------------------------------------------------------------------
 // Live run state (written by index.ts, read by the views below)
@@ -41,6 +43,8 @@ export interface RunActivity {
 	/** Full text tool output for expanded live views. */
 	resultText?: string;
 	resultPreview?: string;
+	/** Structured details supplied by built-in tools (diffs, truncation, result limits, etc.). */
+	resultDetails?: unknown;
 	isError?: boolean;
 }
 
@@ -180,15 +184,25 @@ export function runDisplayName(r: { kind: "single" | "parallel" | "chain"; step?
 export function activityLine(a: RunActivity, theme: Theme, expanded = false): string {
 	switch (a.kind) {
 		case "tool": {
-			const args = expanded ? (a.args ?? a.argsPreview ?? "") : (a.argsPreview ?? a.args ?? "");
-			return `  ${theme.fg("toolTitle", `🔧 ${a.toolName}`)} ${theme.fg("dim", args)}`;
+			const args = expanded ? sanitizeToolOutput(a.args ?? a.argsPreview ?? "") : "";
+			return `  ${theme.fg("toolTitle", `🔧 ${a.toolName}`)}${args ? ` ${theme.fg("dim", args)}` : ""}`;
 		}
 		case "toolResult": {
-			const result = expanded ? (a.resultText ?? a.resultPreview ?? "") : (a.resultPreview ?? a.resultText ?? "");
-			if (a.isError) {
-				return `  ${theme.fg("error", `✗ ${a.toolName}`)}${result ? ` ${theme.fg("error", expanded ? result : preview(result, 90))}` : ""}`;
-			}
-			return `  ${theme.fg("success", `✓ ${a.toolName}`)}${result ? ` ${theme.fg("dim", expanded ? result : preview(result, 90))}` : ""}`;
+			const rawResult = a.resultText ?? a.resultPreview ?? "";
+			const result = expanded
+				? formatToolOutput(rawResult, 1_500, {
+						toolName: a.toolName,
+						args: a.args,
+						details: a.resultDetails,
+					}).text.replace(/\s+/g, " ").trim()
+				: collapsedToolResultSummary(a.toolName ?? "tool", {
+						content: [{ type: "text", text: rawResult }],
+						details: a.resultDetails,
+					}, { args: a.args });
+			const output = result ? ` ${theme.fg(a.isError ? "error" : "dim", preview(result, expanded ? 180 : 90))}` : "";
+			return a.isError
+				? `  ${theme.fg("error", `✗ ${a.toolName}`)}${output}`
+				: `  ${theme.fg("success", `✓ ${a.toolName}`)}${output}`;
 		}
 		case "message":
 			return `  ${theme.fg("accent", "💬")} ${theme.fg("dim", preview(a.text ?? "", 110))}`;
@@ -203,9 +217,15 @@ export function activityLine(a: RunActivity, theme: Theme, expanded = false): st
 export function activityPlainText(a: RunActivity): string {
 	switch (a.kind) {
 		case "tool":
-			return `→ ${a.toolName} ${a.argsPreview ?? ""}`.trimEnd();
-		case "toolResult":
-			return `${a.isError ? "✗" : "✓"} ${a.toolName}${a.resultPreview ? ` ${preview(a.resultPreview, 90)}` : ""}`;
+			return `→ ${a.toolName}`;
+		case "toolResult": {
+			const result = collapsedToolResultSummary(
+				a.toolName ?? "tool",
+				{ content: [{ type: "text", text: a.resultPreview ?? a.resultText ?? "" }], details: a.resultDetails },
+				{ args: a.args },
+			);
+			return `${a.isError ? "✗" : "✓"} ${a.toolName}${result ? ` ${result}` : ""}`;
+		}
 		case "message":
 			return `💬 ${preview(a.text ?? "", 100)}`;
 		case "thinking":
@@ -223,13 +243,10 @@ type TranscriptSegment =
 	| { type: "text"; turn: number; text: string }
 	| { type: "thinking"; turn: number; text: string }
 	| { type: "toolCall"; turn: number; name: string; args: string }
-	| { type: "toolResult"; turn: number; name: string; args: string; text: string; isError: boolean };
+	| { type: "toolResult"; turn: number; name: string; args: string; text: string; details?: unknown; isError: boolean };
 
-function textOf(content: Array<{ type?: string; text?: string }>): string {
-	return (content ?? [])
-		.filter((c): c is { type: "text"; text: string } => c?.type === "text" && typeof c.text === "string")
-		.map((c) => c.text)
-		.join("\n");
+function textOf(content: Array<{ type?: string; text?: string; mimeType?: string }>): string {
+	return toolResultContentText(content);
 }
 
 export function messageSegments(messages: AgentMessage[]): TranscriptSegment[] {
@@ -259,6 +276,7 @@ export function messageSegments(messages: AgentMessage[]): TranscriptSegment[] {
 				name: call?.name ?? m.toolName,
 				args: call?.args ?? "",
 				text: textOf(m.content as Array<{ type?: string; text?: string }>),
+				details: m.details,
 				isError: m.isError,
 			});
 		}
@@ -282,7 +300,7 @@ function appendSegment(
 	switch (seg.type) {
 		case "text":
 			container.addChild(new Spacer(1));
-			container.addChild(new Markdown(expanded ? seg.text : truncateBytes(seg.text, 6000), 0, 0, mdTheme));
+			container.addChild(new Text(expanded ? seg.text : truncateBytes(seg.text, 6000), 0, 0));
 			break;
 		case "thinking":
 			container.addChild(new Spacer(1));
@@ -294,19 +312,40 @@ function appendSegment(
 			container.addChild(new Spacer(1));
 			container.addChild(
 				new Text(
-					theme.fg("toolTitle", `🔧 ${seg.name}`) + (seg.args ? ` ${theme.fg("dim", seg.args)}` : ""),
+					theme.fg("toolTitle", `🔧 ${seg.name}`) + (expanded && seg.args ? ` ${theme.fg("dim", sanitizeToolOutput(seg.args))}` : ""),
 					0,
 					0,
 				),
 			);
 			break;
-		case "toolResult":
+		case "toolResult": {
+			const output = formatToolOutput(seg.text, expanded ? TOOL_OUTPUT_EXPANDED_CAP : TOOL_OUTPUT_COLLAPSED_CAP, {
+				toolName: seg.name,
+				args: seg.args,
+				details: seg.details,
+			});
+			const title = [seg.name, expanded ? output.title : undefined].filter(Boolean).join(" · ");
 			container.addChild(
-				new Text(seg.isError ? theme.fg("error", `✗ ${seg.name}`) : theme.fg("success", `✓ ${seg.name}`), 0, 0),
+				new Text(
+					seg.isError ? theme.fg("error", `✗ ${title} · error`) : theme.fg("success", `✓ ${title} · result`),
+					0,
+					0,
+				),
 			);
-			if (seg.text)
-				container.addChild(new Text(theme.fg("toolOutput", expanded ? seg.text : truncateBytes(seg.text, 4000)), 1, 0));
+			if (!expanded) {
+				const summary = collapsedToolResultSummary(seg.name, { content: [{ type: "text", text: seg.text }], details: seg.details }, { args: seg.args });
+				container.addChild(new Text(theme.fg(seg.isError ? "error" : "dim", `  ${summary}`), 0, 0));
+				break;
+			}
+			if (output.summary) container.addChild(new Text(theme.fg(seg.isError ? "error" : "success", `  ${output.summary}`), 0, 0));
+			if (output.text) {
+				if (seg.name === "bash") container.addChild(new Text(toolOutputText(seg.name, output), 1, 0));
+				else container.addChild(new Markdown(toolOutputMarkdown(output), 1, 0, mdTheme));
+			}
+			for (const note of output.notes) container.addChild(new Text(theme.fg("warning", `  ⚠ ${note}`), 0, 0));
+			if (output.truncated) container.addChild(new Text(theme.fg("warning", "  ⚠ tool output truncated for display"), 0, 0));
 			break;
+		}
 	}
 }
 
@@ -321,6 +360,7 @@ export function renderLiveDashboard(live: LiveRun[], expanded: boolean, theme: T
 	const header = `Subagents · ${live.length} run${live.length === 1 ? "" : "s"} · ${running} active · $${totalCost.toFixed(4)}${expanded ? "" : "  (Ctrl+O to expand)"}`;
 	container.addChild(new Text(theme.fg("accent", header), 0, 0));
 
+	const mdTheme = expanded ? getMarkdownTheme() : undefined;
 	for (const r of live) {
 		container.addChild(new Spacer(1));
 		const icon = statusIcon(r.status);
@@ -343,6 +383,20 @@ export function renderLiveDashboard(live: LiveRun[], expanded: boolean, theme: T
 		const recent = r.activities.slice(-(expanded ? 10 : 2));
 		for (const a of recent) {
 			container.addChild(new Text(activityLine(a, theme), 0, 0));
+			if (expanded && a.kind === "toolResult" && (a.resultText || a.resultDetails)) {
+				const output = formatToolOutput(a.resultText ?? a.resultPreview ?? "", TOOL_OUTPUT_ACTIVITY_CAP, {
+					toolName: a.toolName,
+					args: a.args,
+					details: a.resultDetails,
+				});
+				if (output.summary) container.addChild(new Text(theme.fg("success", `    ${output.summary}`), 0, 0));
+				if (output.text) {
+					if (a.toolName === "bash") container.addChild(new Text(toolOutputText(a.toolName, output), 1, 0));
+					else container.addChild(new Markdown(toolOutputMarkdown(output), 1, 0, mdTheme!));
+				}
+				for (const note of output.notes) container.addChild(new Text(theme.fg("warning", `    ⚠ ${note}`), 0, 0));
+				if (output.truncated) container.addChild(new Text(theme.fg("warning", "    ⚠ tool output truncated for display"), 0, 0));
+			}
 		}
 		const u = usageLine(r.usage, r.model);
 		if (u) container.addChild(new Text(theme.fg("dim", `  ${u}`), 0, 0));
@@ -391,9 +445,10 @@ export function renderRunResults(
 		if (isFailedResult(r) && r.errorMessage) {
 			container.addChild(new Text(theme.fg("error", r.errorMessage), 0, 0));
 		}
+		const segments = messageSegments(r.messages);
 		if (expanded) {
 			let lastTurn = 0;
-			for (const seg of messageSegments(r.messages)) {
+			for (const seg of segments) {
 				if (seg.turn && seg.turn !== lastTurn) {
 					container.addChild(
 						new Text(theme.fg("borderMuted", `  ── turn ${seg.turn} ───────────────────`), 0, 0),
@@ -401,6 +456,29 @@ export function renderRunResults(
 					lastTurn = seg.turn;
 				}
 				appendSegment(container, seg, mdTheme, theme, expanded);
+			}
+		} else {
+			const toolResults = segments.filter(
+				(seg): seg is Extract<TranscriptSegment, { type: "toolResult" }> => seg.type === "toolResult",
+			);
+			const recentResults = toolResults.slice(-6);
+			if (recentResults.length) {
+				container.addChild(new Text(theme.fg("muted", "Tool output previews:"), 0, 0));
+				for (const seg of recentResults) {
+					const summary = collapsedToolResultSummary(
+						seg.name,
+						{ content: [{ type: "text", text: seg.text }], details: seg.details },
+						{ args: seg.args },
+					);
+					container.addChild(
+						new Text(theme.fg(seg.isError ? "error" : "dim", `  ${seg.isError ? "✗" : "✓"} ${seg.name} · ${summary}`), 0, 0),
+					);
+				}
+				if (toolResults.length > recentResults.length) {
+					container.addChild(
+						new Text(theme.fg("muted", `  ${toolResults.length - recentResults.length} earlier outputs omitted; Ctrl+O to expand`), 0, 0),
+					);
+				}
 			}
 		}
 		const final = getFinalOutput(r.messages);
@@ -429,12 +507,107 @@ const BROWSER_MAX_ROWS = 30;
 const BROWSER_PAGE = 20;
 const BROWSER_DETAIL_ROWS = 34;
 const BROWSER_DETAIL_CAP = 40_000;
+const TOOL_OUTPUT_COLLAPSED_CAP = 4_000;
+const TOOL_OUTPUT_EXPANDED_CAP = 40_000;
+const TOOL_OUTPUT_ACTIVITY_CAP = 4_000;
+const TOOL_OUTPUT_COLLAPSED_ROWS = 160;
+const TOOL_OUTPUT_EXPANDED_ROWS = 800;
+const TRANSCRIPT_EXPANDED_CAP = 160_000;
+const TRANSCRIPT_MAX_ROWS = 4_000;
 
 /** Background roles used for the browser panel (subset of pi's ThemeBg). */
 type PanelBg = "selectedBg" | "customMessageBg" | "toolPendingBg";
 
-/** A rendered detail row: code rows keep full width and scroll horizontally; others wrap. */
+/** A rendered detail row: preformatted code rows scroll; prose rows wrap. */
 type BodyLine = { text: string; code: boolean };
+
+function toolOutputMarkdown(output: FormattedToolOutput): string {
+	if (!output.text) return "";
+	if (output.kind === "code" || output.kind === "json") {
+		let fence = "```";
+		while (output.text.includes(fence)) fence += "`";
+		return `${fence}${output.language ?? (output.kind === "json" ? "json" : "text")}\n${output.text}\n${fence}`;
+	}
+	if (output.kind === "list") return output.text.replace(/^• /gm, "- ");
+	return output.text;
+}
+
+function toolOutputText(toolName: string, output: FormattedToolOutput): string {
+	const text = output.text.replace(/^\n+|\n+$/g, "");
+	return toolName === "bash" && output.language === "bash" ? highlightCode(text, "bash").join("\n") : text;
+}
+
+function formatToolOutputLines(
+	output: FormattedToolOutput,
+	theme: Theme,
+	width: number,
+	expanded: boolean,
+	indent = "    ",
+): { lines: BodyLine[]; truncated: boolean } {
+	const maxRows = expanded ? TOOL_OUTPUT_EXPANDED_ROWS : TOOL_OUTPUT_COLLAPSED_ROWS;
+	const rows: BodyLine[] = [];
+	let insideFence = false;
+	let truncated = false;
+	if (!output.text) return { lines: rows, truncated };
+	const sourceLines = output.language ? highlightCode(output.text, output.language) : output.text.split("\n");
+	for (const source of sourceLines) {
+		if (rows.length >= maxRows) {
+			truncated = true;
+			break;
+		}
+		const line = output.kind === "list" ? source.replace(/^• /, "  • ") : source;
+		const fenceLine = /^\s*(?:`{3,}|~{3,})/.test(line);
+		const tableLine = /^\s*\|.*\|\s*$/.test(line);
+		const preformatted =
+			output.kind === "code" ||
+			output.kind === "json" ||
+			insideFence ||
+			fenceLine ||
+			(output.kind === "markdown" && tableLine);
+		if (preformatted) {
+			rows.push({ text: theme.fg("toolOutput", `${indent}${line}`), code: true });
+		} else if (!line.trim()) {
+			rows.push({ text: indent.trimEnd(), code: false });
+		} else {
+			const styled = theme.fg("toolOutput", `${indent}${line}`);
+			for (const wrapped of wrapTextWithAnsi(styled, Math.max(1, width - 2))) {
+				if (rows.length >= maxRows) {
+					truncated = true;
+					break;
+				}
+				rows.push({ text: wrapped, code: false });
+			}
+		}
+		if (fenceLine) insideFence = !insideFence;
+		if (truncated) break;
+	}
+	return { lines: rows, truncated };
+}
+
+function appendToolOutputDetails(
+	lines: BodyLine[],
+	output: FormattedToolOutput,
+	theme: Theme,
+	width: number,
+	expanded: boolean,
+	indent = "    ",
+): void {
+	if (output.summary) {
+		for (const text of wrapTextWithAnsi(theme.fg("success", `${indent}${output.summary}`), Math.max(1, width - 2))) {
+			lines.push({ text, code: false });
+		}
+	}
+	const formatted = formatToolOutputLines(output, theme, width, expanded, indent);
+	lines.push(...formatted.lines);
+	for (const note of output.notes) {
+		for (const text of wrapTextWithAnsi(theme.fg("warning", `${indent}⚠ ${note}`), Math.max(1, width - 2))) {
+			lines.push({ text, code: false });
+		}
+	}
+	if (output.truncated || formatted.truncated) {
+		lines.push({ text: theme.fg("warning", `${indent}⚠ tool output truncated for display`), code: false });
+	}
+}
 
 function appendSectionHeading(lines: BodyLine[], theme: Theme, width: number, label: string): void {
 	const prefix = `  ── ${label} `;
@@ -479,6 +652,50 @@ function appendKeyValueSection(
 	}
 }
 
+function assistantMarkdownLines(text: string, width: number, markdownTheme: MarkdownTheme): BodyLine[] {
+	const rendered: BodyLine[] = [];
+	let prose: string[] = [];
+	let codeBlock: string[] = [];
+	let fenceChar: string | undefined;
+	let fenceLength = 0;
+	const flushProse = () => {
+		if (!prose.length) return;
+		for (const line of new Markdown(prose.join("\n"), 0, 0, markdownTheme).render(width)) {
+			rendered.push({ text: line, code: false });
+		}
+		prose = [];
+	};
+	const flushCode = () => {
+		if (!codeBlock.length) return;
+		for (const line of new Markdown(codeBlock.join("\n"), 0, 0, markdownTheme).render(width)) {
+			rendered.push({ text: line, code: true });
+		}
+		codeBlock = [];
+		fenceChar = undefined;
+		fenceLength = 0;
+	};
+	for (const line of text.split("\n")) {
+		if (!fenceChar) {
+			const opener = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+			if (opener) {
+				flushProse();
+				fenceChar = opener[1]![0]!;
+				fenceLength = opener[1]!.length;
+				codeBlock.push(line);
+			} else {
+				prose.push(line);
+			}
+			continue;
+		}
+		codeBlock.push(line);
+		const closer = line.match(/^\s{0,3}(`+|~+)\s*$/);
+		if (closer && closer[1]![0] === fenceChar && closer[1]!.length >= fenceLength) flushCode();
+	}
+	if (codeBlock.length) flushCode();
+	flushProse();
+	return rendered;
+}
+
 function groupContext(run: LiveRun, runs: LiveRun[], allRuns: LiveRun[] = runs): string | undefined {
 	if (!run.groupId) return undefined;
 	const groupRuns = allRuns.filter((candidate) => candidate.groupId === run.groupId);
@@ -497,8 +714,9 @@ function transcriptBodyLines(
 ): BodyLine[] {
 	const lines: BodyLine[] = [];
 	let lastTurn = 0;
-	let budget = expanded ? Number.POSITIVE_INFINITY : capChars;
+	let budget = expanded ? Math.min(TRANSCRIPT_EXPANDED_CAP, capChars * 4) : capChars;
 	const innerWidth = Math.max(1, width - 2);
+	const markdownTheme = getMarkdownTheme();
 	// code rows are never wrapped or truncated (they scroll horizontally); prose rows wrap.
 	const pushStyled = (styled: string, code: boolean) => {
 		if (code) {
@@ -508,8 +726,34 @@ function transcriptBodyLines(
 		}
 	};
 	const pushNotice = (text: string) => lines.push({ text: theme.fg("warning", `  ⚠ ${text}`), code: false });
-	for (const seg of messageSegments(messages)) {
-		if (Number.isFinite(budget) && budget <= 0) {
+	const segments = messageSegments(messages);
+	const finalOutput = getFinalOutput(messages);
+	let finalOutputIndex = -1;
+	for (let i = segments.length - 1; i >= 0; i--) {
+		const candidate = segments[i];
+		if (candidate?.type === "text" && candidate.text === finalOutput) {
+			finalOutputIndex = i;
+			break;
+		}
+	}
+	const finalReserve = expanded && finalOutputIndex >= 0 ? Math.min(20_000, Buffer.byteLength(finalOutput, "utf8")) : 0;
+	let skippedToFinal = false;
+	for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+		const seg = segments[segmentIndex]!;
+		if (segmentIndex < finalOutputIndex && (budget <= finalReserve || lines.length >= TRANSCRIPT_MAX_ROWS - 600)) {
+			pushNotice("earlier transcript content truncated for display");
+			if (expanded && segmentIndex < finalOutputIndex && !skippedToFinal) {
+				segmentIndex = finalOutputIndex - 1;
+				skippedToFinal = true;
+				continue;
+			}
+			break;
+		}
+		if (lines.length >= TRANSCRIPT_MAX_ROWS) {
+			pushNotice("transcript display truncated by the row limit");
+			break;
+		}
+		if (budget <= 0) {
 			pushNotice("transcript display truncated; more content is not shown");
 			break;
 		}
@@ -519,36 +763,49 @@ function transcriptBodyLines(
 		}
 		switch (seg.type) {
 			case "text": {
-				const t = expanded ? seg.text : truncateBytes(seg.text, Math.min(4000, Math.max(1, budget)));
-				if (!expanded && t !== seg.text) pushNotice("message text truncated for display");
-				budget -= Math.min(budget, t.length);
-				for (const l of t.split("\n")) pushStyled(`  💬 ${l}`, false);
+				const t = truncateBytes(seg.text, Math.min(expanded ? 20_000 : 4_000, Math.max(1, budget)));
+				if (t !== seg.text) pushNotice("message text truncated for display");
+				budget -= Math.min(budget, Buffer.byteLength(t, "utf8"));
+				if (segmentIndex === finalOutputIndex) {
+					pushStyled(theme.fg("accent", "  💬"), false);
+					for (const line of assistantMarkdownLines(t, innerWidth, markdownTheme)) {
+						if (lines.length >= TRANSCRIPT_MAX_ROWS) break;
+						pushStyled(line.text, line.code);
+					}
+				} else {
+					for (const line of t.split("\n")) pushStyled(`  💬 ${line}`, false);
+				}
 				break;
 			}
 			case "thinking": {
-				const t = expanded ? seg.text : truncateBytes(seg.text, Math.min(1500, Math.max(1, budget)));
-				if (!expanded && t !== seg.text) pushNotice("thinking text truncated for display");
-				budget -= Math.min(budget, t.length);
+				const t = truncateBytes(seg.text, Math.min(expanded ? 10_000 : 1_500, Math.max(1, budget)));
+				if (t !== seg.text) pushNotice("thinking text truncated for display");
+				budget -= Math.min(budget, Buffer.byteLength(t, "utf8"));
 				for (const l of t.split("\n")) {
 					pushStyled(theme.fg("thinkingLow", `  💭 ${l}`), false);
 				}
 				break;
 			}
 			case "toolCall": {
-				const args = expanded ? seg.args : preview(seg.args, 140);
-				pushStyled(`  ${theme.fg("toolTitle", `🔧 ${seg.name}`)} ${theme.fg("dim", args)}`, true);
+				const args = expanded ? ` ${sanitizeToolOutput(seg.args)}` : "";
+				pushStyled(`  ${theme.fg("toolTitle", `🔧 ${seg.name}`)}${theme.fg("dim", args)}`, true);
 				break;
 			}
 			case "toolResult": {
-				lines.push({
-					text: seg.isError ? theme.fg("error", `  ✗ ${seg.name}`) : theme.fg("success", `  ✓ ${seg.name}`),
-					code: false,
+				const output = formatToolOutput(seg.text, Math.max(1, Math.min(expanded ? TOOL_OUTPUT_EXPANDED_CAP : 3_000, budget)), {
+					toolName: seg.name,
+					args: seg.args,
+					details: seg.details,
 				});
-				if (seg.text) {
-					const t = expanded ? seg.text : truncateBytes(seg.text, Math.min(3000, Math.max(1, budget)));
-					if (!expanded && t !== seg.text) pushNotice("tool output truncated for display");
-					budget -= Math.min(budget, t.length);
-					for (const l of t.split("\n")) pushStyled(theme.fg("toolOutput", `    ${l}`), true);
+				const title = [seg.name, expanded ? output.title : undefined, expanded ? output.kind : undefined].filter(Boolean).join(" · ");
+				appendSectionHeading(lines, theme, width, `${seg.isError ? "✗" : "✓"} ${title}${seg.isError ? " · error" : ""}`);
+				if (!expanded) {
+					const summary = collapsedToolResultSummary(seg.name, { content: [{ type: "text", text: seg.text }], details: seg.details }, { args: seg.args });
+					pushStyled(`    ${summary}`, false);
+					budget -= Math.min(budget, Buffer.byteLength(summary, "utf8"));
+				} else {
+					appendToolOutputDetails(lines, output, theme, width, true);
+					budget -= Math.min(budget, Buffer.byteLength(output.text, "utf8") + Buffer.byteLength(output.summary ?? "", "utf8"));
 				}
 				break;
 			}
@@ -1029,14 +1286,22 @@ export class SubagentsBrowser implements Component {
 				body.push({ text: th.fg("dim", "    No activity recorded."), code: false });
 				return;
 			}
-			body.push(
-				...run.activities.flatMap((a) =>
-					wrapTextWithAnsi(
-						`${th.fg("dim", `    +${formatElapsed(a.at)}`)} ${activityLine(a, th, this.detailExpanded)}`,
+			for (const activity of run.activities) {
+				body.push(
+					...wrapTextWithAnsi(
+						`${th.fg("dim", `    +${formatElapsed(activity.at)}`)} ${activityLine(activity, th)}`,
 						innerWidth,
 					).map((text) => ({ text, code: false })),
-				),
-			);
+				);
+				if (this.detailExpanded && activity.kind === "toolResult" && (activity.resultText || activity.resultDetails)) {
+					const output = formatToolOutput(activity.resultText ?? activity.resultPreview ?? "", TOOL_OUTPUT_ACTIVITY_CAP, {
+						toolName: activity.toolName,
+						args: activity.args,
+						details: activity.resultDetails,
+					});
+					appendToolOutputDetails(body, output, th, width, true, "      ");
+				}
+			}
 		};
 
 		const hasMessages = run.messages.length > 0;

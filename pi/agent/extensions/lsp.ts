@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve, extname } from "node:path";
+import { createToolResultRenderer } from "./tool-results/render.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -503,6 +504,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "lsp_diagnostics",
+		renderResult: createToolResultRenderer("lsp_diagnostics"),
 		label: "LSP Diagnostics",
 		description: "Get LSP diagnostics (errors, warnings) for a file",
 		promptSnippet: "Get language server diagnostics for a file",
@@ -513,7 +515,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const filePath = resolve(ctx.cwd, params.path);
 			const match = getServerForFile(filePath);
-			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }] };
+			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }], details: undefined };
 
 			const [serverName, config] = match;
 			const client = getClient(serverName, config);
@@ -521,7 +523,7 @@ export default function (pi: ExtensionAPI) {
 			const diagnostics = await client.getDiagnostics(filePath, content);
 
 			if (diagnostics.length === 0) {
-				return { content: [{ type: "text" as const, text: `✓ ${serverName}: no issues in ${params.path}` }] };
+				return { content: [{ type: "text" as const, text: `✓ ${serverName}: no issues in ${params.path}` }], details: undefined };
 			}
 
 			const lines = [`${serverName}: ${diagnostics.length} issue(s)`, ""];
@@ -532,12 +534,13 @@ export default function (pi: ExtensionAPI) {
 				lines.push(`${severity} L${line}:${col}: ${diag.message}`);
 			}
 
-			return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+			return { content: [{ type: "text" as const, text: lines.join("\n") }], details: undefined };
 		},
 	});
 
 	pi.registerTool({
 		name: "lsp_definition",
+		renderResult: createToolResultRenderer("lsp_definition"),
 		label: "LSP Go to Definition",
 		description: "Go to definition of symbol at a position",
 		promptSnippet: "Find definition of a symbol",
@@ -550,7 +553,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const filePath = resolve(ctx.cwd, params.path);
 			const match = getServerForFile(filePath);
-			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }] };
+			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }], details: undefined };
 
 			const [serverName, config] = match;
 			const client = getClient(serverName, config);
@@ -558,16 +561,17 @@ export default function (pi: ExtensionAPI) {
 			const locations = await client.getDefinition(filePath, content, params.line, params.character);
 
 			if (locations.length === 0) {
-				return { content: [{ type: "text" as const, text: "No definition found" }] };
+				return { content: [{ type: "text" as const, text: "No definition found" }], details: undefined };
 			}
 
 			const lines = locations.map((loc) => formatLocation(loc, ctx.cwd));
-			return { content: [{ type: "text" as const, text: `Definition(s):\n${lines.join("\n")}` }] };
+			return { content: [{ type: "text" as const, text: `Definition(s):\n${lines.join("\n")}` }], details: undefined };
 		},
 	});
 
 	pi.registerTool({
 		name: "lsp_references",
+		renderResult: createToolResultRenderer("lsp_references"),
 		label: "LSP Find References",
 		description: "Find all references to symbol at a position",
 		promptSnippet: "Find all references to a symbol",
@@ -580,7 +584,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const filePath = resolve(ctx.cwd, params.path);
 			const match = getServerForFile(filePath);
-			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }] };
+			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }], details: undefined };
 
 			const [serverName, config] = match;
 			const client = getClient(serverName, config);
@@ -588,18 +592,20 @@ export default function (pi: ExtensionAPI) {
 			const locations = await client.getReferences(filePath, content, params.line, params.character);
 
 			if (locations.length === 0) {
-				return { content: [{ type: "text" as const, text: "No references found" }] };
+				return { content: [{ type: "text" as const, text: "No references found" }], details: undefined };
 			}
 
 			const lines = locations.map((loc) => formatLocation(loc, ctx.cwd));
 			return {
 				content: [{ type: "text" as const, text: `Found ${lines.length} reference(s):\n${lines.join("\n")}` }],
+				details: undefined,
 			};
 		},
 	});
 
 	pi.registerTool({
 		name: "lsp_hover",
+		renderResult: createToolResultRenderer("lsp_hover"),
 		label: "LSP Hover",
 		description: "Get hover information (type, docs) for symbol at a position",
 		promptSnippet: "Get type/docs for a symbol",
@@ -612,7 +618,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const filePath = resolve(ctx.cwd, params.path);
 			const match = getServerForFile(filePath);
-			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }] };
+			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }], details: undefined };
 
 			const [serverName, config] = match;
 			const client = getClient(serverName, config);
@@ -620,16 +626,17 @@ export default function (pi: ExtensionAPI) {
 			const hover = await client.getHover(filePath, content, params.line, params.character);
 
 			if (!hover) {
-				return { content: [{ type: "text" as const, text: "No hover information available" }] };
+				return { content: [{ type: "text" as const, text: "No hover information available" }], details: undefined };
 			}
 
 			const text = typeof hover.contents === "string" ? hover.contents : hover.contents.value;
-			return { content: [{ type: "text" as const, text }] };
+			return { content: [{ type: "text" as const, text }], details: undefined };
 		},
 	});
 
 	pi.registerTool({
 		name: "lsp_symbols",
+		renderResult: createToolResultRenderer("lsp_symbols"),
 		label: "LSP Document Symbols",
 		description: "List all symbols (functions, classes, variables) in a file",
 		promptSnippet: "List symbols in a file",
@@ -640,7 +647,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const filePath = resolve(ctx.cwd, params.path);
 			const match = getServerForFile(filePath);
-			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }] };
+			if (!match) return { content: [{ type: "text" as const, text: `No LSP configured for ${params.path}` }], details: undefined };
 
 			const [serverName, config] = match;
 			const client = getClient(serverName, config);
@@ -648,7 +655,7 @@ export default function (pi: ExtensionAPI) {
 			const symbols = await client.getDocumentSymbols(filePath, content);
 
 			if (symbols.length === 0) {
-				return { content: [{ type: "text" as const, text: "No symbols found" }] };
+				return { content: [{ type: "text" as const, text: "No symbols found" }], details: undefined };
 			}
 
 			const lines = symbols.map((sym) => {
@@ -657,7 +664,7 @@ export default function (pi: ExtensionAPI) {
 				return `${kind} ${sym.name} @ ${loc}`;
 			});
 
-			return { content: [{ type: "text" as const, text: `Symbols (${lines.length}):\n${lines.join("\n")}` }] };
+			return { content: [{ type: "text" as const, text: `Symbols (${lines.length}):\n${lines.join("\n")}` }], details: undefined };
 		},
 	});
 

@@ -29,6 +29,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { createToolResultRenderer } from "../tool-results/render.ts";
 import { Type, type Static } from "typebox";
 import { type AgentScope, discoverAgents, formatAgentList } from "./agents.ts";
 import {
@@ -809,6 +810,7 @@ export default function (pi: ExtensionAPI) {
 					argsPreview: preview(args, 90),
 					resultText: event.resultText,
 					resultPreview: event.resultPreview,
+					resultDetails: event.resultDetails,
 					isError: event.isError,
 				});
 				break;
@@ -1401,6 +1403,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Inspect running or completed subagent groups without waiting. Pass a groupId to inspect one group; run ids are included for individual cancellation and transcript lookup.",
 		parameters: BackgroundStatusParams,
+		renderResult: createToolResultRenderer("subagent_status"),
 		async execute(_toolCallId, params) {
 			return {
 				content: [{ type: "text", text: formatBackgroundStatus(params.groupId) }],
@@ -1415,6 +1418,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Read live or persisted subagent history by runId, groupId, or metadata. For a running run, includeTranscript returns completed messages plus recent tool events and current streamed assistant text. Output is capped.",
 		parameters: SubagentHistoryParams,
+		renderResult: createToolResultRenderer("subagent_history"),
 		async execute(_toolCallId, params, _signal, _onUpdate, rawContext) {
 			const ctx = rawContext as ExtensionContext;
 			const filter = (params.filter ?? "").trim();
@@ -1441,6 +1445,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Request cancellation of exactly one active run by runId, or every active run in a group by groupId. Returns immediately; queued group work is skipped.",
 		parameters: SubagentCancelParams,
+		renderResult: createToolResultRenderer("subagent_cancel"),
 		async execute(_toolCallId, params) {
 			const response = (text: string, isError = false) => ({
 				content: [{ type: "text" as const, text }],

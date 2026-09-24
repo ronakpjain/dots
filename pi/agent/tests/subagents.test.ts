@@ -3,7 +3,8 @@
  * Run with: bun test agent/tests/subagents.test.ts
  */
 
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	runSubagent,
@@ -20,11 +21,14 @@ import {
 	formatTokens,
 	formatElapsed,
 	activityPlainText,
+	renderRunResults,
 	runMatchesFilter,
 	SubagentsBrowser,
 	type LiveRun,
 	type RunActivity,
 } from "../extensions/subagents/ui.ts";
+
+beforeAll(() => initTheme("dark"));
 
 const fakeModel = {
 	id: "fake-model",
@@ -301,7 +305,11 @@ describe("subagent ui helpers", () => {
 				role: "toolResult",
 				toolCallId: "c1",
 				toolName: "read",
-				content: [{ type: "text", text: "file contents" }],
+				content: [
+					{ type: "text", text: "file contents" },
+					{ type: "image", mimeType: "image/png", data: "SECRET_IMAGE" },
+				],
+				details: { diff: "@@ -1 +1 @@\\n-old\\n+new" },
 				isError: false,
 			} as any,
 			{
@@ -321,6 +329,9 @@ describe("subagent ui helpers", () => {
 		if (result.type === "toolResult") {
 			expect(result.name).toBe("read");
 			expect(result.text).toContain("file contents");
+			expect(result.text).toContain("[image · image/png content]");
+			expect(result.text).not.toContain("SECRET_IMAGE");
+			expect(result.details).toEqual({ diff: "@@ -1 +1 @@\\n-old\\n+new" });
 			expect(result.turn).toBe(1);
 		}
 	});
@@ -390,10 +401,9 @@ describe("subagent ui helpers", () => {
 			groupSize: undefined,
 			activities: [
 				{
-					kind: "tool",
+					kind: "status",
 					at: 12,
-					toolName: "bash",
-					argsPreview: `${"argument ".repeat(30)}TAIL_ACTIVITY`,
+					text: `${"argument ".repeat(30)}TAIL_ACTIVITY`,
 				},
 			],
 		});
@@ -475,6 +485,184 @@ describe("subagent ui helpers", () => {
 		}
 	});
 
+	test("browser formats prose, code, and edit results with safe structured details", () => {
+		const makeTranscriptRun = (
+			toolName: string,
+			text: string,
+			args: Record<string, unknown>,
+			details?: unknown,
+			activities: RunActivity[] = [],
+		) =>
+			browserRun({
+				activities,
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", id: "tool-call", name: toolName, arguments: args }],
+					} as any,
+					{
+						role: "toolResult",
+						toolCallId: "tool-call",
+						toolName,
+						content: [{ type: "text", text }],
+						details,
+						isError: false,
+					} as any,
+				],
+			});
+		const renderDetail = (run: LiveRun, width = 52, expanded = false) => {
+			const browser = new SubagentsBrowser(browserTheme, browserTui(60), () => {}, () => [run]);
+			try {
+				browser.render(width);
+				browser.handleInput(String.fromCharCode(13));
+				if (expanded) browser.handleInput("o");
+				browser.handleInput("G");
+				return browser.render(width).join("\n");
+			} finally {
+				browser.dispose();
+			}
+		};
+
+		const prose = renderDetail(
+			makeTranscriptRun("bash", `${"Plain prose output should wrap naturally. ".repeat(8)}\u001b[31mPROSE_TAIL\u001b[0m`, {
+				command: "echo results",
+			}),
+			52,
+			true,
+		);
+		expect(prose).toContain("PROSE_TAIL");
+		expect(prose).not.toContain("\u001b[31m");
+		expect(prose).not.toContain("\u001b[0m");
+		expect(prose).not.toContain("←/→ horiz");
+
+		const code = renderDetail(
+			makeTranscriptRun("read", `export const longLine = "${"CODE".repeat(40)}";`, { path: "src/a.ts" }),
+			52,
+			true,
+		);
+		expect(code).toContain("←/→ horiz");
+
+		const edit = renderDetail(
+			makeTranscriptRun("edit", "Successfully replaced 1 block(s).", { path: "src/a.ts" }, {
+				diff: "@@ -1 +1 @@\\n-old\\n+new",
+				firstChangedLine: 1,
+			}),
+			52,
+			true,
+		);
+		expect(edit).toContain("Successfully replaced 1 block(s).");
+		expect(edit).toContain("+new");
+		expect(edit).toContain("First changed line: 1");
+
+		const secret = "sk-live-subagent-test-only";
+		const secretText = "stdout result preview";
+		const secretArgs = { command: `curl -H 'Authorization: Bearer ${secret}' https://example.invalid` };
+		const privateRun = makeTranscriptRun("bash", secretText, secretArgs, undefined, [
+			{ kind: "tool", at: 1, toolName: "bash", args: secretArgs, argsPreview: JSON.stringify(secretArgs) } as any,
+			{
+				kind: "toolResult",
+				at: 2,
+				toolName: "bash",
+				args: secretArgs,
+				resultPreview: secretText,
+				resultText: secretText,
+				isError: false,
+			} as any,
+		]);
+		const collapsed = renderDetail(privateRun);
+		expect(collapsed).toContain(secretText);
+		expect(collapsed).not.toContain(secret);
+		expect(collapsed).not.toContain("Authorization");
+		expect(collapsed).not.toContain("example.invalid");
+		expect(renderDetail(privateRun, 52, true)).toContain(secretText);
+	});
+
+	test("shows bounded tool-output previews in collapsed run results and full output when expanded", () => {
+		const toolOutput = "stdout preview value\n# Heading\n\n```rust\nlet answer = 42;\n```";
+		const messages = [
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "echo output" } }],
+			} as any,
+			{
+				role: "toolResult",
+				toolCallId: "tool-1",
+				toolName: "bash",
+				content: [{ type: "text", text: toolOutput }],
+				isError: false,
+			} as any,
+			{ role: "assistant", content: [{ type: "text", text: "finished" }] } as any,
+		];
+		const run = {
+			name: "worker",
+			task: "inspect output",
+			exitCode: 0,
+			messages,
+			stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+			model: "fake-model",
+			timeoutKilled: false,
+			maxTurnsKilled: false,
+			aborted: false,
+			startedAt: new Date().toISOString(),
+			durationMs: 10,
+		};
+		const collapsed = renderRunResults([run], "single", false, browserTheme).render(100).join("\n");
+		expect(collapsed).toContain("stdout preview value");
+		expect(collapsed).toContain("Ctrl+O to expand");
+		const expanded = renderRunResults([run], "single", true, browserTheme).render(100).join("\n");
+		expect(expanded).toContain("stdout preview value");
+		expect(expanded).toContain("# Heading");
+		expect(expanded).toContain("```rust");
+	});
+
+	test("renders only the final agent response as Markdown in the subagent transcript", () => {
+		const run = browserRun({
+			groupId: "",
+			groupSize: undefined,
+			messages: [
+				{ role: "assistant", content: [{ type: "text", text: "# Intermediate note\n\n- raw list" }] } as any,
+				{ role: "assistant", content: [{ type: "text", text: "# Final answer\n\n- formatted item" }] } as any,
+			],
+		});
+		const browser = new SubagentsBrowser(browserTheme, browserTui(60), () => {}, () => [run]);
+		try {
+			browser.render(70);
+			browser.handleInput(String.fromCharCode(13));
+			browser.handleInput("o");
+			browser.handleInput("G");
+			const output = browser.render(70).join("\n");
+			expect(output).toContain("# Intermediate note");
+			expect(output).not.toContain("# Final answer");
+			expect(output).toContain("Final answer");
+			expect(output).toContain("formatted item");
+		} finally {
+			browser.dispose();
+		}
+	});
+
+	test("expanded transcript keeps the final response visible after a large earlier message", () => {
+		const run = browserRun({
+			groupId: "",
+			groupSize: undefined,
+			messages: [
+				{ role: "assistant", content: [{ type: "text", text: "earlier output ".repeat(20_000) }] } as any,
+				{ role: "assistant", content: [{ type: "text", text: "# Final response survives" }] } as any,
+			],
+		});
+		const browser = new SubagentsBrowser(browserTheme, browserTui(60), () => {}, () => [run]);
+		try {
+			browser.render(70);
+			browser.handleInput(String.fromCharCode(13));
+			browser.handleInput("o");
+			browser.handleInput("G");
+			const output = browser.render(70).join("\n");
+			expect(output).toContain("Final response survives");
+		} finally {
+			browser.dispose();
+		}
+	});
+
 	test("browser labels live activity separately from the transcript", () => {
 		const run = browserRun({
 			status: "running",
@@ -520,7 +708,7 @@ describe("subagent ui helpers", () => {
 			expect(updated).not.toBe(initial);
 			expect(updated.join(" ")).toContain("2 turns");
 			expect(updated.join(" ")).toContain("ctx 99");
-			expect(updated.join(" ")).toContain("new args");
+			expect(updated.join(" ")).not.toContain("new args");
 			expect(updated.join(" ")).toContain("✗ bash");
 		} finally {
 			browser.dispose();

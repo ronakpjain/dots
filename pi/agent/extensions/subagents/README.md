@@ -165,10 +165,14 @@ the session output behind it. The selected run row is highlighted with
 - **Detail view** — uses labeled `Prompt`, `System prompt`, `Config`, `Live
   activity`/`Activity`, and `Transcript` sections. It shows the exact task
   prompt sent by the main agent, resolved launch controls, streamed thinking,
-  tool calls, tool results (with errors highlighted), and final output. Prose
-  wraps to the panel width; code rows (tool arguments, tool output) keep full
-  width and scroll horizontally with `←/→` (`h`/`l`). Press `o` (or `Ctrl+o`)
-  to expand/collapse display caps and reveal raw stored content; the footer
+  tool calls, tool results (with errors highlighted), and final output. By
+  default, tool calls show names and tool results show bounded, sanitized
+  output previews; arguments remain hidden. Expand with `o` (or `Ctrl+o`) to view
+  more of the result and transcript. Only the final agent response is rendered
+  as Markdown; intermediate transcript text remains literal. Display formatting
+  never changes stored transcript content or model context. Prose wraps to the panel
+  width; code rows (tool arguments, tool output) keep full width and scroll
+  horizontally with `←/→` (`h`/`l`). Expansion increases display caps; the footer
   shows the current mode. Scroll vertically with `↑/↓`; `g`/`G` jump to
   top/bottom; `Backspace` returns to the list; Esc closes. Live runs refresh
   automatically. Display and storage truncation notices are called out

@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { renderToolResult } from "./tool-results/render.ts";
 
 const STORE_VERSION = 2;
 const MAX_MEMORY_CONTENT = 20_000;
@@ -687,21 +688,21 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 				0,
 			);
 		},
-		renderResult(result, _options, theme) {
-			const details = result.details as MemoryDetails | undefined;
-			if (details?.action === "retrieve") {
-				return new Text(
-					theme.fg("success", `✓ ${details.count ?? 0} memor${details.count === 1 ? "y" : "ies"}`),
-					0,
-					0,
-				);
-			}
-			if (details?.action === "stats") return new Text(theme.fg("success", "✓ Memory stats"), 0, 0);
-			if (details?.action === "delete") return new Text(theme.fg("success", "✓ Memory deleted"), 0, 0);
-			if (details?.action === "archive" || details?.action === "restore" || details?.action === "merge") {
-				return new Text(theme.fg("success", `✓ Memory ${details.action}`), 0, 0);
-			}
-			return new Text(theme.fg("success", "✓ Memory saved"), 0, 0);
+		renderResult(result, options, theme, context) {
+			return renderToolResult("memory", result, options, theme, context, {
+				collapsedSummary: (toolResult) => {
+					const details = toolResult.details as MemoryDetails | undefined;
+					if (details?.action === "retrieve") {
+						return `${details.count ?? 0} memor${details.count === 1 ? "y" : "ies"}`;
+					}
+				if (details?.action === "stats") return "Memory stats";
+				if (details?.action === "delete") return "Memory deleted";
+				if (details?.action === "archive" || details?.action === "restore" || details?.action === "merge") {
+					return `Memory ${details.action}`;
+				}
+				return "Memory saved";
+				},
+			});
 		},
 	});
 }

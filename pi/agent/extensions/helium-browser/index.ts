@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { Type, type Static } from "typebox";
 import { apwStatus, getApwCredential, listApwLogins, type ApwLoginMetadata } from "./apw.ts";
 import { registerApwAliasTool } from "./apw-alias-tool.ts";
+import { createToolResultRenderer } from "../tool-results/render.ts";
 import {
 	focusedSensitiveFieldEvaluator,
 	loginFormEvaluator,
@@ -3016,6 +3017,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_request_intervention",
+		renderResult: createToolResultRenderer("helium_request_intervention"),
 		label: "Helium: Request user action",
 		description:
 			"Notify the user that a bounded manual action is required in a Helium tab; use this instead of inventing a reason or message.",
@@ -3039,6 +3041,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_apw_fill",
+		renderResult: createToolResultRenderer("helium_apw_fill"),
 		label: "Helium: Fill saved login",
 		description:
 			"After mandatory interactive confirmation for an exact HTTPS origin and saved account, fill one visible login form from APW. Pi will not click the submit button or call form.submit; the site may react to input events.",
@@ -3058,6 +3061,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_status",
+		renderResult: createToolResultRenderer("helium_status"),
 		label: "Helium: Status",
 		description:
 			"Read Helium CDP status, Pi-owned window state, and tab counts without creating or changing browser state.",
@@ -3071,6 +3075,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_tabs",
+		renderResult: createToolResultRenderer("helium_tabs"),
 		label: "Helium: List tabs",
 		description:
 			"Read visible Helium tabs (all by default), including ownership and Chromium window ids; never creates a Pi window.",
@@ -3094,6 +3099,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_open_tab",
+		renderResult: createToolResultRenderer("helium_open_tab"),
 		label: "Helium: Open tab",
 		description:
 			"Safely adopt an entirely blank default window when possible, then reuse an unused blank Pi tab; otherwise open a same-window tab, optionally navigating to a safe http(s) URL.",
@@ -3125,6 +3131,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_navigate",
+		renderResult: createToolResultRenderer("helium_navigate"),
 		label: "Helium: Navigate",
 		description: "Navigate an existing Helium tab to an http(s) URL or about:blank.",
 		promptSnippet: "Navigate a Helium tab",
@@ -3165,6 +3172,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_snapshot",
+		renderResult: createToolResultRenderer("helium_snapshot"),
 		label: "Helium: Snapshot",
 		description:
 			"Read a bounded text snapshot of a Helium tab, including stable refs. Use the opaque cursor in details to continue through large DOMs; scope optionally limits traversal to one CSS-selected subtree. Omitted tabId uses an existing Pi window only and never adopts or creates one.",
@@ -3199,6 +3207,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_click",
+		renderResult: createToolResultRenderer("helium_click"),
 		label: "Helium: Click",
 		description: "Click one visible element in a Helium tab using a fresh snapshot ref or a CSS selector.",
 		parameters: elementTargetParams,
@@ -3256,6 +3265,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_fill",
+		renderResult: createToolResultRenderer("helium_fill"),
 		label: "Helium: Fill",
 		description:
 			"Replace one non-credential value in a Helium tab. Never use for passwords, OTPs, API keys, payment data, or other credentials; use helium_apw_fill for eligible logins.",
@@ -3314,6 +3324,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_type",
+		renderResult: createToolResultRenderer("helium_type"),
 		label: "Helium: Type",
 		description:
 			"Focus one non-credential input-like element and type text without evaluating arbitrary page JavaScript. Never use for passwords, OTPs, API keys, payment data, or other credentials.",
@@ -3390,6 +3401,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_key",
+		renderResult: createToolResultRenderer("helium_key"),
 		label: "Helium: Key press",
 		description:
 			"Send one bounded Puppeteer key press such as Enter, Escape, ArrowDown, or Control+A to a Helium tab.",
@@ -3436,6 +3448,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "helium_screenshot",
+		renderResult: createToolResultRenderer("helium_screenshot"),
 		label: "Helium: Screenshot",
 		description:
 			"Capture a PNG screenshot of a Helium tab; omitted tabId uses an existing Pi window only and never adopts or creates one.",

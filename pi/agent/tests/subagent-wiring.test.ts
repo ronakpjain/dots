@@ -18,6 +18,7 @@ interface RegisteredTool {
 	executionMode?: string;
 	parameters?: { properties?: Record<string, unknown> };
 	execute?: (...args: unknown[]) => Promise<unknown>;
+	renderResult?: (...args: unknown[]) => unknown;
 }
 
 interface FakePi {
@@ -103,6 +104,9 @@ describe("subagents extension wiring", () => {
 			"subagent_status",
 		]);
 		expect(pi.tools.get("subagent")!.executionMode).toBe("sequential");
+		for (const name of ["subagent_status", "subagent_history", "subagent_cancel"]) {
+			expect(typeof pi.tools.get(name)?.renderResult).toBe("function");
+		}
 		expect([...pi.commands.keys()].sort()).toEqual(["subagent-model", "subagents"]);
 	});
 

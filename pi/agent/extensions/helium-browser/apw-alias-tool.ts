@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { createToolResultRenderer } from "../tool-results/render.ts";
 import { inspectApwSavedHostnames } from "./apw.ts";
 import { isAliasHostname, saveApprovedAlias } from "./apw-alias-store.ts";
 
@@ -41,6 +42,7 @@ export async function executeAliasRequest(params: AliasRequest, ctx: AliasContex
 export function registerApwAliasTool(pi: ExtensionAPI, origin: AliasDependencies["origin"]) {
 	pi.registerTool({
 		name: "helium_apw_alias",
+		renderResult: createToolResultRenderer("helium_apw_alias"),
 		label: "Helium: Inspect or approve APW alias",
 		description: "Inspect saved APW hostnames for a tab without exposing accounts or passwords. Supply a returned savedHostname to request user confirmation and persist a directed alias; active immediately without reload.",
 		promptSnippet: "Inspect APW hostname mismatches and request approval for a persistent alias",

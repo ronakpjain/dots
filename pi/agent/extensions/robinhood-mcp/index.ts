@@ -11,6 +11,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
+import { createToolResultRenderer } from "../tool-results/render.ts";
 
 const MCP_URL = process.env.ROBINHOOD_MCP_URL ?? "https://agent.robinhood.com/mcp/trading";
 const DATA_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "robinhood-mcp", ".state");
@@ -144,6 +145,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: ROBINHOOD_SEARCH_TOOL,
+		renderResult: createToolResultRenderer(ROBINHOOD_SEARCH_TOOL),
 		label: "Robinhood: Search tools",
 		description:
 			"Search the authenticated Robinhood capability catalog and load only the tools needed for the current task. Capabilities include quotes, portfolio, positions, orders, options, earnings, watchlists, screeners, and market data.",
@@ -224,6 +226,7 @@ export default function (pi: ExtensionAPI) {
 
 			pi.registerTool({
 				name,
+				renderResult: createToolResultRenderer(name),
 				label: `Robinhood: ${t.name}`,
 				description,
 				// Deliberately omit promptSnippet/promptGuidelines. These tools are

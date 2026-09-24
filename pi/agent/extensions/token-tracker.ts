@@ -3,6 +3,8 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { sanitizeToolOutput } from "./tool-results/format.ts";
+import { renderToolResult } from "./tool-results/render.ts";
 
 export const TOKEN_USAGE_EVENT = "pi-token-usage";
 const STORE_VERSION = 1;
@@ -1224,16 +1226,16 @@ export default function tokenTrackerExtension(pi: ExtensionAPI): void {
 			}
 		},
 		renderCall(args, theme) {
-			const period = args.period || args.from || "all time";
+			const period = sanitizeToolOutput(args.period || args.from || "all time").replace(/\s+/g, " ").slice(0, 80);
 			return new Text(theme.fg("toolTitle", theme.bold("token_usage ")) + theme.fg("accent", period), 0, 0);
 		},
-		renderResult(result, _options, theme) {
-			const isError = (result as { isError?: boolean }).isError === true;
-			return new Text(
-				theme.fg(isError ? "error" : "success", isError ? "× Token report failed" : "✓ Token report ready"),
-				0,
-				0,
-			);
+		renderResult(result, options, theme, context) {
+			return renderToolResult("token_usage", result, options, theme, context, {
+				collapsedSummary: (toolResult) => {
+					if (context.isError) return "Token report failed";
+					return "Token usage report ready · expand for details";
+				},
+			});
 		},
 	});
 

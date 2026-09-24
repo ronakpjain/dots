@@ -2,6 +2,7 @@ import { createGitCheckpoint } from "./checkpoint.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { renderToolResult } from "./tool-results/render.ts";
 
 const DEFAULT_MAX_ITERATIONS = 32;
 const GOAL_CONTEXT_TYPE = "goal-mode-context";
@@ -330,8 +331,10 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 				0,
 			);
 		},
-		renderResult(result, _options, theme) {
-			return new Text(theme.fg("success", "✓ ") + theme.fg("accent", "Goal complete"), 0, 0);
+		renderResult(result, options, theme, context) {
+			return renderToolResult("goal_complete", result, options, theme, context, {
+				collapsedSummary: () => (context.isError ? "Goal completion failed" : "Goal complete"),
+			});
 		},
 	});
 

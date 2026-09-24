@@ -52,6 +52,31 @@ test("parses calendar, duration, and arbitrary date periods", () => {
 	expect(since.to).toBe(now.getTime());
 });
 
+test("collapsed token reports use a fixed safe summary", () => {
+	let tokenTool: any;
+	const pi = {
+		on: () => {},
+		registerCommand: () => {},
+		registerTool: (definition: any) => {
+			if (definition.name === "token_usage") tokenTool = definition;
+		},
+		events: { on: () => () => {} },
+	};
+	tokenTrackerExtension(pi as never);
+	const escape = String.fromCharCode(27);
+	const secretPeriod = `period${escape}[31mcredential-value`;
+	const component = tokenTool.renderResult(
+		{ content: [{ type: "text", text: "report" }], details: { period: secretPeriod } },
+		{ expanded: false },
+		{ fg: (_color: string, text: string) => text, bold: (text: string) => text },
+		{ isError: false },
+	);
+	const output = component.render(100).join("\n");
+	expect(output).toContain("Token usage report ready");
+	expect(output).not.toContain("credential-value");
+	expect(output).not.toContain(`${escape}[`);
+});
+
 test("recovers main, compaction, and subagent usage from a session", () => {
 	const session = [
 		JSON.stringify({ type: "session", id: "session-1", cwd: "/tmp/project" }),

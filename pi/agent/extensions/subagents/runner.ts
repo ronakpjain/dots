@@ -26,6 +26,7 @@ import {
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { applyFastMode, isLunaModel } from "../fast-mode.ts";
+import { toolResultContentText } from "../tool-results/format.ts";
 import { randomUUID } from "node:crypto";
 
 export interface SubagentTaskSpec {
@@ -83,6 +84,8 @@ export type RunnerEvent =
 			resultPreview: string;
 			/** Full text content for the transparent live activity view. */
 			resultText?: string;
+			/** Allowlisted structured metadata from the tool result. */
+			resultDetails?: unknown;
 			isError: boolean;
 		}
 	| { type: "thinking"; text: string }
@@ -191,12 +194,8 @@ export function assistantText(message: AgentMessage): string {
 
 /** Full text content of a tool result for the transparent live activity view. */
 function toolResultText(result: unknown): string {
-	const content = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((c): c is { type: string; text: string } => c?.type === "text" && typeof c.text === "string")
-		.map((c) => c.text)
-		.join("\n");
+	const content = (result as { content?: Array<{ type?: string; text?: string; mimeType?: string }> } | undefined)?.content;
+	return toolResultContentText(content);
 }
 
 /** One-line preview of a tool result (for live dashboards). */
@@ -551,6 +550,7 @@ export async function runSubagent(spec: SubagentTaskSpec, opts: RunOptions): Pro
 				args: toolCallArgs.get(event.toolCallId) ?? {},
 				resultPreview: toolResultPreview(event.result),
 				resultText: toolResultText(event.result),
+				resultDetails: (event.result as { details?: unknown } | undefined)?.details,
 				isError: event.isError,
 			});
 		}
