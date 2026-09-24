@@ -11,3 +11,5 @@ pi/agent/extensions/robinhood-mcp/.env*
 __pycache__/
 *.pyc
 node_modules/
+pi/agent/state
+pi/agent/models.json
