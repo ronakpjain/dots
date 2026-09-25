@@ -97,7 +97,14 @@ async function collectChecks(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	const oauth = await readJson(statePath);
 	const allTools = pi.getAllTools().map((tool) => tool.name);
 	const activeTools = new Set(pi.getActiveTools());
-	const requiredTools = ["memory", "question", "goal_complete", "robinhood_search_tools"];
+	const requiredTools = [
+		"memory",
+		"question",
+		"goal_set_plan",
+		"goal_verify",
+		"goal_complete",
+		"robinhood_search_tools",
+	];
 	const extensionChecks = await Promise.all(
 		REQUIRED_EXTENSIONS.map(async (name): Promise<Check> => ({
 			label: `extension ${name}`,
@@ -141,9 +148,13 @@ async function collectChecks(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 				: "not loaded",
 		},
 		{
-			label: "goal tool",
-			status: allTools.includes("goal_complete") ? "ok" : "fail",
-			detail: allTools.includes("goal_complete") ? "loaded" : "not loaded",
+			label: "goal lifecycle tools",
+			status: ["goal_set_plan", "goal_verify", "goal_complete"].every((name) => allTools.includes(name))
+				? "ok"
+				: "fail",
+			detail: ["goal_set_plan", "goal_verify", "goal_complete"]
+				.map((name) => `${name} ${allTools.includes(name) ? "loaded" : "missing"}`)
+				.join(", "),
 		},
 		{
 			label: "Robinhood search",

@@ -3,6 +3,8 @@ import type { ExtensionAPI, ExtensionContext, ToolResultEvent } from "@earendil-
 type GoalSnapshot = {
 	goal?: string;
 	plan?: string[];
+	acceptanceCriteria?: Array<{ id?: string; description?: string; verified?: boolean; evidence?: string }>;
+	workIterationsAfterPlan?: number;
 	progress?: string;
 	status?: string;
 };
@@ -62,7 +64,15 @@ function goalInstruction(ctx: ExtensionContext): string {
 			?.slice(0, 8)
 			.map((item, index) => `${index + 1}. ${item}`)
 			.join("\n") || "(plan not yet recorded)";
-	return `Active goal: ${goal.goal ?? "(unnamed)"}\nSuccess criteria/plan:\n${plan}\nLatest progress: ${(goal.progress ?? "").slice(-500)}`;
+	const criteria =
+		goal.acceptanceCriteria
+			?.slice(0, 8)
+			.map(
+				(criterion) =>
+					`- ${criterion.id ?? "AC"} [${criterion.verified ? "VERIFIED" : "UNVERIFIED"}] ${criterion.description ?? "(missing description)"}${criterion.evidence ? ` — evidence: ${criterion.evidence}` : ""}`,
+			)
+			.join("\n") || "(acceptance criteria not yet recorded)";
+	return `Active goal: ${goal.goal ?? "(unnamed)"}\nPlan:\n${plan}\nAcceptance criteria and evidence:\n${criteria}\nWork iterations since latest plan: ${goal.workIterationsAfterPlan ?? 0}\nLatest progress: ${(goal.progress ?? "").slice(-500)}`;
 }
 
 function resultDetails(event: ToolResultEvent, originalChars: number, retainedChars: number): unknown {

@@ -9,17 +9,29 @@ const GOAL_CONTEXT_TYPE = "goal-mode-context";
 const GOAL_STATE_TYPE = "goal-mode-state";
 const GOAL_CAPABILITY_PROMPT =
 	"[GOAL CAPABILITY] The user can start autonomous work with /goal <objective>. " +
-	"When goal mode is active, design explicit verifiable criteria, keep working across turns, and call goal_complete only after every criterion is verified. " +
-	"A message from the user during an active goal is FEEDBACK on the goal, not a new request: incorporate it, adjust the plan if needed, and keep working toward the goal. " +
+	"When goal mode is active, first use goal_set_plan to record a concrete plan and explicit, testable acceptance criteria; do not use implementation or research tools before recording both. " +
+	"Then complete at least one real work iteration, call goal_verify with concrete evidence for each criterion, and call goal_complete only after every criterion is verified. " +
+	"A message from the user during an active goal is FEEDBACK on the goal, not a new request: incorporate it, revise the plan or criteria if needed, and keep working toward the goal. " +
 	"If the goal is paused, the user is giving feedback when they type a message; resume addressing the goal. " +
 	"If the user says to stop or pause, stop working and wait for /goal resume.";
 
 type GoalStatus = "idle" | "active" | "paused" | "completed";
+type GoalPhase = "planning" | "execution" | "verification";
+
+interface GoalCriterion {
+	id: string;
+	description: string;
+	verified: boolean;
+	evidence: string;
+}
 
 interface GoalState {
 	goal: string;
 	status: GoalStatus;
 	plan: string[];
+	acceptanceCriteria: GoalCriterion[];
+	planSetIteration: number;
+	workIterationsAfterPlan: number;
 	progress: string;
 	iterations: number;
 	maxIterations: number;
@@ -42,11 +54,33 @@ interface GoalStateEntry {
 	data?: GoalState;
 }
 
+const GoalPlanParams = Type.Object({
+	plan: Type.Array(Type.String({ minLength: 1, maxLength: 300 }), {
+		minItems: 1,
+		maxItems: 8,
+		description: "Ordered, actionable implementation or work steps",
+	}),
+	acceptanceCriteria: Type.Array(Type.String({ minLength: 1, maxLength: 300 }), {
+		minItems: 1,
+		maxItems: 8,
+		description: "Distinct, observable conditions that must be true for the goal to count as complete",
+	}),
+});
+
+const GoalVerifyParams = Type.Object({
+	criterionId: Type.String({ minLength: 1, description: "Criterion id from goal_set_plan, such as AC1" }),
+	evidence: Type.String({
+		minLength: 1,
+		maxLength: 1000,
+		description: "Concrete check or observation supporting this criterion",
+	}),
+});
+
 const GoalCompleteParams = Type.Object({
 	summary: Type.String({ description: "A concise summary of the completed goal and outcome" }),
 	evidence: Type.Optional(
 		Type.Array(Type.String(), {
-			description: "Concrete checks, files, commands, or observations that verify completion",
+			description: "Additional concrete checks, files, commands, or observations",
 			maxItems: 8,
 		}),
 	),
@@ -74,42 +108,58 @@ function isAssistantMessage(message: unknown): boolean {
 	return (message as GoalMessage).role === "assistant";
 }
 
-function cleanPlanItem(value: string): string {
-	return value
-		.replace(/\s+/g, " ")
-		.replace(/\[(?:DONE|TODO):\d+\]/gi, "")
-		.trim()
-		.replace(/[.;]+$/, "");
+function normalizeItems(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const items: string[] = [];
+	for (const item of value) {
+		if (typeof item !== "string") continue;
+		const normalized = item.replace(/\s+/g, " ").trim().slice(0, 300);
+		if (normalized && !items.includes(normalized)) items.push(normalized);
+		if (items.length === 8) break;
+	}
+	return items;
 }
 
-function extractPlan(text: string): string[] {
-	const lines = text.split("\n");
-	const items: string[] = [];
-	let inPlanSection = false;
+function goalPhase(state: GoalState): GoalPhase {
+	if (state.plan.length === 0 || state.acceptanceCriteria.length === 0) return "planning";
+	return state.acceptanceCriteria.every((criterion) => criterion.verified && criterion.evidence.trim())
+		? "verification"
+		: "execution";
+}
 
-	for (const line of lines) {
-		const heading = line
-			.match(/^#{1,4}\s*(.+)$/)?.[1]
-			?.trim()
-			.toLowerCase();
-		if (heading) {
-			inPlanSection = /plan|success criteria|acceptance criteria|steps|objective/.test(heading);
-			continue;
-		}
-
-		const match = line.match(/^\s*(?:[-*]|\d+[.)])\s+(.+)$/);
-		if (!match) {
-			if (inPlanSection && line.trim() === "") continue;
-			if (inPlanSection && items.length > 0 && line.trim()) inPlanSection = false;
-			continue;
-		}
-
-		const item = cleanPlanItem(match[1]);
-		if (item.length > 3 && !items.includes(item)) items.push(item.slice(0, 140));
-		if (items.length >= 8) break;
+function completionBlockReason(state: GoalState): string | undefined {
+	if (goalPhase(state) === "planning") {
+		return "Record a non-empty plan and explicit acceptance criteria with goal_set_plan before completing the goal.";
 	}
+	if (state.iterations <= state.planSetIteration || state.workIterationsAfterPlan < 1) {
+		return "Complete at least one subsequent work iteration after the current plan was recorded before verifying or completing it.";
+	}
+	const outstanding = state.acceptanceCriteria.filter(
+		(criterion) => !criterion.verified || !criterion.evidence.trim(),
+	);
+	if (outstanding.length > 0) {
+		return `Verify every acceptance criterion with goal_verify and concrete evidence first (outstanding: ${outstanding.map((item) => item.id).join(", ")}).`;
+	}
+	return undefined;
+}
 
-	return items;
+function normalizeRestoredCriteria(value: unknown): GoalCriterion[] {
+	if (!Array.isArray(value)) return [];
+	return value.slice(0, 8).flatMap((candidate, index) => {
+		if (!candidate || typeof candidate !== "object") return [];
+		const item = candidate as Partial<GoalCriterion>;
+		if (typeof item.description !== "string" || !item.description.trim()) return [];
+		const evidence = typeof item.evidence === "string" ? item.evidence.trim().slice(0, 1000) : "";
+		const verified = item.verified === true && evidence.length > 0;
+		return [
+			{
+				id: typeof item.id === "string" && item.id.trim() ? item.id.trim() : `AC${index + 1}`,
+				description: item.description.replace(/\s+/g, " ").trim().slice(0, 300),
+				verified,
+				evidence: verified ? evidence : "",
+			},
+		];
+	});
 }
 
 function latestAssistant(messages: unknown[]): GoalMessage | undefined {
@@ -126,7 +176,10 @@ function makeInitialState(goal: string): GoalState {
 		goal,
 		status: "active",
 		plan: [],
-		progress: "Designing a plan and success criteria",
+		acceptanceCriteria: [],
+		planSetIteration: 0,
+		workIterationsAfterPlan: 0,
+		progress: "Planning required: record a plan and acceptance criteria",
 		iterations: 0,
 		maxIterations,
 		startedAt: new Date().toISOString(),
@@ -134,8 +187,12 @@ function makeInitialState(goal: string): GoalState {
 	};
 }
 
+function makeIdleState(): GoalState {
+	return { ...makeInitialState(""), status: "idle", progress: "", startedAt: "" };
+}
+
 function statusText(state: GoalState): string {
-	if (state.status === "active") return `◈ goal ${state.iterations}/${state.maxIterations}`;
+	if (state.status === "active") return `◈ goal ${goalPhase(state)} ${state.iterations}/${state.maxIterations}`;
 	if (state.status === "completed") return "✓ goal complete";
 	if (state.status === "paused") return "Ⅱ goal paused";
 	return "";
@@ -180,6 +237,17 @@ function goalWidget(ctx: ExtensionContext, getState: () => GoalState): void {
 					.join("  ·  ");
 				lines.push(theme.fg("dim", "  plan: ") + plan);
 			}
+			if (state.acceptanceCriteria.length > 0) {
+				const verified = state.acceptanceCriteria.filter((criterion) => criterion.verified).length;
+				const criteria = state.acceptanceCriteria
+					.slice(0, 3)
+					.map(
+						(criterion) =>
+							`${criterion.id} ${criterion.verified ? "✓" : "○"}: ${compactUiText(criterion.description)}`,
+					)
+					.join("  ·  ");
+				lines.push(theme.fg("dim", `  criteria ${verified}/${state.acceptanceCriteria.length}: `) + criteria);
+			}
 
 			const hint =
 				state.status === "paused"
@@ -198,18 +266,10 @@ function goalWidget(ctx: ExtensionContext, getState: () => GoalState): void {
 }
 
 export default function goalModeExtension(pi: ExtensionAPI): void {
-	let state: GoalState = {
-		goal: "",
-		status: "idle",
-		plan: [],
-		progress: "",
-		iterations: 0,
-		maxIterations: DEFAULT_MAX_ITERATIONS,
-		startedAt: "",
-		feedback: "",
-	};
+	let state: GoalState = makeIdleState();
 	let currentContext: ExtensionContext | undefined;
 	let continuationQueued = false;
+	let pendingWorkInTurn = false;
 	let goalWidgetInstalled = false;
 	/** Why the current run was aborted: a user pause, or a feedback-resume.
 	 *  Lets agent_end(aborted) avoid pausing a goal that was just resumed
@@ -217,7 +277,19 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	let abortIntent: "pause" | "feedback" | undefined;
 
 	function persist(): void {
-		pi.appendEntry(GOAL_STATE_TYPE, { ...state, plan: [...state.plan] });
+		pi.appendEntry(GOAL_STATE_TYPE, {
+			...state,
+			plan: [...state.plan],
+			acceptanceCriteria: state.acceptanceCriteria.map((criterion) => ({ ...criterion })),
+		});
+	}
+
+	function requireReplanningAfterFeedback(): void {
+		state.plan = [];
+		state.acceptanceCriteria = [];
+		state.planSetIteration = state.iterations;
+		state.workIterationsAfterPlan = 0;
+		pendingWorkInTurn = false;
 	}
 
 	function updateUi(ctx: ExtensionContext): void {
@@ -246,23 +318,44 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	}
 
 	function promptForGoal(): string {
+		const phase = goalPhase(state);
 		const plan =
 			state.plan.length > 0
-				? `\nCurrent designed plan:\n${state.plan.map((item, i) => `${i + 1}. ${item}`).join("\n")}`
-				: "";
+				? `\n\nRecorded plan:\n${state.plan.map((item, i) => `${i + 1}. ${item}`).join("\n")}`
+				: "\n\nRecorded plan: (required; not yet set)";
+		const criteria =
+			state.acceptanceCriteria.length > 0
+				? `\n\nAcceptance criteria:\n${state.acceptanceCriteria
+						.map(
+							(criterion) =>
+								`- ${criterion.id} [${criterion.verified ? "VERIFIED" : "UNVERIFIED"}] ${criterion.description}${criterion.evidence ? ` — evidence: ${criterion.evidence}` : ""}`,
+						)
+						.join("\n")}`
+				: "\n\nAcceptance criteria: (required; not yet set)";
 		const feedback =
 			state.feedback && state.feedback.trim()
-				? `\n\nLatest user feedback (address this first, then continue the goal):\n${state.feedback.trim()}`
+				? `\n\nLatest user feedback (address this first, revise the plan/criteria if needed, then continue):\n${state.feedback.trim()}`
 				: "";
-		return `[GOAL MODE ACTIVE — iteration ${state.iterations}/${state.maxIterations}]\n\nOriginal goal:\n${state.goal}${plan}${feedback}\n\nWork autonomously toward this goal. On the first pass, design a concrete plan and explicit, verifiable success criteria. Then execute the plan using the available tools and verify each criterion yourself. Do not stop merely because you have a plan or because one step succeeded. A user message during the goal is feedback: incorporate it and keep going. If information is genuinely required from the user, use the question tool instead of writing a question in prose. When every criterion is verified, call goal_complete with a concise summary and concrete evidence. Never call goal_complete speculatively. If blocked, explain the blocker and the next useful action rather than claiming success.`;
+		const lifecycle =
+			phase === "planning"
+				? "You are in PLANNING. Your first required action is to call goal_set_plan with a concrete ordered plan AND distinct, observable acceptance criteria. Until both are recorded, no implementation or research tools may be used; ask the user with the question tool only if genuinely necessary. After planning, continue in a later goal iteration."
+				: phase === "execution"
+					? "You are in EXECUTION. Work through the plan in iterations, using tools and checking results. Do not claim a criterion is met without checking it. After at least one subsequent work iteration that uses a non-lifecycle tool, call goal_verify once per criterion with concrete evidence. Revise the plan/criteria with goal_set_plan if feedback changes the requirements."
+					: "You are in VERIFICATION. Every criterion has recorded evidence; review that evidence against the criteria and call goal_complete only if it truly supports every one.";
+		return `[GOAL MODE ACTIVE — phase ${phase} — iteration ${state.iterations}/${state.maxIterations}]\n\nOriginal goal:\n${state.goal}${plan}${criteria}${feedback}\n\n${lifecycle} A user message during the goal is feedback, not a new request: incorporate it and keep working. If information is genuinely required from the user, use the question tool. goal_complete is the sole completion path; prose markers never complete a goal. If blocked, explain the blocker and the next useful action rather than claiming success.`;
 	}
 
 	function kickoffPrompt(): string {
-		return "Begin working on the active goal. Design the plan and success criteria, then take the first useful action.";
+		return "Start in planning phase: call goal_set_plan to record an actionable plan and explicit acceptance criteria before using any other tools. Continue working through later goal iterations until every criterion is verified.";
 	}
 
 	function continuationPrompt(): string {
-		return `Continue working on the active goal. Review the goal, your designed success criteria, and the latest tool results. Take the next useful action now; do not provide a stopping summary until the goal is verified. When all criteria pass, call goal_complete.`;
+		const phase = goalPhase(state);
+		if (phase === "planning")
+			return "The goal cannot proceed without a recorded plan and acceptance criteria. Call goal_set_plan now, then continue the goal.";
+		if (phase === "verification")
+			return "Review the evidence recorded for every acceptance criterion. If each is truly satisfied, call goal_complete; otherwise continue work and update verification only after checking.";
+		return "Continue the active goal through the next useful work iteration. Review the plan, outstanding criteria, feedback, and latest tool results; do not provide a stopping summary until all criteria have been checked and recorded with goal_verify.";
 	}
 
 	function isGoalGeneratedText(text: string): boolean {
@@ -289,10 +382,174 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.registerTool({
+		name: "goal_set_plan",
+		label: "Set Goal Plan",
+		description:
+			"Required first step in goal mode: record an actionable plan and explicit acceptance criteria before using work tools.",
+		promptGuidelines: [
+			"Call this before implementation or research tools while a goal is in planning phase.",
+			"Use distinct, observable criteria that can each be checked and evidenced.",
+		],
+		parameters: GoalPlanParams,
+		executionMode: "sequential",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (state.status !== "active") {
+				return {
+					content: [{ type: "text", text: `No active goal to plan (status: ${state.status}).` }],
+					details: { status: state.status },
+				};
+			}
+
+			const plan = normalizeItems(params.plan);
+			const descriptions = normalizeItems(params.acceptanceCriteria);
+			if (plan.length === 0 || descriptions.length === 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Goal plan rejected: provide at least one actionable plan step and one explicit acceptance criterion.",
+						},
+					],
+					details: { status: "active", phase: "planning" },
+					isError: true,
+				};
+			}
+
+			const unchanged =
+				JSON.stringify(plan) === JSON.stringify(state.plan) &&
+				JSON.stringify(descriptions) ===
+					JSON.stringify(state.acceptanceCriteria.map((criterion) => criterion.description));
+			if (!unchanged) {
+				state.plan = plan;
+				state.acceptanceCriteria = descriptions.map((description, index) => ({
+					id: `AC${index + 1}`,
+					description,
+					verified: false,
+					evidence: "",
+				}));
+				state.planSetIteration = state.iterations;
+				state.workIterationsAfterPlan = 0;
+				pendingWorkInTurn = false;
+			}
+			state.progress = unchanged
+				? "Plan and acceptance criteria already recorded; continue the next goal iteration"
+				: "Plan and acceptance criteria recorded; begin work in the next goal iteration";
+			persist();
+			updateUi(ctx);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Goal plan recorded (${plan.length} steps, ${descriptions.length} acceptance criteria).\n${descriptions.map((description, index) => `AC${index + 1}: ${description}`).join("\n")}`,
+					},
+				],
+				details: {
+					status: "active",
+					phase: goalPhase(state),
+					plan,
+					acceptanceCriteria: state.acceptanceCriteria,
+				},
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "goal_verify",
+		label: "Verify Goal Criterion",
+		description:
+			"Record concrete evidence that one acceptance criterion from the active goal has been checked and satisfied.",
+		promptGuidelines: [
+			"Verify criteria individually only after at least one subsequent work iteration has used a non-lifecycle tool.",
+			"Evidence must identify a concrete check, command, file, or observation; do not guess or mark unchecked criteria verified.",
+		],
+		parameters: GoalVerifyParams,
+		executionMode: "sequential",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (state.status !== "active") {
+				return {
+					content: [{ type: "text", text: `No active goal to verify (status: ${state.status}).` }],
+					details: { status: state.status },
+				};
+			}
+			if (goalPhase(state) === "planning") {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Cannot verify yet: record a plan and acceptance criteria with goal_set_plan first.",
+						},
+					],
+					details: { status: "active", phase: "planning" },
+					isError: true,
+				};
+			}
+			if (state.iterations <= state.planSetIteration || state.workIterationsAfterPlan < 1) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Cannot verify yet: complete at least one subsequent work iteration after the latest plan was recorded.",
+						},
+					],
+					details: { status: "active", phase: goalPhase(state), iterations: state.iterations },
+					isError: true,
+				};
+			}
+
+			const criterionId = typeof params.criterionId === "string" ? params.criterionId.trim() : "";
+			const evidence = typeof params.evidence === "string" ? params.evidence.trim().slice(0, 1000) : "";
+			if (!criterionId || !evidence) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Cannot verify a criterion without its id and non-empty concrete evidence.",
+						},
+					],
+					details: { status: "active" },
+					isError: true,
+				};
+			}
+			const criterionIndex = state.acceptanceCriteria.findIndex((criterion) => criterion.id === criterionId);
+			if (criterionIndex < 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Unknown acceptance criterion ${criterionId}. Use one of: ${state.acceptanceCriteria.map((criterion) => criterion.id).join(", ")}.`,
+						},
+					],
+					details: { status: "active", phase: goalPhase(state) },
+					isError: true,
+				};
+			}
+
+			state.acceptanceCriteria[criterionIndex] = {
+				...state.acceptanceCriteria[criterionIndex]!,
+				verified: true,
+				evidence,
+			};
+			state.progress =
+				goalPhase(state) === "verification"
+					? "All acceptance criteria have evidence; review it and call goal_complete if it proves the goal"
+					: `Recorded evidence for ${criterionId}; continue working on outstanding criteria`;
+			persist();
+			updateUi(ctx);
+			return {
+				content: [{ type: "text", text: `Recorded verification for ${criterionId}: ${evidence}` }],
+				details: {
+					status: "active",
+					phase: goalPhase(state),
+					criterion: state.acceptanceCriteria[criterionIndex],
+				},
+			};
+		},
+	});
+	pi.registerTool({
 		name: "goal_complete",
 		label: "Complete Goal",
 		description:
-			"Mark the active goal as complete only after every model-designed success criterion has been verified. Include concrete evidence.",
+			"Mark the active goal complete only after every recorded acceptance criterion has concrete evidence and at least one iteration followed the latest plan.",
 		promptGuidelines: [
 			"Use goal_complete only when the active goal is fully verified; do not use it to end a plan early.",
 		],
@@ -306,10 +563,22 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 				};
 			}
 
-			const summary = params.summary.trim();
+			const summary = typeof params.summary === "string" ? params.summary.trim() : "";
 			if (!summary) throw new Error("goal_complete requires a non-empty summary");
 
-			const evidence = (params.evidence ?? []).map((item) => item.trim()).filter(Boolean);
+			const blockedReason = completionBlockReason(state);
+			if (blockedReason) {
+				return {
+					content: [{ type: "text", text: `Goal completion blocked: ${blockedReason}` }],
+					details: { status: "active", phase: goalPhase(state), reason: blockedReason },
+					isError: true,
+				};
+			}
+
+			const evidence = [
+				...state.acceptanceCriteria.map((criterion) => `${criterion.id}: ${criterion.evidence}`),
+				...(params.evidence ?? []).map((item) => item.trim()).filter(Boolean),
+			];
 			completeGoal(summary, evidence, ctx);
 			ctx.ui.notify("Goal completed.", "info");
 
@@ -317,10 +586,10 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text",
-						text: `Goal completed: ${summary}${evidence.length ? `\nEvidence:\n- ${evidence.join("\n- ")}` : ""}`,
+						text: `Goal completed: ${summary}\nVerified acceptance criteria:\n- ${state.acceptanceCriteria.map((criterion) => `${criterion.id}: ${criterion.description} — ${criterion.evidence}`).join("\n- ")}${evidence.length > state.acceptanceCriteria.length ? `\nAdditional evidence:\n- ${evidence.slice(state.acceptanceCriteria.length).join("\n- ")}` : ""}`,
 					},
 				],
-				details: { status: "completed", summary, evidence },
+				details: { status: "completed", summary, evidence, acceptanceCriteria: state.acceptanceCriteria },
 				terminate: true,
 			};
 		},
@@ -350,7 +619,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 				"Goal mode lets pi work autonomously toward an objective you set.",
 				"",
 				"  /goal <objective>            start a goal (also creates a git checkpoint)",
-				"  /goal status                 show goal, progress, plan, and feedback",
+				"  /goal status                 show goal, phase, plan, criteria, and feedback",
 				"  /goal stop                   pause now and abort the current work",
 				"  /goal resume                 continue working toward the goal",
 				"  /goal feedback <text>        stop work, record your feedback, and resume",
@@ -378,8 +647,15 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 					state.plan.length > 0
 						? `\nPlan:\n${state.plan.map((item, i) => `${i + 1}. ${item}`).join("\n")}`
 						: "";
+				const criteria =
+					state.acceptanceCriteria.length > 0
+						? `\nAcceptance criteria:\n${state.acceptanceCriteria.map((criterion) => `- ${criterion.id} [${criterion.verified ? "VERIFIED" : "UNVERIFIED"}] ${criterion.description}${criterion.evidence ? ` — evidence: ${criterion.evidence}` : ""}`).join("\n")}`
+						: "\nAcceptance criteria: not yet recorded";
 				const feedback = state.feedback ? `\nLatest feedback: ${state.feedback}` : "";
-				ctx.ui.notify(`${statusText(state)}\n${state.goal}\n${state.progress}${feedback}${plan}`, "info");
+				ctx.ui.notify(
+					`${statusText(state)}\n${state.goal}\n${state.progress}${feedback}${plan}${criteria}`,
+					"info",
+				);
 			}
 			return;
 		}
@@ -416,6 +692,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			state.feedback = feedbackText;
 			state.progress = "Addressing your feedback";
 			state.iterations = 0;
+			requireReplanningAfterFeedback();
 			continuationQueued = false;
 			persist();
 			updateUi(ctx);
@@ -439,9 +716,9 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		}
 
 		if (command === "clear" || command === "reset") {
-			state = makeInitialState("");
-			state.status = "idle";
+			state = makeIdleState();
 			continuationQueued = false;
+			pendingWorkInTurn = false;
 			persist();
 			updateUi(ctx);
 			ctx.ui.notify("Goal state cleared.", "info");
@@ -476,6 +753,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		}
 		state = makeInitialState(input);
 		continuationQueued = false;
+		pendingWorkInTurn = false;
 		persist();
 		updateUi(ctx);
 		sendGoalPrompt(kickoffPrompt(), { triggerTurn: true });
@@ -515,6 +793,10 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		currentContext = ctx;
+		state = makeIdleState();
+		continuationQueued = false;
+		pendingWorkInTurn = false;
+		abortIntent = undefined;
 		const entry = [...ctx.sessionManager.getBranch()]
 			.reverse()
 			.find(
@@ -522,10 +804,23 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 					candidate.type === "custom" && (candidate as GoalStateEntry).customType === GOAL_STATE_TYPE,
 			) as GoalStateEntry | undefined;
 		if (entry?.data?.goal && entry.data.status !== "idle") {
+			const restored = entry.data;
+			const restoredIteration =
+				Number.isInteger(restored.planSetIteration) && restored.planSetIteration! >= 0
+					? restored.planSetIteration!
+					: 0;
 			state = {
 				...state,
-				...entry.data,
-				plan: [...(entry.data.plan ?? [])],
+				...restored,
+				plan: normalizeItems(restored.plan),
+				// Older persisted goals have no structured criteria, so they return to
+				// planning rather than being treated as implicitly verified.
+				acceptanceCriteria: normalizeRestoredCriteria(restored.acceptanceCriteria),
+				planSetIteration: restoredIteration,
+				workIterationsAfterPlan:
+					Number.isInteger(restored.workIterationsAfterPlan) && restored.workIterationsAfterPlan! >= 0
+						? restored.workIterationsAfterPlan!
+						: 0,
 			};
 		}
 		continuationQueued = false;
@@ -535,6 +830,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	pi.on("agent_start", (_event, ctx) => {
 		currentContext = ctx;
 		continuationQueued = false;
+		pendingWorkInTurn = false;
 		abortIntent = undefined;
 		updateUi(ctx);
 	});
@@ -557,6 +853,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			state.feedback = userPrompt;
 			state.progress = "Addressing your feedback";
 			state.iterations = 0;
+			requireReplanningAfterFeedback();
 			continuationQueued = false;
 			persist();
 			result.message = {
@@ -569,7 +866,11 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 
 		if (state.status === "active") {
 			// Any non-generated user message during the goal is feedback on it.
-			if (userPrompt && !isGenerated) state.feedback = userPrompt;
+			if (userPrompt && !isGenerated) {
+				state.feedback = userPrompt;
+				requireReplanningAfterFeedback();
+				persist();
+			}
 			result.message = {
 				customType: GOAL_CONTEXT_TYPE,
 				content: promptForGoal(),
@@ -614,11 +915,41 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		};
 	});
 
+	pi.on("tool_call", (event) => {
+		if (state.status !== "active" || event.toolName === "goal_set_plan" || event.toolName === "question") return;
+		if (goalPhase(state) === "planning") {
+			return {
+				block: true,
+				reason: "Goal mode requires a structured plan and explicit acceptance criteria via goal_set_plan before any work tools can run.",
+			};
+		}
+		if (event.toolName === "goal_verify") {
+			if (state.iterations <= state.planSetIteration || state.workIterationsAfterPlan < 1) {
+				return {
+					block: true,
+					reason: "Complete at least one subsequent work iteration after the latest plan before verifying criteria.",
+				};
+			}
+			return;
+		}
+	});
+
+	pi.on("tool_result", (event) => {
+		if (
+			state.status !== "active" ||
+			event.isError ||
+			goalPhase(state) === "planning" ||
+			state.iterations <= state.planSetIteration ||
+			["goal_set_plan", "goal_verify", "goal_complete", "question"].includes(event.toolName)
+		) {
+			return;
+		}
+		pendingWorkInTurn = true;
+	});
+
 	pi.on("turn_end", async (event, ctx) => {
 		if (state.status !== "active" || !isAssistantMessage(event.message)) return;
 		const text = textFromMessage(event.message);
-		const extracted = extractPlan(text);
-		if (state.plan.length === 0 && extracted.length > 0) state.plan = extracted;
 		if (text.trim()) state.progress = text.trim().replace(/\s+/g, " ").slice(-220);
 		persist();
 		updateUi(ctx);
@@ -629,15 +960,9 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 
 		const last = latestAssistant(event.messages);
 		const text = last ? textFromMessage(last) : "";
-		const extracted = extractPlan(text);
-		if (state.plan.length === 0 && extracted.length > 0) state.plan = extracted;
-
-		if (/\[GOAL_COMPLETE\]/i.test(text)) {
-			completeGoal(text.replace(/\[GOAL_COMPLETE\]/gi, "").trim(), [], ctx);
-			return;
-		}
 
 		if (last?.stopReason === "aborted") {
+			pendingWorkInTurn = false;
 			// An abort with a feedback-resume pending must not pause the goal
 			// again: the feedback turn is queued and about to start.
 			if (abortIntent === "feedback") {
@@ -653,6 +978,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		}
 
 		if (last?.stopReason === "error") {
+			pendingWorkInTurn = false;
 			abortIntent = undefined;
 			state.status = "paused";
 			state.progress = `Paused after error: ${text.slice(0, 120) || "unknown error"}`;
@@ -661,6 +987,9 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
+		if (pendingWorkInTurn) state.workIterationsAfterPlan += 1;
+		pendingWorkInTurn = false;
+		persist();
 		if (state.iterations >= state.maxIterations) {
 			state.status = "paused";
 			state.progress = `Iteration limit reached (${state.maxIterations}) — type feedback or /goal resume to continue`;
@@ -673,7 +1002,12 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		if (continuationQueued || ctx.hasPendingMessages()) return;
 
 		state.iterations += 1;
-		state.progress = "Continuing toward the next unverified criterion";
+		state.progress =
+			goalPhase(state) === "planning"
+				? "Waiting for a structured plan and acceptance criteria"
+				: goalPhase(state) === "verification"
+					? "Reviewing verified evidence before completion"
+					: "Continuing toward the next unverified criterion";
 		continuationQueued = true;
 		persist();
 		updateUi(ctx);
