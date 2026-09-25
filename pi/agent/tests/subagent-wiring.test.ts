@@ -110,6 +110,79 @@ describe("subagents extension wiring", () => {
 		expect([...pi.commands.keys()].sort()).toEqual(["subagent-model", "subagents"]);
 	});
 
+	test("accepts 20 simultaneous subagents and rejects a 21st task", async () => {
+		setSessionPreference({ model: "test/model", thinking: "off" });
+		const pi = fakePi();
+		(subagentsExtension as (api: unknown) => void)(pi.api);
+		const tool = pi.tools.get("subagent")!;
+		const parallelLimit = tool.parameters?.properties?.parallelLimit as { maximum?: number };
+		expect(parallelLimit.maximum).toBe(20);
+
+		let active = 0;
+		let peak = 0;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const provider = {
+			streamSimple: async () => {
+				active++;
+				peak = Math.max(peak, active);
+				await gate;
+				active--;
+				const message = {
+					role: "assistant", content: [{ type: "text", text: "done" }],
+					api: "openai-completions", provider: "test", model: "model",
+					usage: { input: 1, output: 1, totalTokens: 2, cost: { total: 0 } },
+					stopReason: "stop", timestamp: Date.now(),
+				};
+				const stream = (async function* () {
+					yield { type: "start", partial: message };
+					yield { type: "done", reason: "stop", message };
+				})();
+				(stream as any).result = () => message;
+				return stream;
+			},
+		};
+		const context = {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: {},
+			sessionManager: { getSessionId: () => "task-cap-test", getEntries: () => [] },
+			modelRegistry: {
+				getAvailable: () => [
+					{ provider: "test", id: "model", name: "Test", contextWindow: 1024, maxTokens: 1024 },
+				],
+				getProvider: () => provider,
+				getApiKeyForProvider: async () => undefined,
+			},
+		};
+		const tasks = Array.from({ length: 20 }, (_, index) => ({ task: `inspect ${index}` }));
+		const accepted = (await tool.execute!(
+			"cap-20", { tasks, parallelLimit: 20 }, new AbortController().signal, undefined, context,
+		)) as { content: Array<{ text?: string }>; isError?: boolean; details?: { groupId?: string } };
+		try {
+			expect(accepted.isError).not.toBe(true);
+			expect(accepted.content[0]?.text).toContain("with 20 subagent runs");
+			for (let attempt = 0; attempt < 100 && peak < 20; attempt++) {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			expect(peak).toBe(20);
+		} finally {
+			release();
+			if (peak !== 20 && accepted.details?.groupId) {
+				await pi.tools.get("subagent_cancel")!.execute!(
+					"cancel-cap-20", { groupId: accepted.details.groupId }, undefined, undefined, context,
+				);
+			}
+		}
+
+		const rejected = (await tool.execute!(
+			"cap-21", { tasks: [...tasks, { task: "one too many" }] },
+			new AbortController().signal, undefined, context,
+		)) as { content: Array<{ text?: string }>; isError?: boolean };
+		expect(rejected.isError).toBe(true);
+		expect(rejected.content[0]?.text).toContain("Too many parallel tasks (21). Max is 20.");
+	});
+
 	test("always launches without a wait tool or background opt-in", () => {
 		const pi = fakePi();
 		(subagentsExtension as (api: unknown) => void)(pi.api);

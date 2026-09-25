@@ -84,7 +84,8 @@ import { TOKEN_USAGE_EVENT } from "../token-tracker.ts";
 // ---------------------------------------------------------------------------
 
 const DEFAULT_CONCURRENCY = 1; // sequential by default
-const MAX_PARALLEL_TASKS = 8;
+const MAX_PARALLEL_TASKS = 20;
+const MAX_CONCURRENT_SUBAGENTS = 20;
 const PARENT_OUTPUT_CAP = 50 * 1024; // cap text returned or interjected into the parent LLM
 const RUN_ENTRY_TYPE = "subagent-run";
 const RUN_DETAIL_ENTRY_TYPE = "subagent-run-detail";
@@ -178,7 +179,7 @@ const SubagentParams = Type.Object({
 	parallelLimit: Type.Optional(
 		Type.Integer({
 			minimum: 1,
-			maximum: MAX_PARALLEL_TASKS,
+			maximum: MAX_CONCURRENT_SUBAGENTS,
 			description: "Max concurrent subagents (default 1 = sequential; use 2-4 for independent tasks)",
 		}),
 	),
@@ -298,7 +299,9 @@ function matchesPattern(model: { provider: string; id: string; name: string }, p
 	const p = pattern.trim();
 	if (!p) return false;
 	if (p.includes("/")) {
-		const [providerPart, idPart] = p.split("/", 2);
+		const separator = p.indexOf("/");
+		const providerPart = p.slice(0, separator);
+		const idPart = p.slice(separator + 1);
 		const providerOk = providerPart === "*" || model.provider === providerPart;
 		if (!providerOk) return false;
 		if (idPart === "*") return true;
@@ -1279,7 +1282,7 @@ export default function (pi: ExtensionAPI) {
 				// ---- Parallel mode ----
 				const concurrency = Math.max(
 					1,
-					Math.min(params.parallelLimit ?? DEFAULT_CONCURRENCY, MAX_PARALLEL_TASKS),
+					Math.min(params.parallelLimit ?? DEFAULT_CONCURRENCY, MAX_CONCURRENT_SUBAGENTS),
 				);
 				const results: SubagentRunResult[] = new Array(tasks.length);
 				let nextIndex = 0;

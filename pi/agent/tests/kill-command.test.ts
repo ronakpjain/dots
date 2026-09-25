@@ -96,6 +96,14 @@ describe("command-local cancellation", () => {
 		expect(registry.size).toBe(0);
 	});
 
+	test("registers the formatted Bash tool after an in-session reload", () => {
+		const runtime = testRuntime();
+		killCommandExtension(runtime.pi as never);
+		expect(runtime.tools.has("bash")).toBe(false);
+		runtime.handlers.get("before_agent_start")!({}, runtime.ctx);
+		expect(runtime.tools.get("bash")?.renderResult).toBeFunction();
+	});
+
 	test("kills a bash command while leaving the agent running", async () => {
 		const runtime = testRuntime();
 		killCommandExtension(runtime.pi as never);
@@ -125,17 +133,13 @@ describe("command-local cancellation", () => {
 		expect(callLines[0]?.trimStart().startsWith("$ ")).toBe(true);
 		expect(plainCall).toContain("echo ready");
 		expect(call).not.toBe(plainCall);
-		const styledTheme = { ...theme, bg: (color: string, text: string) => `[${color}]${text}` };
-		const completedCall = tool.renderCall!(renderContext.args, styledTheme, { ...renderContext, isPartial: false, isError: false });
-		expect(completedCall.render(80)[0]).toContain("[toolSuccessBg]");
-		const collapsed = tool.renderResult!(
+		const collapsedLines = tool.renderResult!(
 			{ content: [{ type: "text", text: "secret stdout value" }], details: {} },
 			{ expanded: false, isPartial: false },
 			theme,
 			{ ...renderContext, isError: false, invalidate: () => {} },
-		)
-			.render(80)
-			.join(" ");
+		).render(80);
+		const collapsed = collapsedLines.join(" ");
 		expect(collapsed).toContain("Command completed");
 		expect(collapsed).toContain("Took ");
 		expect(collapsed).not.toContain("\\nTook");

@@ -4,7 +4,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Box, Container, Text } from "@earendil-works/pi-tui";
+import { matchesKey, Container, Text } from "@earendil-works/pi-tui";
 import { sanitizeToolOutput } from "./tool-results/format.ts";
 import { renderToolResult } from "./tool-results/render.ts";
 
@@ -139,12 +139,19 @@ export default function killCommandExtension(pi: ExtensionAPI): void {
 			});
 		}
 
+		registerBashTool(ctx);
+	});
+
+	// A reload can replace extensions without starting a new session. Re-register
+	// before each turn so the built-in Bash renderer cannot take over that session.
+	pi.on("before_agent_start", (_event, ctx) => registerBashTool(ctx));
+
+	function registerBashTool(ctx: ExtensionContext): void {
 		if (!pi.getActiveTools().includes("bash")) return;
 
 		const bashTool = createBashToolDefinition(ctx.cwd);
 		pi.registerTool({
 			...bashTool,
-			renderShell: "self",
 			renderCall(args, theme, context) {
 				if (context.executionStarted && context.state.startedAt === undefined) {
 					context.state.startedAt = Date.now();
@@ -157,10 +164,7 @@ export default function killCommandExtension(pi: ExtensionAPI): void {
 				const timeout = typeof args.timeout === "number" && args.timeout > 0
 					? theme.fg("muted", ` (timeout ${args.timeout}s)`)
 					: "";
-				const background = context.isPartial ? "toolPendingBg" : context.isError ? "toolErrorBg" : "toolSuccessBg";
-				const box = new Box(0, 0, (text) => theme.bg(background, text));
-				box.addChild(new Text(theme.fg("toolTitle", theme.bold("$ ")) + highlighted + truncated + timeout, 0, 0));
-				return box;
+				return new Text(theme.fg("toolTitle", theme.bold("$ ")) + highlighted + truncated + timeout, 0, 0);
 			},
 			renderResult(result, options, theme, context) {
 				const state = context.state;
@@ -185,10 +189,7 @@ export default function killCommandExtension(pi: ExtensionAPI): void {
 					const label = options.isPartial ? "Elapsed" : "Took";
 					container.addChild(new Text(theme.fg("muted", `${label} ${formatDuration(endTime - state.startedAt)}`), 0, 0));
 				}
-				const background = context.isPartial ? "toolPendingBg" : context.isError ? "toolErrorBg" : "toolSuccessBg";
-				const box = new Box(0, 0, (text) => theme.bg(background, text));
-				box.addChild(container);
-				return box;
+				return container;
 			},
 			async execute(toolCallId, params, signal, onUpdate, toolCtx) {
 				const running = commandRegistry.start(toolCallId, params.command);
@@ -207,7 +208,7 @@ export default function killCommandExtension(pi: ExtensionAPI): void {
 				}
 			},
 		});
-	});
+	}
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		removeTerminalInputListener?.();

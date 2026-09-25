@@ -13,7 +13,9 @@
     "openai-codex/gpt-6-astra",
     "openrouter/deepseek/deepseek-v4.1-flash",
     "openai-codex/gpt-6-luna",
-    "openai-codex/gpt-6-sol"
+    "openai-codex/gpt-6-sol",
+    "openrouter/z-ai/glm-5.3-flash",
+    "openrouter/meta/muse-spark-1.3-contributor"
   ],
   "tuiMode": "fullscreen"
 }
