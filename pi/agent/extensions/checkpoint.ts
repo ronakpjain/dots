@@ -7,6 +7,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 const CHECKPOINT_ENTRY = "git-checkpoint";
 const CHECKPOINT_CAPABILITY =
 	"[CHECKPOINT CAPABILITY] A Git checkpoint is created before a new /goal. Use /checkpoint to snapshot current work and /rollback to restore a checkpoint after confirmation.";
+const GIT_WORKFLOW_CAPABILITY =
+	"[GIT WORKFLOW CAPABILITY] After completing a major, coherent change—and before moving to a different task or starting the next major change—run the relevant checks and create a focused Git commit. First inspect git status and the diff, stage only files changed for this work, never include pre-existing unrelated user changes, and follow the repository's recent commit-message style. If a commit is blocked or inappropriate (for example, there is no Git repository or the user prohibited commits), pause and explain instead of silently moving on.";
 const CHECKPOINT_VERSION = 1;
 
 type CheckpointManifest = {
@@ -226,7 +228,7 @@ function latestSessionEntry(ctx: ExtensionContext): string | undefined {
 
 export default function checkpointExtension(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${CHECKPOINT_CAPABILITY}`,
+		systemPrompt: `${event.systemPrompt}\n\n${CHECKPOINT_CAPABILITY}\n\n${GIT_WORKFLOW_CAPABILITY}`,
 	}));
 
 	pi.registerCommand("checkpoint", {
