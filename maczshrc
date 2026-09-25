@@ -178,20 +178,8 @@ openclose() {
   exit
 }
 
-# Terminal title
-autoload -Uz add-zsh-hook
-
-set_term_title() {
-  print -Pn "\e]2;%n@%m:%~\a"
-}
-
-set_term_title_preexec() {
-  local cmd="${1[(wr)^(*=*|sudo|ssh|mosh|rake|-*)]:gs/%/%%}"
-  print -Pn "\e]2;$cmd\a"
-}
-
-add-zsh-hook precmd set_term_title
-add-zsh-hook preexec set_term_title_preexec
+# Ghostty's OSC-title hooks and optional native foreground-process monitor.
+[[ -r "$HOME/.config/ghostty/title.zsh" ]] && source "$HOME/.config/ghostty/title.zsh"
 
 # -----------------------------------------------------------------------------
 # Theme (alanpeabody)
