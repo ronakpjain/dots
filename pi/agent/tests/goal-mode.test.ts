@@ -1,5 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import goalModeExtension from "../extensions/goal-mode.ts";
+import goalModeExtension, { createGoalModeExtension } from "../extensions/goal-mode.ts";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+
+type CheckpointFactory = (pi: any, cwd: string, label?: string) => Promise<any>;
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
 
 const goalState = (overrides: Record<string, unknown> = {}) => ({
 	goal: "Implement the feature",
@@ -12,13 +25,15 @@ const goalState = (overrides: Record<string, unknown> = {}) => ({
 	...overrides,
 });
 
-function runtime(initialState = goalState()) {
+function runtime(initialState = goalState(), resumeRestoredGoal = true, checkpointFactory?: CheckpointFactory) {
 	const handlers = new Map<string, (event: any, ctx: any) => unknown>();
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	const entries: any[] = [{ type: "custom", customType: "goal-mode-state", data: initialState }];
 	const sentMessages: any[] = [];
 	const notifications: string[] = [];
+	const widgets = new Map<string, any>();
+	let abortCalls = 0;
 	const pi = {
 		on(name: string, handler: (event: any, ctx: any) => unknown) {
 			handlers.set(name, handler);
@@ -44,17 +59,26 @@ function runtime(initialState = goalState()) {
 		hasUI: false,
 		ui: {
 			setStatus() {},
-			setWidget() {},
+			setWidget(name: string, widget: any) {
+				if (widget === undefined) widgets.delete(name);
+				else widgets.set(name, widget);
+			},
 			notify(message: string) {
 				notifications.push(message);
 			},
 		},
 		sessionManager: { getBranch: () => entries },
 		hasPendingMessages: () => false,
-		abort() {},
+		abort() {
+			abortCalls += 1;
+		},
 	};
-	goalModeExtension(pi as any);
-	handlers.get("session_start")?.({}, ctx);
+	(checkpointFactory ? createGoalModeExtension(checkpointFactory as any) : goalModeExtension)(pi as any);
+	handlers.get("session_start")?.({ reason: "startup" }, ctx);
+	if (resumeRestoredGoal && (initialState as any).status === "active") {
+		void commands.get("goal").handler("resume", ctx);
+		sentMessages.length = 0;
+	}
 
 	const latestState = () => {
 		const entry = [...entries].reverse().find((item) => item.customType === "goal-mode-state");
@@ -62,7 +86,19 @@ function runtime(initialState = goalState()) {
 	};
 	const execute = (name: string, params: any) =>
 		tools.get(name).execute!("test-call", params, undefined, undefined, ctx);
-	return { handlers, tools, commands, entries, sentMessages, notifications, ctx, execute, latestState };
+	return {
+		handlers,
+		tools,
+		commands,
+		entries,
+		sentMessages,
+		notifications,
+		widgets,
+		ctx,
+		execute,
+		latestState,
+		getAbortCalls: () => abortCalls,
+	};
 }
 
 const plan = {
@@ -95,14 +131,23 @@ describe("goal mode lifecycle enforcement", () => {
 	test("can verify and complete across tool turns without ending the agent run", async () => {
 		const rt = runtime();
 		await rt.execute("goal_set_plan", plan);
-		await rt.handlers.get("turn_end")!({
-			message: { role: "assistant", content: [], stopReason: "toolUse" },
-		}, rt.ctx);
+		await rt.handlers.get("tool_result")!({ toolName: "goal_set_plan", isError: false }, rt.ctx);
+		await rt.handlers.get("turn_end")!(
+			{
+				message: { role: "assistant", content: [], stopReason: "toolUse" },
+			},
+			rt.ctx,
+		);
+		expect(rt.latestState().iterations).toBe(1);
+		expect(rt.latestState().workIterationsAfterPlan).toBe(0);
 		await rt.handlers.get("tool_result")!({ toolName: "bash", isError: false }, rt.ctx);
 		expect((await rt.execute("goal_verify", { criterionId: "AC1", evidence: "checked" })).isError).toBe(true);
-		await rt.handlers.get("turn_end")!({
-			message: { role: "assistant", content: [], stopReason: "toolUse" },
-		}, rt.ctx);
+		await rt.handlers.get("turn_end")!(
+			{
+				message: { role: "assistant", content: [], stopReason: "toolUse" },
+			},
+			rt.ctx,
+		);
 		expect(rt.latestState().workIterationsAfterPlan).toBe(1);
 		for (const criterionId of ["AC1", "AC2"]) {
 			expect((await rt.execute("goal_verify", { criterionId, evidence: "Tests passed" })).isError).not.toBe(true);
@@ -291,6 +336,163 @@ describe("goal mode lifecycle enforcement", () => {
 		expect(paused.latestState().plan).toEqual([]);
 		expect(paused.latestState().acceptanceCriteria).toEqual([]);
 		expect(paused.latestState().status).toBe("active");
+	});
+
+	test("restores active goals paused and resumes them without discarding verified work", async () => {
+		const restoredCriteria = [
+			{ id: "AC1", description: "Checks pass", verified: true, evidence: "bun test passed" },
+		];
+		const rt = runtime(
+			goalState({
+				plan: ["Run checks"],
+				acceptanceCriteria: restoredCriteria,
+				iterations: 3,
+				planSetIteration: 1,
+				workIterationsAfterPlan: 2,
+			}),
+			false,
+		);
+
+		expect(rt.latestState().status).toBe("paused");
+		expect(rt.latestState().progress).toContain("/goal resume");
+		expect(rt.latestState().acceptanceCriteria).toEqual(restoredCriteria);
+
+		await rt.commands.get("goal").handler("resume", rt.ctx);
+		expect(rt.latestState().status).toBe("active");
+		expect(rt.latestState().plan).toEqual(["Run checks"]);
+		expect(rt.latestState().acceptanceCriteria).toEqual(restoredCriteria);
+		expect(rt.latestState().workIterationsAfterPlan).toBe(2);
+	});
+
+	test("clear aborts an active goal and a second goal cannot replace it implicitly", async () => {
+		const rt = runtime();
+
+		await rt.commands.get("goal").handler("New objective", rt.ctx);
+		expect(rt.latestState().goal).toBe("Implement the feature");
+		expect(rt.latestState().status).toBe("active");
+		expect(rt.getAbortCalls()).toBe(0);
+
+		await rt.commands.get("goal").handler("clear", rt.ctx);
+		expect(rt.getAbortCalls()).toBe(1);
+		expect(rt.latestState().status).toBe("idle");
+		await rt.handlers.get("agent_end")!(
+			{ messages: [{ role: "assistant", content: [], stopReason: "aborted" }] },
+			rt.ctx,
+		);
+		expect(rt.latestState().status).toBe("idle");
+	});
+
+	test("wraps long goal and every acceptance criterion within the widget width", () => {
+		const goal = "Make the goal indicator readable by wrapping its full objective instead of clipping long text";
+		const criteria = [
+			"The first acceptance criterion has a long description that should wrap across multiple terminal lines without losing its ending",
+			"The second acceptance criterion also remains entirely visible when the widget is rendered at a narrow width",
+		];
+		const rt = runtime(
+			goalState({
+				goal,
+				acceptanceCriteria: criteria.map((description, index) => ({
+					id: `AC${index + 1}`,
+					description,
+					verified: false,
+					evidence: "",
+				})),
+			}),
+		);
+		const widgetFactory = rt.widgets.get("goal-mode");
+		for (const width of [8, 12, 36]) {
+			const rendered = widgetFactory(null, { fg: (_color: string, text: string) => text }).render(width);
+			const flattened = stripTerminalSequences(rendered.join("")).replace(/\s+/g, "");
+
+			expect(rendered.length).toBeGreaterThan(8);
+			expect(rendered.every((line: string) => visibleWidth(line) <= width)).toBe(true);
+			expect(flattened).toContain(goal.replace(/\s+/g, ""));
+			for (const criterion of criteria) expect(flattened).toContain(criterion.replace(/\s+/g, ""));
+		}
+	});
+
+	test("clear invalidates pending and overlapping goal starts", async () => {
+		const rt = runtime(goalState({ goal: "", status: "idle" }), false);
+		let releaseWait!: () => void;
+		let waitCalls = 0;
+		(rt.ctx as any).waitForIdle = () => {
+			waitCalls += 1;
+			return new Promise<void>((resolve) => {
+				releaseWait = resolve;
+			});
+		};
+
+		const firstStart = rt.commands.get("goal").handler("First objective", rt.ctx);
+		expect(waitCalls).toBe(1);
+		await rt.commands.get("goal").handler("Second objective", rt.ctx);
+		expect(waitCalls).toBe(1);
+		expect(rt.notifications.at(-1)).toContain("already in progress");
+		await rt.commands.get("goal").handler("clear", rt.ctx);
+		releaseWait();
+		await firstStart;
+
+		expect(rt.latestState().status).toBe("idle");
+		expect(rt.latestState().goal).toBe("");
+	});
+
+	test("checkpoint completion or failure cannot revive a cleared goal or unlock a replacement", async () => {
+		for (const rejectOldCheckpoint of [false, true]) {
+			const oldCheckpoint = deferred<any>();
+			const replacementCheckpoint = deferred<any>();
+			let checkpointCalls = 0;
+			const rt = runtime(goalState({ goal: "", status: "idle" }), false, async () => {
+				checkpointCalls += 1;
+				return checkpointCalls === 1 ? oldCheckpoint.promise : replacementCheckpoint.promise;
+			});
+			const checkpoint = (id: string) => ({
+				id,
+				label: "goal-start",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				repoRoot: "/repo",
+				head: "head",
+				branch: "main",
+			});
+
+			const staleStart = rt.commands.get("goal").handler("Stale objective", rt.ctx);
+			expect(checkpointCalls).toBe(1);
+			await rt.commands.get("goal").handler("clear", rt.ctx);
+			const replacementStart = rt.commands.get("goal").handler("Replacement objective", rt.ctx);
+			expect(checkpointCalls).toBe(2);
+
+			if (rejectOldCheckpoint) oldCheckpoint.reject(new Error("stale checkpoint failed"));
+			else oldCheckpoint.resolve(checkpoint("stale"));
+			await staleStart;
+			expect(rt.latestState().status).toBe("idle");
+			expect(rt.entries.filter((entry) => entry.customType === "git-checkpoint")).toHaveLength(0);
+
+			await rt.commands.get("goal").handler("Another objective", rt.ctx);
+			expect(checkpointCalls).toBe(2);
+			expect(rt.notifications.at(-1)).toContain("already in progress");
+
+			replacementCheckpoint.resolve(checkpoint("replacement"));
+			await replacementStart;
+			expect(rt.latestState().status).toBe("active");
+			expect(rt.latestState().goal).toBe("Replacement objective");
+			expect(rt.entries.filter((entry) => entry.customType === "git-checkpoint")).toMatchObject([
+				{ data: { id: "replacement" } },
+			]);
+		}
+	});
+
+	test("feedback-triggered abort leaves the queued feedback resume active", async () => {
+		const rt = runtime();
+		await rt.commands.get("goal").handler("feedback keep working on the original objective", rt.ctx);
+		expect(rt.getAbortCalls()).toBe(1);
+		expect(rt.latestState().status).toBe("active");
+		expect(rt.latestState().plan).toEqual([]);
+
+		await rt.handlers.get("agent_end")!(
+			{ messages: [{ role: "assistant", content: [], stopReason: "aborted" }] },
+			rt.ctx,
+		);
+		expect(rt.latestState().status).toBe("active");
+		await rt.handlers.get("agent_start")!({}, rt.ctx);
+		expect(rt.latestState().status).toBe("active");
 	});
 
 	test("resets goal state when a new session has no active goal", async () => {

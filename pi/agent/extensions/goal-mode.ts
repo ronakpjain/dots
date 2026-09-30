@@ -1,6 +1,6 @@
 import { createGitCheckpoint } from "./checkpoint.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { renderToolResult } from "./tool-results/render.ts";
 
@@ -104,7 +104,7 @@ function textFromMessage(message: unknown): string {
 		.join("\n");
 }
 
-function isAssistantMessage(message: unknown): boolean {
+function isAssistantMessage(message: unknown): message is GoalMessage & { role: "assistant" } {
 	return (message as GoalMessage).role === "assistant";
 }
 
@@ -220,33 +220,50 @@ function goalWidget(ctx: ExtensionContext, getState: () => GoalState): void {
 			const lines = [
 				theme.fg(
 					state.status === "completed" ? "success" : state.status === "paused" ? "warning" : "accent",
-					heading,
+					truncateToWidth(heading, limit, ""),
 				),
-				theme.fg("text", `  ${compactUiText(state.goal)}`),
-				theme.fg("muted", `  ${compactUiText(state.progress)}`),
 			];
 
-			if (state.feedback) {
-				lines.push(theme.fg("warning", `  ↳ feedback: ${compactUiText(state.feedback)}`));
-			}
+			const addWrapped = (
+				color: "text" | "muted" | "warning" | "success" | "dim",
+				value: string,
+				prefix: string,
+			): void => {
+				const text = compactUiText(value);
+				if (!text) return;
+				const prefixWidth = visibleWidth(prefix);
+				const minContentWidth = Math.min(12, Math.max(1, Math.ceil(limit / 2)));
+				if (limit - prefixWidth < minContentWidth) {
+					const label = prefix.trim();
+					if (label && visibleWidth(label) <= limit) lines.push(theme.fg(color, label));
+					for (const line of wrapTextWithAnsi(text, limit)) lines.push(theme.fg(color, line));
+					return;
+				}
+				const wrapped = wrapTextWithAnsi(text, limit - prefixWidth);
+				for (let index = 0; index < wrapped.length; index++) {
+					const linePrefix = index === 0 ? prefix : " ".repeat(prefixWidth);
+					lines.push(theme.fg(color, `${linePrefix}${wrapped[index]}`));
+				}
+			};
+
+			addWrapped("text", state.goal, "  goal: ");
+			addWrapped("muted", state.progress, "  progress: ");
+			if (state.feedback) addWrapped("warning", state.feedback, "  ↳ feedback: ");
 
 			if (state.plan.length > 0) {
-				const plan = state.plan
-					.slice(0, 3)
-					.map((item, index) => `${index + 1}. ${compactUiText(item)}`)
-					.join("  ·  ");
-				lines.push(theme.fg("dim", "  plan: ") + plan);
+				addWrapped("dim", `${state.plan.length} steps (full plan: /goal status)`, "  plan: ");
 			}
 			if (state.acceptanceCriteria.length > 0) {
 				const verified = state.acceptanceCriteria.filter((criterion) => criterion.verified).length;
-				const criteria = state.acceptanceCriteria
-					.slice(0, 3)
-					.map(
-						(criterion) =>
-							`${criterion.id} ${criterion.verified ? "✓" : "○"}: ${compactUiText(criterion.description)}`,
-					)
-					.join("  ·  ");
-				lines.push(theme.fg("dim", `  criteria ${verified}/${state.acceptanceCriteria.length}: `) + criteria);
+				lines.push(theme.fg("dim", `  criteria ${verified}/${state.acceptanceCriteria.length}:`));
+				for (const criterion of state.acceptanceCriteria) {
+					const mark = criterion.verified ? "✓" : "○";
+					addWrapped(
+						criterion.verified ? "success" : "text",
+						criterion.description,
+						`  ${criterion.id} ${mark}: `,
+					);
+				}
 			}
 
 			const hint =
@@ -255,22 +272,24 @@ function goalWidget(ctx: ExtensionContext, getState: () => GoalState): void {
 					: state.status === "active"
 						? "type to give feedback · ^G pause · /goal status"
 						: "";
-			if (hint) lines.push(theme.fg("dim", `  ${hint}`));
+			if (hint) addWrapped("dim", hint, "  ");
 
-			// Use an empty ellipsis so every returned entry is strictly bounded by
-			// width without adding another wide glyph at the terminal edge.
+			// Every widget entry is one line; long fields are wrapped above instead
+			// of being clipped at the terminal edge.
 			return lines.map((line) => truncateToWidth(line, limit, ""));
 		},
 		invalidate() {},
 	}));
 }
 
-export default function goalModeExtension(pi: ExtensionAPI): void {
+function goalModeExtensionWithCheckpoint(pi: ExtensionAPI, checkpointFactory: typeof createGitCheckpoint): void {
 	let state: GoalState = makeIdleState();
 	let currentContext: ExtensionContext | undefined;
 	let continuationQueued = false;
 	let pendingWorkInTurn = false;
 	let goalWidgetInstalled = false;
+	let goalStartGeneration = 0;
+	let goalStartPending = false;
 	/** Why the current run was aborted: a user pause, or a feedback-resume.
 	 *  Lets agent_end(aborted) avoid pausing a goal that was just resumed
 	 *  with feedback. */
@@ -716,47 +735,75 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		}
 
 		if (command === "clear" || command === "reset") {
+			const abortCurrentRun = state.status === "active";
+			goalStartGeneration += 1;
+			goalStartPending = false;
 			state = makeIdleState();
 			continuationQueued = false;
 			pendingWorkInTurn = false;
+			abortIntent = undefined;
 			persist();
+			if (abortCurrentRun) ctx.abort();
 			updateUi(ctx);
 			ctx.ui.notify("Goal state cleared.", "info");
 			return;
 		}
 
-		if (typeof ctx.waitForIdle === "function") await ctx.waitForIdle();
+		if (goalStartPending) {
+			ctx.ui.notify("A goal start is already in progress.", "warning");
+			return;
+		}
+		if (state.status === "active" || state.status === "paused") {
+			ctx.ui.notify(
+				"A goal is already active or paused. Run /goal clear before starting another goal.",
+				"warning",
+			);
+			return;
+		}
+
+		const startGeneration = ++goalStartGeneration;
+		goalStartPending = true;
 		try {
-			const checkpoint = await createGitCheckpoint(pi, ctx.cwd, "goal-start");
-			pi.appendEntry("git-checkpoint", {
-				id: checkpoint.id,
-				label: checkpoint.label,
-				createdAt: checkpoint.createdAt,
-				repoRoot: checkpoint.repoRoot,
-				head: checkpoint.head,
-				branch: checkpoint.branch,
-			});
-			ctx.ui.notify(`Git checkpoint created before goal: ${checkpoint.id}`, "info");
-		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			if (/not a git repository/i.test(detail)) {
-				ctx.ui.notify("No Git repository found; starting goal without a checkpoint.", "warning");
-			} else {
-				ctx.ui.notify(`Goal not started because the Git checkpoint failed: ${detail}`, "error");
-				return;
+			if (typeof ctx.waitForIdle === "function") await ctx.waitForIdle();
+			if (startGeneration !== goalStartGeneration) return;
+			try {
+				const checkpoint = await checkpointFactory(pi, ctx.cwd, "goal-start");
+				if (startGeneration !== goalStartGeneration) return;
+				pi.appendEntry("git-checkpoint", {
+					id: checkpoint.id,
+					label: checkpoint.label,
+					createdAt: checkpoint.createdAt,
+					repoRoot: checkpoint.repoRoot,
+					head: checkpoint.head,
+					branch: checkpoint.branch,
+				});
+				ctx.ui.notify(`Git checkpoint created before goal: ${checkpoint.id}`, "info");
+			} catch (error) {
+				if (startGeneration !== goalStartGeneration) return;
+				const detail = error instanceof Error ? error.message : String(error);
+				if (/not a git repository/i.test(detail)) {
+					ctx.ui.notify("No Git repository found; starting goal without a checkpoint.", "warning");
+				} else {
+					ctx.ui.notify(`Goal not started because the Git checkpoint failed: ${detail}`, "error");
+					return;
+				}
 			}
+			if (startGeneration !== goalStartGeneration) return;
+			if (!pi.getSessionName()) {
+				const goalName = compactUiText(input);
+				const suffix = goalName.length > 70 ? `${goalName.slice(0, 69).trimEnd()}…` : goalName;
+				if (suffix) pi.setSessionName(`Goal: ${suffix}`);
+			}
+			state = makeInitialState(input);
+			continuationQueued = false;
+			pendingWorkInTurn = false;
+			abortIntent = undefined;
+			persist();
+			updateUi(ctx);
+			sendGoalPrompt(kickoffPrompt(), { triggerTurn: true });
+		} finally {
+			if (startGeneration === goalStartGeneration) goalStartPending = false;
 		}
-		if (!pi.getSessionName()) {
-			const goalName = compactUiText(input);
-			const suffix = goalName.length > 70 ? `${goalName.slice(0, 69).trimEnd()}…` : goalName;
-			if (suffix) pi.setSessionName(`Goal: ${suffix}`);
-		}
-		state = makeInitialState(input);
-		continuationQueued = false;
-		pendingWorkInTurn = false;
-		persist();
-		updateUi(ctx);
-		sendGoalPrompt(kickoffPrompt(), { triggerTurn: true });
 	};
 
 	pi.registerCommand("goal", {
@@ -793,6 +840,8 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		currentContext = ctx;
+		goalStartGeneration += 1;
+		goalStartPending = false;
 		state = makeIdleState();
 		continuationQueued = false;
 		pendingWorkInTurn = false;
@@ -822,6 +871,11 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 						? restored.workIterationsAfterPlan!
 						: 0,
 			};
+			if (state.status === "active") {
+				state.status = "paused";
+				state.progress = "Paused after session restore — use /goal resume to continue";
+				persist();
+			}
 		}
 		continuationQueued = false;
 		updateUi(ctx);
@@ -948,8 +1002,9 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
-		if (state.status !== "active" || !isAssistantMessage(event.message)) return;
-		if (event.message.stopReason === "aborted" || event.message.stopReason === "error") {
+		const message = event.message as GoalMessage;
+		if (state.status !== "active" || message.role !== "assistant") return;
+		if (message.stopReason === "aborted" || message.stopReason === "error") {
 			pendingWorkInTurn = false;
 			return;
 		}
@@ -961,7 +1016,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		if (goalPhase(state) !== "planning" && state.iterations <= state.planSetIteration) {
 			state.iterations = state.planSetIteration + 1;
 		}
-		const text = textFromMessage(event.message);
+		const text = textFromMessage(message);
 		if (text.trim()) state.progress = text.trim().replace(/\s+/g, " ").slice(-220);
 		persist();
 		updateUi(ctx);
@@ -1027,6 +1082,8 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		goalStartGeneration += 1;
+		goalStartPending = false;
 		if (state.status === "active") persist();
 		ctx.ui.setStatus("goal-mode", undefined);
 		ctx.ui.setWidget("goal-mode", undefined);
@@ -1035,4 +1092,14 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	});
 
 	void currentContext;
+}
+
+export function createGoalModeExtension(
+	checkpointFactory: typeof createGitCheckpoint = createGitCheckpoint,
+): (pi: ExtensionAPI) => void {
+	return (pi) => goalModeExtensionWithCheckpoint(pi, checkpointFactory);
+}
+
+export default function goalModeExtension(pi: ExtensionAPI): void {
+	goalModeExtensionWithCheckpoint(pi, createGitCheckpoint);
 }
