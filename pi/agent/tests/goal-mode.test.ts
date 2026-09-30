@@ -92,6 +92,35 @@ async function finishOneIteration(rt: ReturnType<typeof runtime>, text = "Contin
 }
 
 describe("goal mode lifecycle enforcement", () => {
+	test("can verify and complete across tool turns without ending the agent run", async () => {
+		const rt = runtime();
+		await rt.execute("goal_set_plan", plan);
+		await rt.handlers.get("turn_end")!({
+			message: { role: "assistant", content: [], stopReason: "toolUse" },
+		}, rt.ctx);
+		await rt.handlers.get("tool_result")!({ toolName: "bash", isError: false }, rt.ctx);
+		expect((await rt.execute("goal_verify", { criterionId: "AC1", evidence: "checked" })).isError).toBe(true);
+		await rt.handlers.get("turn_end")!({
+			message: { role: "assistant", content: [], stopReason: "toolUse" },
+		}, rt.ctx);
+		expect(rt.latestState().workIterationsAfterPlan).toBe(1);
+		for (const criterionId of ["AC1", "AC2"]) {
+			expect((await rt.execute("goal_verify", { criterionId, evidence: "Tests passed" })).isError).not.toBe(true);
+		}
+		expect((await rt.execute("goal_complete", { summary: "Done" })).details.status).toBe("completed");
+		await rt.handlers.get("agent_end")!({ messages: [] }, rt.ctx);
+		expect(rt.sentMessages).toHaveLength(0);
+	});
+
+	test("completed work turns are not counted again at agent_end", async () => {
+		const rt = runtime();
+		await rt.execute("goal_set_plan", plan);
+		await rt.handlers.get("turn_end")!({ message: { role: "assistant", content: [] } }, rt.ctx);
+		await rt.handlers.get("tool_result")!({ toolName: "read", isError: false }, rt.ctx);
+		await rt.handlers.get("turn_end")!({ message: { role: "assistant", content: [] } }, rt.ctx);
+		await rt.handlers.get("agent_end")!({ messages: [] }, rt.ctx);
+		expect(rt.latestState().workIterationsAfterPlan).toBe(1);
+	});
 	test("requires a structured plan and criteria before allowing work tools", async () => {
 		const rt = runtime();
 		expect(rt.tools.has("goal_set_plan")).toBe(true);

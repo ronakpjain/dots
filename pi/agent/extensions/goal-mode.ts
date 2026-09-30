@@ -949,6 +949,18 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("turn_end", async (event, ctx) => {
 		if (state.status !== "active" || !isAssistantMessage(event.message)) return;
+		if (event.message.stopReason === "aborted" || event.message.stopReason === "error") {
+			pendingWorkInTurn = false;
+			return;
+		}
+		// A tool-using run can span many turns without reaching agent_end.
+		// Credit completed work here so verification is reachable in that run.
+		if (pendingWorkInTurn) state.workIterationsAfterPlan += 1;
+		pendingWorkInTurn = false;
+		// Finishing the planning turn opens the subsequent work iteration.
+		if (goalPhase(state) !== "planning" && state.iterations <= state.planSetIteration) {
+			state.iterations = state.planSetIteration + 1;
+		}
 		const text = textFromMessage(event.message);
 		if (text.trim()) state.progress = text.trim().replace(/\s+/g, " ").slice(-220);
 		persist();
