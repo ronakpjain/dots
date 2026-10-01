@@ -14,7 +14,6 @@ else
 fi
 
 # PATH
-export PATH="/opt/homebrew/opt/python/libexec/bin:$PATH"
 export PATH="/opt/homebrew/opt/curl/bin:$PATH"
 export PATH="/opt/homebrew/opt/ruby/bin:$PATH"
 export PATH="/opt/homebrew/lib/ruby/gems/3.4.0/bin:$PATH"
@@ -261,8 +260,8 @@ alias :qa='killall kitty'
 # Late sourcing
 # -----------------------------------------------------------------------------
 
-# Virtual environment
-[[ -f ~/.venv/bin/activate ]] && source ~/.venv/bin/activate
+# Virtual environment (uv-managed Python)
+[[ -f ~/.venv-uv/bin/activate ]] && source ~/.venv-uv/bin/activate
 
 export PATH=$PATH:/Users/ronak/.spicetify
 
