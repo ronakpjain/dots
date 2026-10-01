@@ -300,7 +300,7 @@ describe("subagents extension wiring", () => {
 		)) as { content: Array<{ type: string; text?: string }> };
 
 		expect(result.content[0]?.text).toContain("Started non-blocking single group");
-		expect(result.content[0]?.text).toContain("completed group result will be interjected automatically");
+		expect(result.content[0]?.text).toContain("completed result will preempt active assistant generation");
 	});
 
 	test("lets the main agent inspect and cancel a live subagent by runId", async () => {
@@ -468,6 +468,8 @@ describe("subagents extension wiring", () => {
 				cwd: process.cwd(),
 				hasUI: false,
 				ui: {},
+				isIdle: () => true,
+				abort: () => { throw new Error("idle parent must not be aborted"); },
 				sessionManager: { getSessionId: () => "test-session", getEntries: () => [] },
 				modelRegistry: { getAvailable: () => [] },
 			},
@@ -489,28 +491,203 @@ describe("subagents extension wiring", () => {
 		expect((sent.message as { content: string }).content).toContain(`group ${groupId} failed`);
 	});
 
-	test("does not interject a stale group after a session switch", async () => {
+	test("preempts active assistant generation and delivers after settlement", async () => {
 		setSessionPreference({ model: "missing/model", thinking: "off" });
 		const pi = fakePi();
 		(subagentsExtension as (api: unknown) => void)(pi.api);
 		const tool = pi.tools.get("subagent")!;
+		let aborts = 0;
+		const context = {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: {},
+			isIdle: () => false,
+			abort: () => {
+				aborts++;
+			},
+			sessionManager: { getSessionId: () => "active-session", getEntries: () => [] },
+			modelRegistry: { getAvailable: () => [] },
+		};
+		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
+
+		await tool.execute!(
+			"call-preempt",
+			{ task: "finish during parent generation" },
+			new AbortController().signal,
+			undefined,
+			context,
+		);
+		for (let attempt = 0; attempt < 100 && aborts === 0; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+
+		expect(aborts).toBe(1);
+		expect(pi.messages).toHaveLength(0);
+		pi.handlers.get("agent_settled")!({}, context);
+
+		expect(pi.messages).toHaveLength(1);
+		expect(pi.messages[0]!.options).toEqual({ triggerTurn: true });
+		expect((pi.messages[0]!.message as { content: string }).content).toContain("Unknown model");
+	});
+
+	test("coalesces completions during one parent interruption", async () => {
+		setSessionPreference({ model: "missing/model", thinking: "off" });
+		const pi = fakePi();
+		(subagentsExtension as (api: unknown) => void)(pi.api);
+		const tool = pi.tools.get("subagent")!;
+		let aborts = 0;
+		const context = {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: {},
+			isIdle: () => false,
+			abort: () => { aborts++; },
+			sessionManager: { getSessionId: () => "batch-session", getEntries: () => [] },
+			modelRegistry: { getAvailable: () => [] },
+		};
+		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
+
+		const first = (await tool.execute!(
+			"call-batch-1",
+			{ task: "first completion" },
+			new AbortController().signal,
+			undefined,
+			context,
+		)) as { details: { groupId: string } };
+		const second = (await tool.execute!(
+			"call-batch-2",
+			{ task: "second completion" },
+			new AbortController().signal,
+			undefined,
+			context,
+		)) as { details: { groupId: string } };
+		for (
+			let attempt = 0;
+			attempt < 100 &&
+			(aborts === 0 || pi.entries.filter((entry) => entry.customType === "subagent-run").length < 2);
+			attempt++
+		) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+
+		expect(aborts).toBe(1);
+		expect(pi.entries.filter((entry) => entry.customType === "subagent-run")).toHaveLength(2);
+		expect(pi.messages).toHaveLength(0);
+		pi.handlers.get("agent_settled")!({}, context);
+
+		expect(pi.messages).toHaveLength(1);
+		const sent = pi.messages[0]!.message as { content: string; details: { groups?: Array<{ groupId: string }> } };
+		expect(sent.content).toContain(first.details.groupId);
+		expect(sent.content).toContain(second.details.groupId);
+		expect(sent.details.groups).toHaveLength(2);
+	});
+
+	test("does not abort an in-flight parent tool", async () => {
+		setSessionPreference({ model: "missing/model", thinking: "off" });
+		const pi = fakePi();
+		(subagentsExtension as (api: unknown) => void)(pi.api);
+		const tool = pi.tools.get("subagent")!;
+		let aborts = 0;
+		const context = {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: {},
+			isIdle: () => false,
+			abort: () => {
+				aborts++;
+			},
+			sessionManager: { getSessionId: () => "tool-session", getEntries: () => [] },
+			modelRegistry: { getAvailable: () => [] },
+		};
+
+		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
+		pi.handlers.get("tool_execution_start")!({}, context);
+		await tool.execute!(
+			"call-tool-active",
+			{ task: "finish during a parent tool" },
+			new AbortController().signal,
+			undefined,
+			context,
+		);
+		for (let attempt = 0; attempt < 100 && pi.messages.length === 0; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+
+		expect(aborts).toBe(0);
+		expect(pi.messages).toHaveLength(1);
+		expect(pi.messages[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
+	});
+
+	test("handles synchronous settlement during parent abort", async () => {
+		setSessionPreference({ model: "missing/model", thinking: "off" });
+		const pi = fakePi();
+		(subagentsExtension as (api: unknown) => void)(pi.api);
+		const tool = pi.tools.get("subagent")!;
+		let aborts = 0;
+		const context = {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: {},
+			isIdle: () => false,
+			abort: () => {
+				aborts++;
+				pi.handlers.get("agent_settled")!({}, context);
+			},
+			sessionManager: { getSessionId: () => "sync-session", getEntries: () => [] },
+			modelRegistry: { getAvailable: () => [] },
+		};
+		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
+
+		await tool.execute!(
+			"call-sync-settle",
+			{ task: "finish before abort returns" },
+			new AbortController().signal,
+			undefined,
+			context,
+		);
+		for (let attempt = 0; attempt < 100 && pi.messages.length === 0; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+
+		expect(aborts).toBe(1);
+		expect(pi.messages).toHaveLength(1);
+		expect(pi.messages[0]!.options).toEqual({ triggerTurn: true });
+	});
+
+	test("does not interject a stale completion after session switch", async () => {
+		setSessionPreference({ model: "missing/model", thinking: "off" });
+		const pi = fakePi();
+		(subagentsExtension as (api: unknown) => void)(pi.api);
+		const tool = pi.tools.get("subagent")!;
+		let aborts = 0;
+		const context = {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: {},
+			isIdle: () => false,
+			abort: () => {
+				aborts++;
+			},
+			sessionManager: { getSessionId: () => "old-session", getEntries: () => [] },
+			modelRegistry: { getAvailable: () => [] },
+		};
+		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
 
 		await tool.execute!(
 			"call-stale-completion",
-			{ task: "finish after the session changes" },
+			{ task: "finish after session switch" },
 			new AbortController().signal,
 			undefined,
-			{
-				cwd: process.cwd(),
-				hasUI: false,
-				ui: {},
-				sessionManager: { getSessionId: () => "old-session", getEntries: () => [] },
-				modelRegistry: { getAvailable: () => [] },
-			},
+			context,
 		);
+		for (let attempt = 0; attempt < 100 && aborts === 0; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+		expect(aborts).toBe(1);
 
 		pi.handlers.get("session_shutdown")!({}, {});
 		pi.handlers.get("session_start")!({}, { sessionManager: { getBranch: () => [] } });
+		pi.handlers.get("agent_settled")!({}, context);
 		for (let attempt = 0; attempt < 20; attempt++) await new Promise((resolve) => setTimeout(resolve, 0));
 
 		expect(pi.messages).toHaveLength(0);
@@ -636,7 +813,7 @@ describe("subagents extension wiring", () => {
 		expect(before.systemPrompt).toContain("Every subagent launch is non-blocking");
 		expect(before.systemPrompt).toContain("Do not duplicate work assigned to a running subagent");
 		expect(before.systemPrompt).toContain("use the subagent's completion result instead of recreating its work");
-		expect(before.systemPrompt).toContain("automatically interject their capped result");
+		expect(before.systemPrompt).toContain("interrupt an actively streaming assistant response");
 
 		setSessionPreference({ model: "openai-codex/gpt-5.6-luna", thinking: "medium" });
 		const after = handler({ systemPrompt: "BASE" }, {}) as { systemPrompt: string };
