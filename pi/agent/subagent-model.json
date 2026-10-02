@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "preferences": {
+    "planner": {
+      "model": "openai/gpt-6.1-sol",
+      "thinking": "low"
+    },
+    "scout": {
+      "model": "openai/gpt-6-luna",
+      "thinking": "low"
+    },
+    "reviewer": {
+      "model": "openai/gpt-6.1-sol",
+      "thinking": "low"
+    },
+    "worker": {
+      "model": "openai/gpt-6-luna",
+      "thinking": "high"
+    }
+  }
+}
