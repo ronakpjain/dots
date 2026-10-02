@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.99.1",
+  "lastChangelogVersion": "1.0.0",
   "defaultProvider": "openai",
   "defaultModel": "gpt-6-luna",
   "defaultThinkingLevel": "max",
@@ -16,6 +16,5 @@
     "openai/gpt-6.1-sol",
     "openai/gpt-6-luna"
   ],
-  "tuiMode": "fullscreen",
   "deviceId": "64c819ba-7b2c-4f69-bec7-e88e12a0cb2b"
 }

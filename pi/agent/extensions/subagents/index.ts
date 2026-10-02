@@ -815,7 +815,21 @@ export default function (pi: ExtensionAPI) {
 		if (event.message.role === "assistant") parentAssistantStreaming = true;
 	});
 	pi.on("message_end", (event) => {
-		if (event.message.role === "assistant") parentAssistantStreaming = false;
+		if (event.message.role !== "assistant") return;
+		parentAssistantStreaming = false;
+		if (!parentInterruptRequested || event.message.stopReason !== "aborted") return;
+
+		// Pi renders every aborted assistant response as "Operation aborted". This
+		// is an intentional handoff, not a user-visible failure; retain partial text
+		// but drop any incomplete tool calls so the canceled draft cannot execute.
+		return {
+			message: {
+				...event.message,
+				content: event.message.content.filter((part) => part.type !== "toolCall"),
+				stopReason: "stop",
+				errorMessage: undefined,
+			},
+		};
 	});
 	pi.on("tool_execution_start", () => {
 		parentAssistantStreaming = false;

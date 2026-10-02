@@ -103,13 +103,6 @@ function defaultCollapsedSummary(toolName: string, result: ToolResultLike, outpu
 		return count ? `${count} definition${count === 1 ? "" : "s"}` : "Definition result ready";
 	}
 	if (toolName === "lsp_hover") return "Hover information ready";
-	if (toolName === "robinhood_search_tools") {
-		const details = asRecord(result.details);
-		const matches = Array.isArray(details?.matches) ? details.matches.length : 0;
-		const added = Array.isArray(details?.added) ? details.added.length : 0;
-		return `${matches} matching tool${matches === 1 ? "" : "s"} · ${added} newly loaded`;
-	}
-	if (toolName.startsWith("robinhood_")) return "Brokerage result ready · expand for details";
 	if (toolName.startsWith("helium_")) return "Browser result ready · expand for details";
 	return output.text ? `${Buffer.byteLength(output.text, "utf8")} bytes of output · expand for details` : "No text output";
 }

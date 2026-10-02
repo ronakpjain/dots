@@ -523,11 +523,45 @@ describe("subagents extension wiring", () => {
 
 		expect(aborts).toBe(1);
 		expect(pi.messages).toHaveLength(0);
+		const messageEnd = pi.handlers.get("message_end")!;
+		const rewritten = messageEnd(
+			{
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: "partial draft" },
+						{ type: "toolCall", id: "unfinished", name: "bash", arguments: { command: "dangerous" } },
+					],
+					stopReason: "aborted",
+					errorMessage: "Request was aborted",
+				},
+			},
+			context,
+		) as { message?: { stopReason?: string; errorMessage?: string; content?: Array<{ type: string }> } };
+		expect(rewritten.message?.stopReason).toBe("stop");
+		expect(rewritten.message?.errorMessage).toBeUndefined();
+		expect(rewritten.message?.content?.map((part) => part.type)).toEqual(["text"]);
 		pi.handlers.get("agent_settled")!({}, context);
 
 		expect(pi.messages).toHaveLength(1);
 		expect(pi.messages[0]!.options).toEqual({ triggerTurn: true });
 		expect((pi.messages[0]!.message as { content: string }).content).toContain("Unknown model");
+	});
+
+	test("does not hide a user-initiated abort notice", () => {
+		const pi = fakePi();
+		(subagentsExtension as (api: unknown) => void)(pi.api);
+		const messageEnd = pi.handlers.get("message_end")!;
+		const event = {
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "user-canceled response" }],
+				stopReason: "aborted",
+				errorMessage: "Request was aborted",
+			},
+		};
+
+		expect(messageEnd(event, {})).toBeUndefined();
 	});
 
 	test("coalesces completions during one parent interruption", async () => {
