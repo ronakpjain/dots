@@ -14,7 +14,7 @@ type Check = {
 type JsonObject = Record<string, unknown>;
 
 const DOCTOR_CAPABILITY =
-	"[DOCTOR CAPABILITY] Use /doctor for a read-only health check of Pi extensions, configuration, memory storage, Robinhood auth/catalog state, Git, and LSP servers.";
+	"[DOCTOR CAPABILITY] Use /doctor for a read-only health check of Pi extensions, configuration, memory storage, Git, and LSP servers.";
 const LSP_COMMANDS = [
 	"clangd",
 	"pylsp",
@@ -40,7 +40,6 @@ const REQUIRED_EXTENSIONS = [
 	"session-automation.ts",
 	"token-tracker.ts",
 	"recheck/index.ts",
-	"robinhood-mcp/index.ts",
 ];
 
 function agentDir(): string {
@@ -93,8 +92,6 @@ async function collectChecks(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	const settings = await readJson(settingsPath);
 	const storePath = memoryFile();
 	const store = await readJson(storePath);
-	const statePath = join(agentDir(), "extensions", "robinhood-mcp", ".state", "oauth.json");
-	const oauth = await readJson(statePath);
 	const allTools = pi.getAllTools().map((tool) => tool.name);
 	const activeTools = new Set(pi.getActiveTools());
 	const requiredTools = [
@@ -103,7 +100,6 @@ async function collectChecks(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 		"goal_set_plan",
 		"goal_verify",
 		"goal_complete",
-		"robinhood_search_tools",
 	];
 	const extensionChecks = await Promise.all(
 		REQUIRED_EXTENSIONS.map(async (name): Promise<Check> => ({
@@ -155,33 +151,6 @@ async function collectChecks(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 			detail: ["goal_set_plan", "goal_verify", "goal_complete"]
 				.map((name) => `${name} ${allTools.includes(name) ? "loaded" : "missing"}`)
 				.join(", "),
-		},
-		{
-			label: "Robinhood search",
-			status: allTools.includes("robinhood_search_tools") ? "ok" : "fail",
-			detail: allTools.includes("robinhood_search_tools") ? "loaded" : "not loaded",
-		},
-		{
-			label: "Robinhood auth",
-			status:
-				oauth?.tokens &&
-				typeof oauth.tokens === "object" &&
-				typeof (oauth.tokens as JsonObject).access_token === "string"
-					? "ok"
-					: "warn",
-			detail:
-				oauth?.tokens &&
-				typeof oauth.tokens === "object" &&
-				typeof (oauth.tokens as JsonObject).access_token === "string"
-					? "token present (secret hidden)"
-					: "authentication required",
-		},
-		{
-			label: "Robinhood catalog",
-			status: allTools.some((name) => name.startsWith("robinhood_") && name !== "robinhood_search_tools")
-				? "ok"
-				: "warn",
-			detail: `${allTools.filter((name) => name.startsWith("robinhood_") && name !== "robinhood_search_tools").length} remote schema(s) registered; schemas load on demand`,
 		},
 		{
 			label: "Git repository",

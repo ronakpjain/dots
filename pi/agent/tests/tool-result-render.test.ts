@@ -14,35 +14,6 @@ function rendered(component: { render(width: number): string[] }, width = 80): s
 }
 
 describe("shared tool-result renderer", () => {
-	test("renders a collapsed output preview without mutating structured results", () => {
-		const result = {
-			content: [{ type: "text", text: '{"balance":1234,"positions":[{"symbol":"AAPL"}]}' }],
-			details: { balance: 1234 },
-		};
-		const before = JSON.stringify(result);
-		const collapsed = rendered(
-			renderToolResult(
-				"robinhood_get_portfolio",
-				result,
-				{ expanded: false },
-				theme,
-				{},
-				{ collapsedSummary: () => "Brokerage result ready · expand for details" },
-			),
-		);
-		expect(collapsed).toContain("Brokerage result ready");
-		expect(collapsed).toContain("1234");
-
-		const safeCollapsed = rendered(renderToolResult("robinhood_get_portfolio", result, { expanded: false }, theme));
-		expect(safeCollapsed).toContain("Brokerage result ready");
-		expect(safeCollapsed).toContain("1234");
-
-		const expanded = rendered(renderToolResult("robinhood_get_portfolio", result, { expanded: true }, theme));
-		expect(expanded).toContain('"balance": 1234');
-		expect(expanded).toContain('"symbol": "AAPL"');
-		expect(JSON.stringify(result)).toBe(before);
-	});
-
 	test("shows a truncated subagent history preview", () => {
 		const output = rendered(
 			renderToolResult(
@@ -54,16 +25,6 @@ describe("shared tool-result renderer", () => {
 		);
 		expect(output).toContain("2 subagent runs");
 		expect(output).toContain("private transcript");
-	});
-
-	test("shows a bounded preview of dynamically loaded tool output", () => {
-		const result = {
-			content: [{ type: "text", text: "Loaded tools: robinhood_account_secret" }],
-			details: { matches: [{ name: "robinhood_account_secret" }], added: [{ name: "robinhood_account_secret" }] },
-		};
-		const collapsed = rendered(renderToolResult("robinhood_search_tools", result, { expanded: false }, theme));
-		expect(collapsed).toContain("1 matching tool · 1 newly loaded");
-		expect(collapsed).toContain("account_secret");
 	});
 
 	test("shows truncated tool output previews while keeping arguments out of collapsed results", () => {

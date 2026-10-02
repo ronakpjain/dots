@@ -5,9 +5,6 @@ macconfig/kitty/kitty.conf.bak
 vim/plugged
 pi/agent/auth.json
 pi/agent/sessions
-pi/agent/extensions/robinhood-mcp/.state/
-pi/agent/extensions/robinhood-mcp/node_modules/
-pi/agent/extensions/robinhood-mcp/.env*
 __pycache__/
 *.pyc
 node_modules/
