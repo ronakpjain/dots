@@ -85,6 +85,7 @@ yay_install uwsm  # universal wayland session manager
 # ── Terminal & shell ───────────────────────────────────
 info "Installing terminal & shell packages..."
 yay_install kitty
+yay_install ghostty
 yay_install zsh
 yay_install zsh-autosuggestions
 yay_install zsh-syntax-highlighting
@@ -104,6 +105,7 @@ yay_install neovim
 info "Installing languages & runtimes..."
 yay_install python
 yay_install nodejs
+yay_install bun
 yay_install go
 yay_install rust
 yay_install lua
@@ -116,6 +118,20 @@ yay_install prettier
 yay_install gopls
 yay_install rust-analyzer
 yay_install lua-language-server
+yay_install python-lsp-server
+yay_install python-debugpy
+yay_install clang
+yay_install lldb
+yay_install texlab
+yay_install texlive-binextra
+yay_install svelte-language-server
+yay_install typescript-language-server
+yay_install neocmakelsp
+yay_install marksman
+yay_install verible
+yay_install ty
+
+yay_install tree-sitter
 
 # ── Build tools ────────────────────────────────────────
 info "Installing build tools..."
@@ -135,7 +151,6 @@ yay_install wget
 yay_install btop
 yay_install fastfetch
 yay_install ncdu
-yay_install pstree
 yay_install htop
 
 # ── Wayland-specific utilities ────────────────────────
@@ -206,6 +221,9 @@ link "$DOTS/linuxconfig/nvim"       "$HOME_DIR/.config/nvim"
 
 # Kitty
 link "$DOTS/linuxconfig/kitty"      "$HOME_DIR/.config/kitty"
+
+# Ghostty
+link "$DOTS/linuxconfig/ghostty"    "$HOME_DIR/.config/ghostty"
 
 # Hyprland
 link "$DOTS/linuxconfig/hypr"       "$HOME_DIR/.config/hypr"

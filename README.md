@@ -105,12 +105,12 @@ The script installs everything: yay packages, zsh plugins, symlinks, Neovim plug
 | Category | Packages |
 |---|---|
 | **Tiling WM** | hyprland, niri, waybar, rofi, hyprlock, hyprpaper, awww-bin, uwsm |
-| **Terminal & Shell** | kitty, zsh, eza, fzf, fd, ripgrep, zoxide, vivid, tree |
+| **Terminal & Shell** | kitty, ghostty, zsh, eza, fzf, fd, ripgrep, zoxide, vivid, tree |
 | **Editors** | neovim |
-| **Languages** | python, nodejs, go, rust, lua, luajit |
-| **LSP & Formatters** | stylua, prettier, gopls, rust-analyzer, lua-language-server |
+| **Languages** | python, nodejs, bun, go, rust, lua, luajit |
+| **LSP & Formatters** | stylua, prettier, python-lsp-server, python-debugpy, gopls, rust-analyzer, lua-language-server, clang, lldb, texlab, texlive-binextra, svelte-language-server, typescript-language-server, neocmakelsp, marksman, verible, ty, tree-sitter |
 | **Build Tools** | cmake, make, gcc, ninja, meson, pkgconf |
-| **CLI Utilities** | gh, git, jq, wget, btop, fastfetch, ncdu, pstree, htop |
+| **CLI Utilities** | gh, git, jq, wget, btop, fastfetch, ncdu, htop |
 | **Wayland Utilities** | grim, slurp, wl-clipboard, playerctl, brightnessctl, wireplumber, pipewire, pipewire-alsa, pipewire-pulse, pavucontrol, swaybg, wl-kbptr |
 | **Media** | ffmpeg, yt-dlp, mpv, imagemagick |
 | **Fonts** | ttf-hack, ttf-jetbrains-mono, noto-fonts, noto-fonts-cjk |
@@ -132,6 +132,7 @@ The script installs everything: yay packages, zsh plugins, symlinks, Neovim plug
 | `dots/vim/` | `~/.vim/` |
 | `dots/linuxconfig/nvim/` | `~/.config/nvim/` |
 | `dots/linuxconfig/kitty/` | `~/.config/kitty/` |
+| `dots/linuxconfig/ghostty/` | `~/.config/ghostty/` |
 | `dots/linuxconfig/hypr/` | `~/.config/hypr/` |
 | `dots/linuxconfig/waybar/` | `~/.config/waybar/` |
 | `dots/linuxconfig/niri/` | `~/.config/niri/` |
@@ -151,9 +152,7 @@ Text Editor of choice
     - [Dropbar](https://github.com/Bekaboo/dropbar.nvim) - Breadcrumb winbar
     - [Fidget](https://github.com/j-hui/fidget.nvim) - LSP progress spinner
     - [image.nvim](https://github.com/3rd/image.nvim) - Image rendering
-    - [Which-Key](https://github.com/folke/which-key.nvim) - Keymap popup
     - [Rainbow Delimiters](https://gitlab.com/HiPhish/rainbow-delimiters.nvim) - Rainbow brackets
-    - [Zen Mode](https://github.com/folke/zen-mode.nvim) - Distraction-free mode
 - **Editing**
     - [Autopairs](https://github.com/windwp/nvim-autopairs) - Auto-close brackets/quotes
     - [Autosave](https://github.com/okuuva/auto-save.nvim) - Auto-save on edit
@@ -164,6 +163,7 @@ Text Editor of choice
         - [telescope-ui-select](https://github.com/nvim-telescope/telescope-ui-select.nvim) - Use Telescope for code actions
         - [telescope-fzf-native](https://github.com/nvim-telescope/telescope-fzf-native.nvim) - FZF sorter
     - [Oil](https://github.com/stevearc/oil.nvim) - File manager as a buffer
+    - [nvim-jump](https://github.com/yorickpeterse/nvim-jump) - Jump between visible text
 - **LSP & Completion**
     - [LSPConfig](https://github.com/neovim/nvim-lspconfig) - LSP server configs
     - [Lazydev](https://github.com/folke/lazydev.nvim) - Lua dev type hints
@@ -185,10 +185,12 @@ Text Editor of choice
     - [DAP](https://github.com/mfussenegger/nvim-dap) - Debug adapter protocol
     - [nvim-dap-ui](https://github.com/rcarriga/nvim-dap-ui) - Debug UI
     - [nvim-nio](https://github.com/nvim-neotest/nvim-nio) - Async IO for DAP
+    - [Cortex](https://github.com/ronakpjain/cortex.nvim) - DAP views and embedded debugging
 - **Markdown & LaTeX**
     - [render-markdown](https://github.com/MeanderingProgrammer/render-markdown.nvim) - Rendered Markdown previews
     - [mdmath](https://github.com/ronakpjain/mdmath.nvim) - LaTeX math rendering
     - [markdown-plus](https://github.com/yousefhadder/markdown-plus.nvim) - Markdown utilities
+    - [pi-nvim](https://github.com/carderne/pi-nvim) - Pi coding-agent integration
 - **Treesitter**
     - [nvim-treesitter](https://github.com/nvim-treesitter/nvim-treesitter) - Syntax highlighting & parsing
 - **Misc**

@@ -16,3 +16,8 @@ font-style-italic = "Italic"
 font-style-bold-italic = "Bold Italic"
 
 font-size = 11.0
+
+# Send Ctrl-M / Ctrl-Shift-M as distinct Ctrl-Enter CSI-u events instead of
+# legacy Enter/CR. Pi maps them to model cycling forward/backward.
+keybind = ctrl+m=csi:13;5u
+keybind = ctrl+shift+m=csi:13;6u
