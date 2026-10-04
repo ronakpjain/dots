@@ -1,16 +1,20 @@
 # Hyprland Keybinds
 
+Configured in `hyprland.lua` (native Lua, Hyprland 0.55+).
+Validate with `Hyprland --verify-config -c ~/.config/hypr/hyprland.lua`.
+After migrating from `hyprland.conf`, restart your Hyprland session to use the new entry point.
+
 ## Spawn / Apps
 | Key | Action |
 |---|---|
-| `Alt+K` | Open terminal (kitty) |
+| `Alt+K` | Open terminal (ghostty) |
 | `Alt+R` | Open app launcher (rofi) |
 | `Alt+A` | Keyboard-driven pointer (wl-kbptr) |
 
 ## Window Management
 | Key | Action |
 |---|---|
-| `Alt+Q` | Close window (handles Firefox specially) |
+| `Alt+Q` | Close the active window |
 | `Alt+W` | Send Ctrl+W to window (close tab) |
 | `Alt+V` | Toggle floating |
 | `Alt+F` | Fullscreen (fake) |
@@ -29,13 +33,6 @@
 | `Alt+S` | Toggle special workspace (scratchpad) |
 | `Alt+Shift+S` | Move window to special workspace |
 | `Alt+scroll` | Cycle workspaces |
-
-## Monitor
-| Key | Action |
-|---|---|
-| `Alt+L` | Focus display 1 |
-| `Alt+J` | Focus display 2 |
-| `Ctrl+Alt+←/→` | Move window to display 1/2 and follow |
 
 ## System
 | Key | Action |
@@ -57,9 +54,6 @@
 | Key | Action |
 |---|---|
 | `Super+Shift+S` | Region screenshot → clipboard |
-| `Print` | Full screen screenshot |
-| `Ctrl+Print` | Screenshot screen |
-| `Alt+Print` | Screenshot window |
 
 ## Mouse
 | Key | Action |
