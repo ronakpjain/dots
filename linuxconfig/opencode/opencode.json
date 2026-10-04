@@ -3,6 +3,11 @@
     "plugin": [
         "opencode-gemini-auth@latest"
     ],
+    "agent": {
+        "explore": {
+            "model": "opencode/big-pickle"
+        }
+    },
     "autoupdate": true,
     "mcp": {
         "pdf-reader": {
