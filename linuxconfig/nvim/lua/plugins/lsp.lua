@@ -10,6 +10,7 @@ vim.pack.add({
 	"https://github.com/saadparwaiz1/cmp_luasnip",
 	"https://github.com/L3MON4D3/LuaSnip",
 	"https://github.com/rafamadriz/friendly-snippets",
+	"https://github.com/iurimateus/luasnip-latex-snippets.nvim",
 	"https://github.com/hrsh7th/nvim-cmp",
 	"https://github.com/stevearc/conform.nvim",
 }, { confirm = false, load = true })
@@ -17,10 +18,16 @@ vim.pack.add({
 local servers = {
 	"pylsp",
 	"gopls",
+	"texlab",
 	"clangd",
+	"svelte",
 	"lua_ls",
 	"rust_analyzer",
 	"ty",
+	"ts_ls",
+	"neocmake",
+	"marksman",
+	"verible",
 }
 
 local on_attach = function(client)
@@ -230,6 +237,34 @@ for _, server in ipairs(servers) do
 			},
 		}
 		vim.lsp.enable("pylsp")
+	elseif server == "texlab" then
+		vim.lsp.config.texlab = {
+			on_attach = on_attach,
+			settings = {
+				texlab = {
+					build = {
+						executable = "latexmk",
+						args = {
+							"-synctex=1",
+							"-interaction=nonstopmode",
+							"-pdf",
+							"%f",
+						},
+						onSave = true,
+						forwardSearchAfter = true,
+					},
+					forwardSearch = {
+						executable = "zathura",
+						args = {
+							"--synctex-forward",
+							"%l:1:%f",
+							"%p",
+						},
+					},
+				},
+			},
+		}
+		vim.lsp.enable("texlab")
 	elseif server == "lua_ls" then
 		vim.lsp.config.lua_ls = {
 			on_attach = on_attach,
@@ -252,6 +287,11 @@ for _, server in ipairs(servers) do
 			on_attach = on_attach,
 		}
 		vim.lsp.enable("ty")
+	elseif server == "verible" then
+		vim.lsp.config.verible = {
+			on_attach = on_attach,
+		}
+		vim.lsp.enable("verible")
 	else
 		vim.lsp.config[server] = {
 			on_attach = on_attach,
@@ -326,12 +366,15 @@ cmp.setup({
 })
 
 require("luasnip.loaders.from_vscode").lazy_load()
+require("luasnip-latex-snippets").setup({ use_treesitter = true })
+require("luasnip").config.setup({ enable_autosnippets = true })
 
 require("conform").setup({
 	formatters_by_ft = {
 		html = { "prettier" },
 		lua = { "stylua" },
 		css = { "prettier" },
+		tex = { "latexindent" },
 		htmldjango = { "prettier" },
 		c = { "clang-format" },
 		cpp = { "clang-format" },

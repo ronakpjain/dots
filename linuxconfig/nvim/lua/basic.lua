@@ -19,4 +19,11 @@ vim.opt.clipboard:append("unnamedplus")
 vim.opt.winborder = "rounded"
 
 vim.g.have_nerd_font = true
+
+-- Prefer the virtual environment created by setup-linux.sh when available.
+local venv_python = vim.fn.expand("~/.venv/bin/python3")
+if vim.fn.executable(venv_python) == 1 then
+	vim.g.python3_host_prog = venv_python
+end
+
 vim.g.loaded_perl_provider = 0

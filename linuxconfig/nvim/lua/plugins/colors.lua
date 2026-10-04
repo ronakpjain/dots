@@ -32,5 +32,9 @@ require("catppuccin").setup({
 	end,
 })
 
-vim.cmd.colorscheme("catppuccin-nvim")
-require("rainbow-delimiters.setup").setup({})
+vim.cmd.colorscheme("catppuccin")
+require("rainbow-delimiters.setup").setup({
+	blacklist = {
+		"svelte",
+	},
+})

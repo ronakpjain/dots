@@ -1,8 +1,18 @@
-vim.pack.add({ { src = "https://github.com/nvim-treesitter/nvim-treesitter", version = "main" } }, { confirm = false, load = true })
+vim.pack.add(
+	{ { src = "https://github.com/nvim-treesitter/nvim-treesitter", version = "main" } },
+	{ confirm = false, load = true }
+)
 
 require("nvim-treesitter").setup({})
 
-local ts_group = vim.api.nvim_create_augroup("DotfilesTreesitterUpdate", { clear = true })
+local ts_group = vim.api.nvim_create_augroup("DotfilesTreesitter", { clear = true })
+vim.api.nvim_create_autocmd("FileType", {
+	group = ts_group,
+	callback = function()
+		pcall(vim.treesitter.start)
+	end,
+})
+
 vim.api.nvim_create_autocmd("PackChanged", {
 	group = ts_group,
 	callback = function(ev)
