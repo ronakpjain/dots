@@ -74,7 +74,9 @@ The script installs everything: yay packages, zsh plugins, symlinks, Neovim plug
 - [eza](https://github.com/eza-community/eza) as `ls` replacement with icons
 
 ### Hercules tmux access
-On macOS, run `hercules` to SSH to Hercules and create or reattach to the persistent tmux session `main` running there (tmux is not run locally). Pass an optional session name, such as `hercules work`. Install tmux on Hercules with `sudo pacman -S --needed tmux` if it is not already installed.
+On macOS, run `hercules` to SSH to Hercules and create a fresh remote tmux session on every invocation. The default name is unique; `hercules work` creates a named session (and fails if that name already exists), `hercules --attach work` reconnects, and `hercules --list` lists sessions. Tmux runs on Hercules, not locally. The Hercules config is `~/.config/tmux/tmux.conf`, installed by `setup-linux.sh`.
+
+Ghostty mouse/trackpad scrolling is routed to tmux's 100,000-line pane history. Tmux owns scrollback while active; use the wheel/trackpad or tmux copy-mode (`prefix` + `[`) to browse remote history rather than relying on Ghostty's native scrollback search. Install tmux on Hercules with `sudo pacman -S --needed tmux` if it is not already installed.
 
 ### macOS — Symlinks
 

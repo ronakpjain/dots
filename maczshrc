@@ -177,15 +177,59 @@ openclose() {
   exit
 }
 
-# Attach to a persistent tmux session running on Hercules.
+# Create a fresh remote tmux session on Hercules; use --attach to reconnect.
 hercules() {
-  local session="${1:-main}"
-  if (( $# > 1 )) || [[ ! "$session" =~ '^[[:alnum:]][[:alnum:]_-]*$' ]]; then
-    print -u2 -- 'Usage: hercules [session-name]'
+  local mode="new"
+  local session
+
+  case "$#" in
+    0)
+      session="hercules-$(uuidgen | tr -d '-' | cut -c1-24 | tr '[:upper:]' '[:lower:]')"
+      ;;
+    1)
+      case "$1" in
+        --help|-h)
+          print -r -- 'Usage: hercules [session-name] | hercules --attach <session-name> | hercules --list'
+          return 0
+          ;;
+        --list)
+          ssh Hercules tmux list-sessions
+          return $?
+          ;;
+        --attach)
+          print -u2 -- 'Usage: hercules --attach <session-name>'
+          return 2
+          ;;
+        *)
+          session="$1"
+          ;;
+      esac
+      ;;
+    2)
+      if [[ "$1" != '--attach' ]]; then
+        print -u2 -- 'Usage: hercules [session-name] | hercules --attach <session-name> | hercules --list'
+        return 2
+      fi
+      mode="attach"
+      session="$2"
+      ;;
+    *)
+      print -u2 -- 'Usage: hercules [session-name] | hercules --attach <session-name> | hercules --list'
+      return 2
+      ;;
+  esac
+
+  if [[ ! "$session" =~ '^[[:alnum:]][[:alnum:]_-]*$' ]]; then
+    print -u2 -- 'Session names must start with a letter or number and contain only letters, numbers, underscores, or hyphens.'
     return 2
   fi
 
-  local remote_command="tmux new-session -A -s $session"
+  local remote_command="tmux new-session -s $session"
+  if [[ "$mode" == 'attach' ]]; then
+    remote_command="tmux new-session -A -s $session"
+  fi
+
+  print -r -- "Hercules tmux session ($mode): $session"
   ssh -t Hercules "$remote_command"
 }
 

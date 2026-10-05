@@ -244,6 +244,9 @@ link "$DOTS/zathura"                "$HOME_DIR/.config/zathura"
 # OpenCode
 link "$DOTS/linuxconfig/opencode"   "$HOME_DIR/.config/opencode"
 
+# tmux (Hercules remote session)
+link "$DOTS/tmux/tmux.conf"         "$HOME_DIR/.config/tmux/tmux.conf"
+
 # Pi
 link "$DOTS/pi"                     "$HOME_DIR/.pi"
 
