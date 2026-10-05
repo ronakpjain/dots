@@ -51,6 +51,19 @@ function fakePi(): FakePi {
 	return state;
 }
 
+async function waitForGroupDone(pi: FakePi, groupId: string, context: unknown): Promise<void> {
+	const statusTool = pi.tools.get("subagent_status")!;
+	for (let attempt = 0; attempt < 100; attempt++) {
+		const status = (await statusTool.execute!("wait-for-group", { groupId }, undefined, undefined, context)) as {
+			content?: Array<{ text?: string }>;
+		};
+		const text = status.content?.[0]?.text ?? "";
+		if (text.includes("· ok ·") || text.includes("· error ·")) return;
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+	throw new Error(`Timed out waiting for subagent group ${groupId}`);
+}
+
 function toolThenHangProvider() {
 	let calls = 0;
 	return {
@@ -300,7 +313,7 @@ describe("subagents extension wiring", () => {
 		)) as { content: Array<{ type: string; text?: string }> };
 
 		expect(result.content[0]?.text).toContain("Started non-blocking single group");
-		expect(result.content[0]?.text).toContain("completed result will preempt active assistant generation");
+		expect(result.content[0]?.text).toContain("queued to steer the next assistant response");
 	});
 
 	test("lets the main agent inspect and cancel a live subagent by runId", async () => {
@@ -491,7 +504,7 @@ describe("subagents extension wiring", () => {
 		expect((sent.message as { content: string }).content).toContain(`group ${groupId} failed`);
 	});
 
-	test("preempts active assistant generation and delivers after settlement", async () => {
+	test("queues a forceful steer at the end of the active turn without aborting", async () => {
 		setSessionPreference({ model: "missing/model", thinking: "off" });
 		const pi = fakePi();
 		(subagentsExtension as (api: unknown) => void)(pi.api);
@@ -508,63 +521,73 @@ describe("subagents extension wiring", () => {
 			sessionManager: { getSessionId: () => "active-session", getEntries: () => [] },
 			modelRegistry: { getAvailable: () => [] },
 		};
-		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
+		pi.handlers.get("turn_start")!({}, context);
 
-		await tool.execute!(
-			"call-preempt",
+		const launched = (await tool.execute!(
+			"call-steer",
 			{ task: "finish during parent generation" },
 			new AbortController().signal,
 			undefined,
 			context,
-		);
-		for (let attempt = 0; attempt < 100 && aborts === 0; attempt++) {
-			await new Promise((resolve) => setTimeout(resolve, 1));
-		}
+		)) as { details: { groupId: string } };
+		await waitForGroupDone(pi, launched.details.groupId, context);
 
-		expect(aborts).toBe(1);
+		expect(pi.entries.filter((entry) => entry.customType === "subagent-run-detail")).toHaveLength(1);
+		expect(aborts).toBe(0);
 		expect(pi.messages).toHaveLength(0);
-		const messageEnd = pi.handlers.get("message_end")!;
-		const rewritten = messageEnd(
-			{
-				message: {
-					role: "assistant",
-					content: [
-						{ type: "text", text: "partial draft" },
-						{ type: "toolCall", id: "unfinished", name: "bash", arguments: { command: "dangerous" } },
-					],
-					stopReason: "aborted",
-					errorMessage: "Request was aborted",
-				},
-			},
-			context,
-		) as { message?: { stopReason?: string; errorMessage?: string; content?: Array<{ type: string }> } };
-		expect(rewritten.message?.stopReason).toBe("stop");
-		expect(rewritten.message?.errorMessage).toBeUndefined();
-		expect(rewritten.message?.content?.map((part) => part.type)).toEqual(["text"]);
-		pi.handlers.get("agent_settled")!({}, context);
+		pi.handlers.get("turn_end")!({}, context);
 
 		expect(pi.messages).toHaveLength(1);
-		expect(pi.messages[0]!.options).toEqual({ triggerTurn: true });
-		expect((pi.messages[0]!.message as { content: string }).content).toContain("Unknown model");
+		expect(pi.messages[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
+		const steeredContent = (pi.messages[0]!.message as { content: string }).content;
+		expect(steeredContent).toContain("Unknown model");
+		expect(steeredContent).toContain("Prioritize this result in the current task");
+		pi.handlers.get("agent_settled")!({}, context);
+		expect(pi.messages).toHaveLength(1);
 	});
 
-	test("does not hide a user-initiated abort notice", () => {
+	test("delivers a pending completion when the parent settles without turn_end", async () => {
+		setSessionPreference({ model: "missing/model", thinking: "off" });
 		const pi = fakePi();
 		(subagentsExtension as (api: unknown) => void)(pi.api);
-		const messageEnd = pi.handlers.get("message_end")!;
-		const event = {
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "user-canceled response" }],
-				stopReason: "aborted",
-				errorMessage: "Request was aborted",
-			},
+		const tool = pi.tools.get("subagent")!;
+		let aborts = 0;
+		const context = {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: {},
+			isIdle: () => false,
+			abort: () => { aborts++; },
+			sessionManager: { getSessionId: () => "settled-session", getEntries: () => [] },
+			modelRegistry: { getAvailable: () => [] },
 		};
+		pi.handlers.get("turn_start")!({}, context);
+		const launched = (await tool.execute!(
+			"call-settled-fallback",
+			{ task: "finish before parent turn boundary" },
+			new AbortController().signal,
+			undefined,
+			context,
+		)) as { details: { groupId: string } };
+		await waitForGroupDone(pi, launched.details.groupId, context);
 
-		expect(messageEnd(event, {})).toBeUndefined();
+		expect(pi.messages).toHaveLength(0);
+		pi.handlers.get("agent_settled")!({}, context);
+		expect(aborts).toBe(0);
+		expect(pi.messages).toHaveLength(1);
+		expect(pi.messages[0]!.options).toEqual({ triggerTurn: true });
 	});
 
-	test("coalesces completions during one parent interruption", async () => {
+	test("does not rewrite user-initiated aborts", () => {
+		const pi = fakePi();
+		(subagentsExtension as (api: unknown) => void)(pi.api);
+
+		// Completion steering uses Pi's queue; the extension no longer rewrites
+		// aborted assistant messages or suppresses the user's abort notice.
+		expect(pi.handlers.has("message_end")).toBe(false);
+	});
+
+	test("coalesces completions from one parent turn into a single steer", async () => {
 		setSessionPreference({ model: "missing/model", thinking: "off" });
 		const pi = fakePi();
 		(subagentsExtension as (api: unknown) => void)(pi.api);
@@ -579,7 +602,7 @@ describe("subagents extension wiring", () => {
 			sessionManager: { getSessionId: () => "batch-session", getEntries: () => [] },
 			modelRegistry: { getAvailable: () => [] },
 		};
-		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
+		pi.handlers.get("turn_start")!({}, context);
 
 		const first = (await tool.execute!(
 			"call-batch-1",
@@ -595,28 +618,27 @@ describe("subagents extension wiring", () => {
 			undefined,
 			context,
 		)) as { details: { groupId: string } };
-		for (
-			let attempt = 0;
-			attempt < 100 &&
-			(aborts === 0 || pi.entries.filter((entry) => entry.customType === "subagent-run").length < 2);
-			attempt++
-		) {
-			await new Promise((resolve) => setTimeout(resolve, 1));
-		}
+		await Promise.all([
+			waitForGroupDone(pi, first.details.groupId, context),
+			waitForGroupDone(pi, second.details.groupId, context),
+		]);
 
-		expect(aborts).toBe(1);
-		expect(pi.entries.filter((entry) => entry.customType === "subagent-run")).toHaveLength(2);
+		expect(aborts).toBe(0);
+		expect(pi.entries.filter((entry) => entry.customType === "subagent-run-detail")).toHaveLength(2);
 		expect(pi.messages).toHaveLength(0);
-		pi.handlers.get("agent_settled")!({}, context);
+		pi.handlers.get("turn_end")!({}, context);
 
 		expect(pi.messages).toHaveLength(1);
+		expect(pi.messages[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
 		const sent = pi.messages[0]!.message as { content: string; details: { groups?: Array<{ groupId: string }> } };
 		expect(sent.content).toContain(first.details.groupId);
 		expect(sent.content).toContain(second.details.groupId);
 		expect(sent.details.groups).toHaveLength(2);
+		pi.handlers.get("agent_settled")!({}, context);
+		expect(pi.messages).toHaveLength(1);
 	});
 
-	test("does not abort an in-flight parent tool", async () => {
+	test("queues a completion while a parent tool runs and steers after the turn", async () => {
 		setSessionPreference({ model: "missing/model", thinking: "off" });
 		const pi = fakePi();
 		(subagentsExtension as (api: unknown) => void)(pi.api);
@@ -634,58 +656,22 @@ describe("subagents extension wiring", () => {
 			modelRegistry: { getAvailable: () => [] },
 		};
 
-		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
-		pi.handlers.get("tool_execution_start")!({}, context);
-		await tool.execute!(
+		// A turn remains active while Pi executes its tool calls.
+		pi.handlers.get("turn_start")!({}, context);
+		const launched = (await tool.execute!(
 			"call-tool-active",
 			{ task: "finish during a parent tool" },
 			new AbortController().signal,
 			undefined,
 			context,
-		);
-		for (let attempt = 0; attempt < 100 && pi.messages.length === 0; attempt++) {
-			await new Promise((resolve) => setTimeout(resolve, 1));
-		}
+		)) as { details: { groupId: string } };
+		await waitForGroupDone(pi, launched.details.groupId, context);
 
 		expect(aborts).toBe(0);
+		expect(pi.messages).toHaveLength(0);
+		pi.handlers.get("turn_end")!({}, context);
 		expect(pi.messages).toHaveLength(1);
 		expect(pi.messages[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
-	});
-
-	test("handles synchronous settlement during parent abort", async () => {
-		setSessionPreference({ model: "missing/model", thinking: "off" });
-		const pi = fakePi();
-		(subagentsExtension as (api: unknown) => void)(pi.api);
-		const tool = pi.tools.get("subagent")!;
-		let aborts = 0;
-		const context = {
-			cwd: process.cwd(),
-			hasUI: false,
-			ui: {},
-			isIdle: () => false,
-			abort: () => {
-				aborts++;
-				pi.handlers.get("agent_settled")!({}, context);
-			},
-			sessionManager: { getSessionId: () => "sync-session", getEntries: () => [] },
-			modelRegistry: { getAvailable: () => [] },
-		};
-		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
-
-		await tool.execute!(
-			"call-sync-settle",
-			{ task: "finish before abort returns" },
-			new AbortController().signal,
-			undefined,
-			context,
-		);
-		for (let attempt = 0; attempt < 100 && pi.messages.length === 0; attempt++) {
-			await new Promise((resolve) => setTimeout(resolve, 1));
-		}
-
-		expect(aborts).toBe(1);
-		expect(pi.messages).toHaveLength(1);
-		expect(pi.messages[0]!.options).toEqual({ triggerTurn: true });
 	});
 
 	test("does not interject a stale completion after session switch", async () => {
@@ -693,31 +679,26 @@ describe("subagents extension wiring", () => {
 		const pi = fakePi();
 		(subagentsExtension as (api: unknown) => void)(pi.api);
 		const tool = pi.tools.get("subagent")!;
-		let aborts = 0;
 		const context = {
 			cwd: process.cwd(),
 			hasUI: false,
 			ui: {},
 			isIdle: () => false,
-			abort: () => {
-				aborts++;
-			},
 			sessionManager: { getSessionId: () => "old-session", getEntries: () => [] },
 			modelRegistry: { getAvailable: () => [] },
 		};
-		pi.handlers.get("message_start")!({ message: { role: "assistant" } }, context);
+		pi.handlers.get("turn_start")!({}, context);
 
-		await tool.execute!(
+		const launched = (await tool.execute!(
 			"call-stale-completion",
 			{ task: "finish after session switch" },
 			new AbortController().signal,
 			undefined,
 			context,
-		);
-		for (let attempt = 0; attempt < 100 && aborts === 0; attempt++) {
-			await new Promise((resolve) => setTimeout(resolve, 1));
-		}
-		expect(aborts).toBe(1);
+		)) as { details: { groupId: string } };
+		await waitForGroupDone(pi, launched.details.groupId, context);
+		expect(pi.entries.some((entry) => entry.customType === "subagent-run-detail")).toBe(true);
+		expect(pi.messages).toHaveLength(0);
 
 		pi.handlers.get("session_shutdown")!({}, {});
 		pi.handlers.get("session_start")!({}, { sessionManager: { getBranch: () => [] } });
@@ -847,7 +828,7 @@ describe("subagents extension wiring", () => {
 		expect(before.systemPrompt).toContain("Every subagent launch is non-blocking");
 		expect(before.systemPrompt).toContain("Do not duplicate work assigned to a running subagent");
 		expect(before.systemPrompt).toContain("use the subagent's completion result instead of recreating its work");
-		expect(before.systemPrompt).toContain("interrupt an actively streaming assistant response");
+		expect(before.systemPrompt).toContain("queue their capped result as a steering message for the next assistant response");
 
 		setSessionPreference({ model: "openai-codex/gpt-5.6-luna", thinking: "medium" });
 		const after = handler({ systemPrompt: "BASE" }, {}) as { systemPrompt: string };

@@ -17,7 +17,7 @@
  *     that `sessionId` later continues the SAME context window (memory)
  *   - Watchdogs: per-task timeout and maxTurns abort the subagent
  *   - Every launch returns immediately; groups continue in the background and expose non-blocking status
- *   - Completed groups preempt an active parent response and interject a capped result
+ *   - Completed groups queue a steering message for the next parent response without aborting active work
  *   - Background groups stop on session shutdown
  *   - Monitoring: run records persisted via pi.appendEntry; `/subagents`
  *     command lists active/recent runs with usage and live activity
@@ -247,7 +247,7 @@ export function formatSubagentCompletionMessage(
 			"",
 			result.text,
 			"",
-			"Review the result and continue the main task as appropriate.",
+			"Prioritize this result in the current task: incorporate relevant findings before continuing, and do not repeat completed delegated work.",
 		].join("\n"),
 		PARENT_OUTPUT_CAP,
 	);
@@ -715,15 +715,13 @@ export default function (pi: ExtensionAPI) {
 	const runControllers = new Map<string, AbortController>();
 	const backgroundGroups = new Map<string, BackgroundGroup>();
 	const pendingCompletions: PendingGroupCompletion[] = [];
-	let parentAssistantStreaming = false;
-	let parentInterruptRequested = false;
+	let parentTurnActive = false;
 	let sessionShuttingDown = false;
 	let sessionGeneration = 0;
 
 	const clearPendingCompletions = (): void => {
 		pendingCompletions.length = 0;
-		parentAssistantStreaming = false;
-		parentInterruptRequested = false;
+		parentTurnActive = false;
 	};
 
 	const sendGroupCompletions = (
@@ -782,26 +780,14 @@ export default function (pi: ExtensionAPI) {
 		groupId: string,
 		result: GroupExecutionResult,
 		generation: number,
-		parent: Pick<ExtensionContext, "isIdle" | "abort">,
 	): void => {
 		if (sessionShuttingDown || generation !== sessionGeneration) return;
 
 		const completion = { groupId, result, generation };
-		if (parentAssistantStreaming && !parent.isIdle()) {
-			// Abort only a currently streaming assistant response. Tool execution is
-			// left alone; its queued steer is consumed at the next normal boundary.
+		if (parentTurnActive) {
+			// Batch results from the active turn. Pi's steering queue delivers them
+			// after this response and its tool calls, before the next model request.
 			pendingCompletions.push(completion);
-			if (parentInterruptRequested) return;
-			parentInterruptRequested = true;
-			try {
-				parent.abort();
-			} catch {
-				// If the host cannot interrupt the active response, preserve the prior
-				// behavior and queue the results as ordinary steering messages.
-				parentInterruptRequested = false;
-				const fallback = pendingCompletions.splice(0);
-				sendGroupCompletions(fallback, { deliverAs: "steer", triggerTurn: true });
-			}
 			return;
 		}
 
@@ -809,36 +795,23 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("agent_start", () => {
-		parentAssistantStreaming = false;
+		parentTurnActive = false;
 	});
-	pi.on("message_start", (event) => {
-		if (event.message.role === "assistant") parentAssistantStreaming = true;
+	pi.on("turn_start", () => {
+		parentTurnActive = true;
 	});
-	pi.on("message_end", (event) => {
-		if (event.message.role !== "assistant") return;
-		parentAssistantStreaming = false;
-		if (!parentInterruptRequested || event.message.stopReason !== "aborted") return;
-
-		// Pi renders every aborted assistant response as "Operation aborted". This
-		// is an intentional handoff, not a user-visible failure; retain partial text
-		// but drop any incomplete tool calls so the canceled draft cannot execute.
-		return {
-			message: {
-				...event.message,
-				content: event.message.content.filter((part) => part.type !== "toolCall"),
-				stopReason: "stop",
-				errorMessage: undefined,
-			},
-		};
-	});
-	pi.on("tool_execution_start", () => {
-		parentAssistantStreaming = false;
+	pi.on("turn_end", () => {
+		parentTurnActive = false;
+		const ready = pendingCompletions.splice(0);
+		// Send at the safe boundary so all completions from this turn are batched
+		// and steered before Pi makes its next model request.
+		sendGroupCompletions(ready, { deliverAs: "steer", triggerTurn: true });
 	});
 	pi.on("agent_settled", () => {
-		parentAssistantStreaming = false;
-		parentInterruptRequested = false;
+		parentTurnActive = false;
 		const ready = pendingCompletions.splice(0);
-		// triggerTurn is deferred by Pi until the settlement event has finished.
+		// A run may settle without a turn_end boundary (for example, on abort).
+		// Defer triggerTurn until Pi has finished emitting this settlement event.
 		sendGroupCompletions(ready, { triggerTurn: true });
 	});
 
@@ -1081,7 +1054,7 @@ export default function (pi: ExtensionAPI) {
 		// detached below, so this never waits for a subagent to finish.
 		executionMode: "sequential",
 		description: [
-			"Delegate tasks to subagents with isolated context windows. Every launch returns immediately; continue independent work or return control to the user. Completed groups interrupt an actively streaming assistant response and interject a capped result; in-flight tools are not interrupted.",
+			"Delegate tasks to subagents with isolated context windows. Every launch returns immediately; continue independent work or return control to the user. Completed groups queue a steering message for the next assistant response after the current turn and its tool calls finish; they never abort the parent or interrupt an in-flight tool.",
 			"Single: {task}. Parallel: {tasks:[...], parallelLimit}. Chain: {chain:[...], onFailure, {previous}}.",
 			'Model and thinking level are chosen by the user: the first launch of each subagent type asks, and the answer is reused only for that type (optionally saved globally). Native OpenAI Luna models always use priority fast mode.',
 			"Use focused tasks with an explicit expected output; do not make one worker own discovery, implementation, and review.",
@@ -1095,9 +1068,9 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		parameters: SubagentParams,
 		promptGuidelines: [
-			"Use subagent proactively whenever one or more focused delegated tasks would materially improve the work; there is no mode gating and the main thread can keep working while they run. A completed result may preempt the main assistant's active response, but won't interrupt a tool already running.",
+			"Use subagent proactively whenever one or more focused delegated tasks would materially improve the work; there is no mode gating and the main thread can keep working while they run. Completed results are queued to steer the next assistant response after the current turn and its tool calls finish; they never abort the parent.",
 			"Use subagent to delegate independent, parallelizable work to a fresh context window; set parallelLimit to 2-4 when concurrency is useful.",
-			"When delegation is beneficial, launch the task and immediately continue independent main-thread work. If no useful work remains, return control to the user; completed results interrupt active assistant generation, but do not stop in-flight tools. Use subagent_status for live snapshots, subagent_history to inspect live or prior transcripts, and subagent_cancel to stop an unwanted run/group.",
+			"When delegation is beneficial, launch the task and immediately continue independent main-thread work. If no useful work remains, return control to the user; completed results are queued as steering for the next assistant response after the current turn and any tools finish. Use subagent_status for live snapshots, subagent_history to inspect live or prior transcripts, and subagent_cancel to stop an unwanted run/group.",
 			NO_DUPLICATE_WORK_DIRECTIVE,
 			"Prefer a scout/planner → focused worker → reviewer workflow instead of one broad worker call.",
 			"Use subagent chain with {previous} for dependent phases; set onFailure to continue only when later phases can recover from partial evidence.",
@@ -1444,7 +1417,7 @@ export default function (pi: ExtensionAPI) {
 					return groupResult;
 				})
 				.then((groupResult) => {
-					interjectGroupCompletion(groupId, groupResult, launchGeneration, ctx);
+					interjectGroupCompletion(groupId, groupResult, launchGeneration);
 					return groupResult;
 				});
 			void backgroundGroup.promise;
@@ -1454,7 +1427,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Started non-blocking ${mode} group ${groupId} with ${count} subagent run${count === 1 ? "" : "s"}. Continue independent work or return control to the user; the completed result will preempt active assistant generation and be interjected automatically. Use subagent_status with groupId ${groupId} only for a non-blocking snapshot.`,
+						text: `Started non-blocking ${mode} group ${groupId} with ${count} subagent run${count === 1 ? "" : "s"}. Continue independent work or return control to the user; the completed result will be queued to steer the next assistant response after the current turn and its tool calls finish. Use subagent_status with groupId ${groupId} only for a non-blocking snapshot.`,
 					},
 				],
 				details: { mode, groupId, nonBlocking: true, results: [] },
@@ -1902,7 +1875,7 @@ export default function (pi: ExtensionAPI) {
 				? `The user already chose subagent models per type (${entries.map(([type, preference]) => `${type}: ${describePreference(preference)}`).join(", ")}); do not ask again for those types. For a new type, ask on its first launch.`
 				: "The user is asked to choose the subagent model and thinking level on the first launch of each session's subagent type.";
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n[SUBAGENT DELEGATION] Subagents run in isolated context windows and are available at all times, with no mode gating. Delegate proactively whenever focused research, implementation, or review would materially improve the work. Every subagent launch is non-blocking and has a ${DEFAULT_SUBAGENT_TIMEOUT_SEC}s default hard timeout (set timeoutSec higher for long tasks); continue independent work or return control to the user. Completed groups interrupt an actively streaming assistant response and inject their capped result into this session; in-flight tool execution is not interrupted. Use subagent_status for live snapshots and run ids, subagent_history to inspect the transcript so far or past transcripts, and subagent_cancel to stop one run or an entire group; do not wait or poll for completion. ${NO_DUPLICATE_WORK_DIRECTIVE} ${choice}`,
+			systemPrompt: `${event.systemPrompt}\n\n[SUBAGENT DELEGATION] Subagents run in isolated context windows and are available at all times, with no mode gating. Delegate proactively whenever focused research, implementation, or review would materially improve the work. Every subagent launch is non-blocking and has a ${DEFAULT_SUBAGENT_TIMEOUT_SEC}s default hard timeout (set timeoutSec higher for long tasks); continue independent work or return control to the user. Completed groups queue their capped result as a steering message for the next assistant response after the current turn and its tool calls finish; they never abort active parent work. Use subagent_status for live snapshots and run ids, subagent_history to inspect the transcript so far or past transcripts, and subagent_cancel to stop one run or an entire group; do not wait or poll for completion. ${NO_DUPLICATE_WORK_DIRECTIVE} ${choice}`,
 		};
 	});
 }
