@@ -177,7 +177,8 @@ openclose() {
   exit
 }
 
-# Create a fresh remote tmux session on Hercules; use --attach to reconnect.
+# Create fresh sessions remotely; attach/list are explicit to avoid surprises.
+# This SSH command is noninteractive, so set UTF-8 before tmux starts.
 hercules() {
   local mode="new"
   local session
@@ -224,9 +225,9 @@ hercules() {
     return 2
   fi
 
-  local remote_command="tmux new-session -s $session"
+  local remote_command="LANG=en_US.UTF-8 tmux new-session -s $session"
   if [[ "$mode" == 'attach' ]]; then
-    remote_command="tmux new-session -A -s $session"
+    remote_command="LANG=en_US.UTF-8 tmux new-session -A -s $session"
   fi
 
   print -r -- "Hercules tmux session ($mode): $session"
