@@ -177,6 +177,18 @@ openclose() {
   exit
 }
 
+# Attach to a persistent tmux session running on Hercules.
+hercules() {
+  local session="${1:-main}"
+  if (( $# > 1 )) || [[ ! "$session" =~ '^[[:alnum:]][[:alnum:]_-]*$' ]]; then
+    print -u2 -- 'Usage: hercules [session-name]'
+    return 2
+  fi
+
+  local remote_command="tmux new-session -A -s $session"
+  ssh -t Hercules "$remote_command"
+}
+
 # Ghostty's OSC-title hooks and optional native foreground-process monitor.
 [[ -r "$HOME/.config/ghostty/title.zsh" ]] && source "$HOME/.config/ghostty/title.zsh"
 

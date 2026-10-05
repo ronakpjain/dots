@@ -73,6 +73,9 @@ The script installs everything: yay packages, zsh plugins, symlinks, Neovim plug
 - [vivid](https://github.com/sharkdp/vivid) LS_COLORS with Catppuccin Mocha
 - [eza](https://github.com/eza-community/eza) as `ls` replacement with icons
 
+### Hercules tmux access
+On macOS, run `hercules` to SSH to Hercules and create or reattach to the persistent tmux session `main` running there (tmux is not run locally). Pass an optional session name, such as `hercules work`. Install tmux on Hercules with `sudo pacman -S --needed tmux` if it is not already installed.
+
 ### macOS — Symlinks
 
 | Source | Target |
@@ -105,7 +108,7 @@ The script installs everything: yay packages, zsh plugins, symlinks, Neovim plug
 | Category | Packages |
 |---|---|
 | **Tiling WM** | hyprland, niri, waybar, rofi, hyprlock, hyprpaper, awww-bin, uwsm |
-| **Terminal & Shell** | kitty, ghostty, zsh, eza, fzf, fd, ripgrep, zoxide, vivid, tree |
+| **Terminal & Shell** | kitty, ghostty, tmux, zsh, eza, fzf, fd, ripgrep, zoxide, vivid, tree |
 | **Editors** | neovim |
 | **Languages** | python, nodejs, bun, go, rust, lua, luajit |
 | **LSP & Formatters** | stylua, prettier, python-lsp-server, python-debugpy, gopls, rust-analyzer, lua-language-server, clang, lldb, texlab, texlive-binextra, svelte-language-server, typescript-language-server, neocmakelsp, marksman, verible, ty, tree-sitter |

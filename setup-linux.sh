@@ -85,6 +85,7 @@ yay_install uwsm  # universal wayland session manager
 # ── Terminal & shell ───────────────────────────────────
 info "Installing terminal & shell packages..."
 yay_install kitty
+yay_install tmux
 yay_install ghostty
 yay_install zsh
 yay_install zsh-autosuggestions
