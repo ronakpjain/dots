@@ -130,9 +130,97 @@ describe("safety gate session approvals", () => {
 
 		await handlers.session_start({}, ctx);
 		selected = "Deny";
-		await handlers.tool_call(second, ctx);
+		const denied = await handlers.tool_call(second, ctx);
 		expect(promptCount).toBe(2);
+		expect(denied).toEqual({ block: true, reason: "User denied remote Git write." });
 		expect(commandHandler).toBeDefined();
 		await commandHandler!("clear", ctx);
+	});
+
+	test("sends an optional denial explanation to the model in the block reason", async () => {
+		const handlers: Record<string, (event: any, ctx: any) => unknown> = {};
+		let offeredOptions: string[] = [];
+		let inputPrompt = "";
+		safetyGate({
+			on(name: string, handler: (event: any, ctx: any) => unknown) {
+				handlers[name] = handler;
+			},
+			registerCommand() {},
+		} as any);
+
+		const explanation = "Do not push until I have reviewed the changes.";
+		const ctx = {
+			cwd: "/tmp/project",
+			hasUI: true,
+			signal: undefined,
+			ui: {
+				select: async (_title: string, options: string[]) => {
+					offeredOptions = options;
+					return "Deny and tell model why";
+				},
+				input: async (title: string) => {
+					inputPrompt = title;
+					return explanation;
+				},
+				confirm: async () => true,
+				notify: () => {},
+				setStatus: () => {},
+			},
+		};
+		const result = await handlers.tool_call(bash("git push origin main"), ctx);
+
+		expect(offeredOptions).toContain("Deny and tell model why");
+		expect(inputPrompt).toBe("Why deny this action? The explanation will be sent to the model.");
+		expect(result).toEqual({
+			block: true,
+			reason: `User denied remote Git write. User's reason: ${explanation}`,
+		});
+	});
+
+	test("keeps denials blocked for cancelled, empty, and failed explanation prompts", async () => {
+		const handlers: Record<string, (event: any, ctx: any) => unknown> = {};
+		let promptCount = 0;
+		let inputValue: string | undefined;
+		let failInput = false;
+		safetyGate({
+			on(name: string, handler: (event: any, ctx: any) => unknown) {
+				handlers[name] = handler;
+			},
+			registerCommand() {},
+		} as any);
+
+		const ctx = {
+			cwd: "/tmp/project",
+			hasUI: true,
+			signal: undefined,
+			ui: {
+				select: async () => {
+					promptCount += 1;
+					return "Deny and tell model why";
+				},
+				input: async () => {
+					if (failInput) throw new Error("dialog failed");
+					return inputValue;
+				},
+				confirm: async () => true,
+				notify: () => {},
+				setStatus: () => {},
+			},
+		};
+		const event = bash("git push origin main");
+		const genericDenial = { block: true, reason: "User denied remote Git write." };
+
+		for (const value of [undefined, "", " \t "]) {
+			inputValue = value;
+			expect(await handlers.tool_call(event, ctx)).toEqual(genericDenial);
+		}
+		inputValue = "  Wait until I review the changes.  ";
+		expect(await handlers.tool_call(event, ctx)).toEqual({
+			block: true,
+			reason: "User denied remote Git write. User's reason: Wait until I review the changes.",
+		});
+		failInput = true;
+		expect(await handlers.tool_call(event, ctx)).toEqual(genericDenial);
+		expect(promptCount).toBe(5);
 	});
 });

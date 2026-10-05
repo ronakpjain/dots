@@ -24,6 +24,7 @@ const ALLOW_ONCE = "Allow once";
 const ALLOW_EXACT = "Always allow this exact command in this session";
 const ALLOW_RELATED = "Always allow related commands in this session";
 const DENY = "Deny";
+const DENY_WITH_REASON = "Deny and tell model why";
 const SAFETY_CAPABILITY =
 	"[SAFETY CAPABILITY] A default-on permission gate protects destructive shell, Git, deployment, and sensitive-file actions. Normal coding edits do not need confirmation; denied dangerous actions must not be retried without approval. The gate can remember an explicitly selected exact command or operation family for the current session only.";
 
@@ -381,7 +382,7 @@ export default function safetyGateExtension(pi: ExtensionAPI): void {
 
 		const options = [ALLOW_ONCE, ALLOW_EXACT];
 		if (risk.family) options.push(ALLOW_RELATED);
-		options.push(DENY);
+		options.push(DENY, DENY_WITH_REASON);
 		const choice = await ctx.ui.select(`Approve ${risk.category}?\n\n${risk.detail}`, options, {
 			signal: ctx.signal,
 			timeout: 120_000,
@@ -397,6 +398,20 @@ export default function safetyGateExtension(pi: ExtensionAPI): void {
 			rememberApproval("related", event, ctx.cwd, risk, approvals);
 			updateStatus(ctx);
 			return;
+		}
+		if (choice === DENY_WITH_REASON) {
+			let explanation: string | undefined;
+			try {
+				explanation = await ctx.ui.input(
+					"Why deny this action? The explanation will be sent to the model.",
+					"Explain why this action should not run",
+					{ signal: ctx.signal, timeout: 120_000 },
+				);
+			} catch {
+				// The user already chose denial; a failed explanation prompt must not allow the tool.
+			}
+			const reason = explanation?.trim();
+			if (reason) return { block: true, reason: `User denied ${risk.category}. User's reason: ${reason}` };
 		}
 		return { block: true, reason: `User denied ${risk.category}.` };
 	});
