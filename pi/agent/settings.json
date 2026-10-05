@@ -1,8 +1,11 @@
 {
-  "lastChangelogVersion": "1.0.0",
+  "lastChangelogVersion": "1.0.3",
   "defaultProvider": "openai",
   "defaultModel": "gpt-6-luna",
   "defaultThinkingLevel": "max",
+  "defaultTools": [
+    "+codemode"
+  ],
   "hideThinkingBlock": false,
   "enableSkillCommands": true,
   "theme": "catppuccin-mocha",
@@ -10,11 +13,11 @@
     "https://github.com/carderne/pi-nvim"
   ],
   "enabledModels": [
-    "openrouter/deepseek/deepseek-v4.1-flash",
-    "openrouter/z-ai/glm-5.3-flash",
-    "openrouter/meta/muse-spark-1.3-contributor",
+    "openai/gpt-6-luna",
     "openai/gpt-6.1-sol",
-    "openai/gpt-6-luna"
+    "openrouter/meta/muse-spark-1.3-contributor",
+    "openrouter/z-ai/glm-5.3-flash",
+    "openrouter/deepseek/deepseek-v4.1-flash"
   ],
   "deviceId": "64c819ba-7b2c-4f69-bec7-e88e12a0cb2b"
 }
