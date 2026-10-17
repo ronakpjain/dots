@@ -45,7 +45,8 @@ function nameFromText(text: string): string | undefined {
 	return normalized.length > MAX_NAME_LENGTH ? `${normalized.slice(0, MAX_NAME_LENGTH - 1).trimEnd()}…` : normalized;
 }
 
-function goalFromPrompt(prompt: string): string | undefined {
+function goalFromPrompt(prompt: string | undefined): string | undefined {
+	if (typeof prompt !== "string") return undefined;
 	const match = prompt.match(
 		/Original goal:\s*([\s\S]*?)(?:\n\s*Current designed plan:|\n\s*Work autonomously toward this goal\.|\n\s*\n)/i,
 	);

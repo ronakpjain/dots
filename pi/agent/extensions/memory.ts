@@ -178,7 +178,8 @@ function memoryQuery(query: string | undefined): string | undefined {
 	return trimmed;
 }
 
-function shouldRetrieveAtStart(prompt: string): boolean {
+function shouldRetrieveAtStart(prompt: string | undefined): boolean {
+	if (typeof prompt !== "string") return false;
 	const normalized = prompt.trim().toLowerCase();
 	if (!normalized) return false;
 
