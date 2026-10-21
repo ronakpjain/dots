@@ -28,6 +28,9 @@ import {
 import { applyFastMode, isLunaModel } from "../fast-mode.ts";
 import { toolResultContentText } from "../tool-results/format.ts";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import memoryExtension from "../memory.ts";
 
 export interface SubagentTaskSpec {
 	name: string;
@@ -109,12 +112,38 @@ export interface RunOptions {
 }
 
 const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+const SUBAGENT_TOOLS = [...BUILTIN_TOOLS, "memory"] as const;
+const execFileAsync = promisify(execFile);
+let capturedMemoryTool: Record<string, any> | undefined;
+
+function getMemoryTool(): Record<string, any> {
+	if (!capturedMemoryTool) {
+		memoryExtension({
+			on: () => {},
+			registerCommand: () => {},
+			registerTool: (definition: Record<string, any>) => { if (definition.name === "memory") capturedMemoryTool = definition; },
+			exec: async (command: string, args: string[], options: { cwd?: string; timeout?: number }) => {
+				try {
+					const result = await execFileAsync(command, args, { cwd: options.cwd, timeout: options.timeout });
+					return { code: 0, stdout: result.stdout, stderr: result.stderr };
+				} catch (error) {
+					const e = error as { code?: number; stdout?: string; stderr?: string };
+					return { code: typeof e.code === "number" ? e.code : 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+				}
+			},
+		} as never);
+	}
+	if (!capturedMemoryTool) throw new Error("Memory extension did not register its memory tool");
+	return capturedMemoryTool;
+}
+
 const DEFAULT_SUBAGENT_SYSTEM_PROMPT = [
 	"You are a focused subagent inside a larger orchestration.",
 	"Work only on the assigned task and return the requested evidence or change; do not broaden the scope without telling the orchestrator.",
 	"Use tools efficiently: batch independent reads/searches, avoid rereading unchanged context, and validate meaningful work before concluding.",
 	"Treat the task's expected output as a contract. End with a concise result that separates verified findings, assumptions, and remaining risks.",
 	"If you are nearing the turn budget, stop exploring and summarize the best verified partial result rather than starting another tool loop.",
+	"For substantive project work, retrieve relevant memories early (usually before consequential assumptions or edits); use results only as candidates and verify them against the current task. Save verified reusable lessons and especially repeated user instructions or corrections; retrieve/search first, edit duplicates or stale notes rather than creating duplicates. Never save secrets, transient details, or logs.",
 ].join("\n");
 
 const TOOL_FACTORIES: Record<
@@ -221,6 +250,7 @@ function buildTools(spec: SubagentTaskSpec, defaultCwd: string, model: Model<any
 			getSessionId: () => `subagent-${process.pid}`,
 			getSessionFile: () => undefined,
 		},
+		cwd,
 	};
 
 	const wrapped: AgentToolLike[] = [];
@@ -248,12 +278,24 @@ function buildTools(spec: SubagentTaskSpec, defaultCwd: string, model: Model<any
 				def.execute(toolCallId, params, signal, onUpdate, mockCtx) as Promise<unknown>,
 		});
 	}
+	if (!allowed || allowed.has("memory")) {
+		const def = getMemoryTool();
+		wrapped.push({
+			name: def.name,
+			label: def.label,
+			description: def.description,
+			parameters: def.parameters,
+			executionMode: def.executionMode,
+			execute: (toolCallId, params, signal, onUpdate) =>
+				def.execute(toolCallId, params, signal, onUpdate, mockCtx),
+		} as AgentToolLike);
+	}
 	return wrapped;
 }
 
 function expectedToolNames(spec: SubagentTaskSpec): string[] {
 	const allowed = spec.tools && spec.tools.length > 0 ? new Set(spec.tools) : undefined;
-	return BUILTIN_TOOLS.filter((name) => !allowed || allowed.has(name));
+	return SUBAGENT_TOOLS.filter((name) => !allowed || allowed.has(name));
 }
 
 function sessionMismatch(agent: Agent, spec: SubagentTaskSpec, model: Model<any>): string | undefined {

@@ -30,9 +30,9 @@ const MEMORY_CAPABILITY_PROMPT =
 	"[MEMORY CAPABILITY] Persistent memory is available through the memory tool. Memory contents are only loaded after an explicit retrieve call; use focused queries or known ids when prior context is likely to matter. Users can inspect it without involving the model with /memory, /memory list, /memory search <query>, and /memory stats. The tool also supports explicit archive, restore, delete, merge, and stats maintenance actions.";
 const MEMORY_WORKFLOW_PROMPT = [
 	"[MEMORY WORKFLOW]",
-	"At the start of a non-trivial project request or ongoing task, or when a request may depend on a personal preference, prior decision, or established constraint, use memory action=retrieve before editing, creating, or making consequential assumptions; this should usually be the first tool call. Do not retrieve for isolated factual questions, routine edits, or tasks with no plausible relevant saved context. Use a focused query or known id and a small limit; never dump the full store just in case. Treat matches as candidates: use only context clearly relevant to this project and request, and do not repeat unrelated memory. If no memory matches, continue with the task.",
-	"Before the final response, review whether the user explicitly asked to remember something or stated a genuinely durable preference, fact, decision, or reusable project constraint. Retrieve/search first to avoid duplicates, then use memory action=create only when appropriate or action=edit for an existing memory. If the user asks to remember something, saving it is required unless they cancel or the information is unsafe to retain.",
-	"Never save passwords, API keys, OTPs, payment data, or other secrets, and do not save transient one-off details or speculative assumptions. Avoid duplicate memories, and do not claim that something was remembered unless the memory tool actually saved it.",
+	"At the start of a non-trivial project request or ongoing task, or when a request may depend on a personal preference, prior decision, or established constraint, use memory action=retrieve before editing, creating, or making consequential assumptions; this should usually be the first tool call. Do not retrieve for isolated factual questions, routine edits, or tasks with no plausible relevant saved context. Use a focused query or known ids and a small limit; never dump the full store just in case. Retrieval is explicit: do not inject or assume memory contents without a retrieve call. Treat matches as candidates and use only context clearly relevant to this project and request.",
+	"Before the final response, proactively save verified, reusable discoveries from meaningful work—especially hard-won debugging lessons, reliable workflows, and decisions—even when the user did not explicitly ask you to remember them. Repeated user instructions, preferences, constraints, and corrections are a strong signal to save or update a memory so the user need not repeat them. Keep notes small, atomic, and actionable; retrieve/search first, edit stale existing memories rather than duplicating them, and use action=create only when useful. If the user asks to remember something, saving it is required unless they cancel or the information is unsafe to retain.",
+	"Never save passwords, API keys, OTPs, payment data, other secrets, speculation, transient details, or task logs. Avoid duplicates, and do not claim that something was remembered unless the memory tool actually saved it.",
 ].join("\n");
 const MEMORY_TASK_PROMPT = [
 	"[MEMORY TASK CHECK] This request appears to involve non-trivial project work, an ongoing task, prior context, a preference, a decision, or an established constraint.",
@@ -52,6 +52,7 @@ type MemoryAction = "create" | "edit" | "retrieve" | "archive" | "restore" | "de
 
 interface Memory {
 	id: string;
+	project: string;
 	title: string;
 	content: string;
 	tags: string[];
@@ -109,6 +110,9 @@ const MemoryParams = Type.Object({
 			maxItems: MAX_MEMORY_TAGS,
 		}),
 	),
+	project: Type.Optional(
+		Type.String({ description: "Memory scope: current (default), global, all (retrieve only), or an explicit project path" }),
+	),
 	query: Type.Optional(
 		Type.String({
 			description: "Case-insensitive terms to search in ids, titles, content, and tags",
@@ -130,6 +134,23 @@ function memoryFilePath(): string {
 
 	const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
 	return join(agentDir, "memories.json");
+}
+
+async function currentProject(pi: ExtensionAPI, cwd: string): Promise<string> {
+	try {
+		const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: 3_000 });
+		if (result.code === 0 && result.stdout.trim()) return resolve(result.stdout.trim());
+	} catch {
+		// Non-Git working directories still get a stable path-based project scope.
+	}
+	return resolve(cwd || process.cwd());
+}
+
+async function resolveProject(pi: ExtensionAPI, value: string | undefined, cwd: string): Promise<string> {
+	if (value === "global") return "global";
+	if (value === "all") return "all";
+	if (value === undefined || value === "current") return currentProject(pi, cwd || process.cwd());
+	return resolve(cwd || process.cwd(), value);
 }
 
 function nonEmpty(value: string | undefined, field: string): string {
@@ -246,6 +267,9 @@ function validateStore(value: unknown, file: string): MemoryStore {
 			tags: normalizeTags(item.tags),
 			createdAt: item.createdAt,
 			updatedAt: item.updatedAt,
+			project: typeof (memory as { project?: unknown }).project === "string"
+				? (memory as { project: string }).project
+				: "global",
 			archived: item.archived === true,
 		};
 	});
@@ -315,9 +339,13 @@ function retrieveMemories(
 	query: string | undefined,
 	limit: number,
 	includeArchived: boolean,
+	projects?: Set<string>,
 ): Memory[] {
-	const candidates = store.memories.filter((memory) => includeArchived || !memory.archived);
-	if (id) return candidates.filter((memory) => memory.id === id).slice(0, 1);
+	const candidates = store.memories.filter(
+		(memory) => (includeArchived || !memory.archived) && (!projects || projects.has(memory.project)),
+	);
+	// A known id is an intentional request and remains retrievable across scopes.
+	if (id) return store.memories.filter((memory) => (includeArchived || !memory.archived) && memory.id === id).slice(0, 1);
 
 	const terms = [...new Set((query ?? "").toLowerCase().split(/\s+/).filter(Boolean))];
 	if (terms.length === 0) {
@@ -360,9 +388,10 @@ function memoryLine(memory: Memory, includeContent: boolean): string {
 	const display = publicMemory(memory, includeContent ? MAX_SEARCH_CONTENT : 0);
 	const tags = display.tags.length > 0 ? ` [${display.tags.join(", ")}]` : "";
 	const archived = display.archived ? " (archived)" : "";
+	const scope = display.project === "global" ? "global" : `project: ${display.project}`;
 	return includeContent
-		? `- ${display.id}: ${display.title}${archived}${tags}\n  ${display.content}`
-		: `- ${display.id}: ${display.title}${archived}${tags}`;
+		? `- ${display.id}: ${display.title} (${scope})${archived}${tags}\n  ${display.content}`
+		: `- ${display.id}: ${display.title} (${scope})${archived}${tags}`;
 }
 
 function formatMemoryIndex(memories: Memory[], availableCount: number): string {
@@ -386,10 +415,13 @@ function formatToolRetrieval(
 	memories: Memory[],
 	isFocused: boolean,
 	includeArchived: boolean,
+	projects?: Set<string>,
 ): string {
 	if (memories.length === 0) return "No memories found.";
 	const lines = memories.map((memory) => memoryLine(memory, isFocused));
-	const availableCount = store.memories.filter((memory) => includeArchived || !memory.archived).length;
+	const availableCount = store.memories.filter(
+		(memory) => (includeArchived || !memory.archived) && (!projects || projects.has(memory.project)),
+	).length;
 	const heading = isFocused
 		? `Found ${memories.length} memor${memories.length === 1 ? "y" : "ies"}`
 		: `Memory index (${availableCount} available; showing ${memories.length})`;
@@ -426,7 +458,7 @@ function commandUsage(action: string): string {
 	return "Usage: /memory [help]";
 }
 
-async function executeMemoryCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+async function executeMemoryCommand(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
 	const { action, values, includeArchived, invalid } = commandTokens(args);
 	if (action !== "list" && action !== "search" && action !== "stats" && action !== "help") {
 		ctx.ui.notify(
@@ -477,19 +509,23 @@ async function executeMemoryCommand(args: string, ctx: ExtensionCommandContext):
 	try {
 		await withFileMutationQueue(file, async () => {
 			const store = await readStore(file);
+			const cwd = ctx.cwd || process.cwd();
+			const projects = new Set([await currentProject(pi, cwd), "global"]);
 			if (action === "stats") {
 				ctx.ui.notify(formatStats(memoryStats(store)), "info");
 				return;
 			}
 
 			if (action === "list") {
-				const available = store.memories.filter((memory) => includeArchived || !memory.archived);
-				const memories = retrieveMemories(store, undefined, undefined, COMMAND_LIST_LIMIT, includeArchived);
+				const available = store.memories.filter(
+					(memory) => (includeArchived || !memory.archived) && projects.has(memory.project),
+				);
+				const memories = retrieveMemories(store, undefined, undefined, COMMAND_LIST_LIMIT, includeArchived, projects);
 				ctx.ui.notify(formatMemoryIndex(memories, available.length), "info");
 				return;
 			}
 
-			const matches = retrieveMemories(store, undefined, query, DEFAULT_LIMIT, includeArchived);
+			const matches = retrieveMemories(store, undefined, query, DEFAULT_LIMIT, includeArchived, projects);
 			const memories = matches.map((memory) => publicMemory(memory, MAX_SEARCH_CONTENT));
 			ctx.ui.notify(formatMemorySearch(query, memories), "info");
 		});
@@ -502,16 +538,30 @@ async function executeMemoryCommand(args: string, ctx: ExtensionCommandContext):
 }
 
 export default function memoryExtension(pi: ExtensionAPI): void {
-	pi.on("before_agent_start", (event) => ({
+	let retrievalRequired = false;
+	let retrieved = false;
+	pi.on("tool_call", (event) => {
+		if (retrievalRequired && !retrieved && (event.toolName === "edit" || event.toolName === "write")) {
+			return { block: true, reason: "Retrieve relevant memory before changing files for this task. Call memory with action=retrieve and a focused query; an empty successful search is sufficient. Then retry this operation." };
+		}
+	});
+	pi.on("tool_result", (event) => {
+		if (event.toolName === "memory" && event.input.action === "retrieve" && !event.isError) retrieved = true;
+	});
+	pi.on("before_agent_start", (event) => {
+		retrievalRequired = shouldRetrieveAtStart("prompt" in event ? event.prompt : undefined);
+		retrieved = false;
+		return ({
 		systemPrompt: [
 			event.systemPrompt,
 			MEMORY_CAPABILITY_PROMPT,
 			MEMORY_WORKFLOW_PROMPT,
-			shouldRetrieveAtStart(event.prompt) ? MEMORY_TASK_PROMPT : undefined,
+			retrievalRequired ? MEMORY_TASK_PROMPT : undefined,
 		]
 			.filter((section): section is string => Boolean(section))
 			.join("\n\n"),
-	}));
+		});
+	});
 
 	pi.registerCommand("memory", {
 		description: "Browse persistent memory or search saved context",
@@ -519,7 +569,7 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 			["help", "list", "search", "stats"]
 				.filter((value) => value.startsWith(prefix.trim().toLowerCase()))
 				.map((value) => ({ value, label: value })),
-		handler: async (args, ctx) => executeMemoryCommand(args, ctx),
+		handler: async (args, ctx) => executeMemoryCommand(args, ctx, pi),
 	});
 
 	pi.registerTool({
@@ -529,9 +579,10 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 			"Create, edit, retrieve, archive, restore, delete, merge, and inspect persistent memories stored in a local JSON file. Retrieve relevant context before acting; retrieve before editing when you do not already know a memory id.",
 		promptSnippet: "Retrieve relevant context and save durable user memories",
 		promptGuidelines: [
-			"For non-trivial project work or ongoing tasks, and for requests involving a preference, prior decision, or established constraint, use memory with action=retrieve early (usually the first tool call) before editing, creating, or making consequential assumptions; use a focused query or known id and a small limit. Treat matches as candidates and ignore unrelated project context.",
-			"Do not call memory for isolated factual questions, routine edits, or tasks where saved context is unlikely to matter; never retrieve the whole store just in case.",
-			"At the end of a task, review for a user-requested or genuinely durable fact, preference, decision, or project constraint. Use action=create only when it is safe and useful to retain; retrieve/search first to avoid creating a duplicate, then use action=edit for an existing memory.",
+			"For non-trivial project work or ongoing tasks, and for requests involving a preference, prior decision, or established constraint, use memory with action=retrieve early (usually the first tool call) before editing, creating, or making consequential assumptions; use a focused query or known id and a small limit. Default retrieval includes only the current project and global memories; use project=all only for deliberate cross-project retrieval. Treat matches as candidates and ignore unrelated context.",
+			"Do not call memory for isolated factual questions, routine edits, or tasks where saved context is unlikely to matter; never retrieve the whole store just in case. Memory contents are never implicitly injected.",
+			"Proactively save verified, reusable discoveries from meaningful work—hard-won debugging lessons, reliable workflows, and decisions—even without an explicit remember request. Repeated user instructions and corrections are a strong save/update signal. Keep notes small, atomic, and actionable; retrieve/search first, edit stale memories rather than duplicating them, and create only safe, useful notes.",
+			"At the end of a task, review for a user-requested or genuinely durable fact, preference, decision, reusable discovery, or project constraint. Use action=create only when safe and useful; retrieve/search first to avoid duplicates, then use action=edit for an existing memory.",
 			"Use memory with action=edit only after retrieving the target memory or when its exact id is already known, and update an existing memory instead of creating a duplicate.",
 			"Never save passwords, API keys, OTPs, payment data, other secrets, transient one-off details, or speculative assumptions with memory.",
 			"Use archive/restore/delete/merge/stats only for explicit memory maintenance; merge archives the source after combining it into the target, and stats never returns memory content.",
@@ -540,12 +591,15 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const file = memoryFilePath();
+			const cwd = typeof _ctx?.cwd === "string" && _ctx.cwd ? _ctx.cwd : process.cwd();
 
 			return withFileMutationQueue(file, async () => {
 				const store = await readStore(file);
 				const now = new Date().toISOString();
 
 				if (params.action === "create") {
+					const project = await resolveProject(pi, params.project, cwd);
+					if (project === "all") throw new Error("project=all is only valid for retrieve");
 					const title = limitedNonEmpty(params.title, "title", MAX_MEMORY_TITLE);
 					const content = nonEmpty(params.content, "content");
 					const tags = memoryTags(params.tags);
@@ -555,6 +609,7 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 
 					const memory: Memory = {
 						id: `mem_${randomUUID()}`,
+						project,
 						title,
 						content,
 						tags,
@@ -574,6 +629,11 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 				if (params.action === "edit") {
 					const id = limitedNonEmpty(params.id, "id", MAX_MEMORY_ID);
 					const memory = findMemory(store, id);
+					if (params.project !== undefined) {
+						const project = await resolveProject(pi, params.project, cwd);
+						if (project === "all") throw new Error("project=all is only valid for retrieve");
+						memory.project = project;
+					}
 					if (params.title !== undefined)
 						memory.title = limitedNonEmpty(params.title, "title", MAX_MEMORY_TITLE);
 					if (params.content !== undefined) {
@@ -583,8 +643,13 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 						}
 					}
 					if (params.tags !== undefined) memory.tags = memoryTags(params.tags);
-					if (params.title === undefined && params.content === undefined && params.tags === undefined) {
-						throw new Error("memory edit requires at least one of title, content, or tags");
+					if (
+						params.title === undefined &&
+						params.content === undefined &&
+						params.tags === undefined &&
+						params.project === undefined
+					) {
+						throw new Error("memory edit requires at least one of title, content, tags, or project");
 					}
 					memory.updatedAt = now;
 					await writeStore(file, store);
@@ -631,6 +696,9 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 					if (targetId === sourceId) throw new Error("memory merge requires different targetId and sourceId");
 					const target = findMemory(store, targetId);
 					const source = findMemory(store, sourceId);
+					if (target.project !== source.project) {
+						throw new Error("memory merge requires both memories to have the same project scope");
+					}
 					const mergedContent = `${target.content.trim()}\n\n${source.content.trim()}`.trim();
 					if (mergedContent.length > MAX_MEMORY_CONTENT) {
 						throw new Error(`merged memory content is limited to ${MAX_MEMORY_CONTENT} characters`);
@@ -659,10 +727,17 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 				const limit = params.limit ?? DEFAULT_LIMIT;
 				const query = memoryQuery(params.query);
 				const includeArchived = params.includeArchived === true;
-				const matches = retrieveMemories(store, params.id, query, limit, includeArchived);
+				const project = await resolveProject(pi, params.project, cwd);
+				const projects =
+					project === "all"
+						? undefined
+						: params.project === undefined || params.project === "current"
+							? new Set([project, "global"])
+							: new Set([project]);
+				const matches = retrieveMemories(store, params.id, query, limit, includeArchived, projects);
 				const isFocused = Boolean(params.id || query);
 				const memories = matches.map((memory) => publicMemory(memory, isFocused ? MAX_SEARCH_CONTENT : 0));
-				return textResult(formatToolRetrieval(store, memories, isFocused, includeArchived), {
+				return textResult(formatToolRetrieval(store, memories, isFocused, includeArchived, projects), {
 					action: params.action,
 					file,
 					memories,

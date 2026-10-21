@@ -34,6 +34,11 @@ function runtime(): Runtime {
 		on: (event: string, handler: Handler) => result.handlers.set(event, handler),
 		registerCommand: (name: string, command: Command) => result.commands.set(name, command),
 		registerTool: (tool: Tool) => result.tools.set(tool.name, tool),
+		exec: async (_command: string, _args: string[], options: { cwd: string }) => ({
+			code: 0,
+			stdout: options.cwd,
+			stderr: "",
+		}),
 	} as never);
 	return result;
 }
@@ -54,9 +59,17 @@ async function withStore<T>(memories: unknown[], callback: (file: string, runtim
 	}
 }
 
-function memory(id: string, title: string, content: string, tags: string[] = [], archived = false) {
+function memory(
+	id: string,
+	title: string,
+	content: string,
+	tags: string[] = [],
+	archived = false,
+	project?: string,
+) {
 	return {
 		id,
+		...(project === undefined ? {} : { project }),
 		title,
 		content,
 		tags,
@@ -75,6 +88,27 @@ function commandContext(runtime: Runtime) {
 }
 
 describe("memory workflow", () => {
+	test("requires successful retrieval before project edits, including nested tool calls", async () => {
+		const rt = runtime();
+		const start = rt.handlers.get("before_agent_start")!;
+		const call = rt.handlers.get("tool_call")!;
+		const result = rt.handlers.get("tool_result")!;
+		await start({ prompt: "Implement this repository feature", systemPrompt: "base" });
+		expect(call({ toolName: "edit", input: {} })?.block).toBe(true);
+		expect(call({ toolName: "write", parentToolCallId: "batch", input: {} })?.block).toBe(true);
+		expect(call({ toolName: "read", input: {} })).toBeUndefined();
+		result({ toolName: "memory", input: { action: "stats" }, isError: false });
+		expect(call({ toolName: "edit", input: {} })?.block).toBe(true);
+		result({ toolName: "memory", input: { action: "retrieve" }, isError: true });
+		expect(call({ toolName: "edit", input: {} })?.block).toBe(true);
+		result({ toolName: "memory", input: { action: "retrieve" }, isError: false });
+		expect(call({ toolName: "edit", input: {} })).toBeUndefined();
+		await start({ prompt: "Implement another repository feature", systemPrompt: "base" });
+		expect(call({ toolName: "edit", input: {} })?.block).toBe(true);
+		await start({ prompt: "Fix this typo", systemPrompt: "base" });
+		expect(call({ toolName: "edit", input: {} })).toBeUndefined();
+	});
+
 	test("adds explicit retrieve/save guidance without implicitly loading contents", async () => {
 		await withStore(
 			[memory("mem_commit", "Git commit message style", "Use plain descriptive Git commit subjects.", ["git"])],
@@ -307,6 +341,65 @@ describe("memory workflow", () => {
 		);
 	});
 
+	test("scopes default retrieval to current and legacy-global memories, with deliberate all-scope retrieval", async () => {
+		await withStore(
+			[
+				memory("legacy", "Legacy", "legacy content"),
+				memory("here", "Current", "current content", [], false, "/work/repo"),
+				memory("there", "Other project", "other content", [], false, "/work/other"),
+			],
+			async (_file, runtime) => {
+				const tool = runtime.tools.get("memory")!;
+				const ctx = { cwd: "/work/repo" };
+				const result = await tool.execute("test", { action: "retrieve", query: "content" }, undefined, undefined, ctx);
+				const text = (result.content as { text: string }[])[0].text;
+				expect(text).toContain("legacy");
+				expect(text).toContain("here");
+				expect(text).not.toContain("there");
+				expect(text).toContain("global");
+				expect(text).toContain("project: /work/repo");
+
+				const all = await tool.execute("test", { action: "retrieve", query: "content", project: "all" }, undefined, undefined, ctx);
+				expect((all.content as { text: string }[])[0].text).toContain("there");
+			},
+		);
+	});
+
+	test("migrates legacy scope to global and allows exact-id retrieval across projects", async () => {
+		await withStore([memory("foreign", "Foreign", "known content", [], false, "/elsewhere")], async (_file, runtime) => {
+			const tool = runtime.tools.get("memory")!;
+			const result = await tool.execute("test", { action: "retrieve", id: "foreign" }, undefined, undefined, { cwd: "/here" });
+			expect((result.content as { text: string }[])[0].text).toContain("foreign");
+		});
+		await withStore([memory("legacy", "Legacy", "old content")], async (file, runtime) => {
+			const tool = runtime.tools.get("memory")!;
+			await tool.execute("test", { action: "edit", id: "legacy", title: "Migrated" }, undefined, undefined, { cwd: "/here" });
+			const saved = JSON.parse(await readFile(file, "utf8"));
+			expect(saved.memories[0].project).toBe("global");
+		});
+	});
+
+	test("creates in current scope, preserves edit scope, and refuses cross-scope merges", async () => {
+		await withStore([memory("global", "Global", "one", [], false, "global"), memory("local", "Local", "two", [], false, "/repo")], async (file, runtime) => {
+			const tool = runtime.tools.get("memory")!;
+			const ctx = { cwd: "/repo" };
+			await tool.execute("test", { action: "edit", id: "global", title: "Updated" }, undefined, undefined, ctx);
+			let saved = JSON.parse(await readFile(file, "utf8"));
+			expect(saved.memories[0].project).toBe("global");
+			await tool.execute("test", { action: "create", title: "New", content: "note" }, undefined, undefined, ctx);
+			saved = JSON.parse(await readFile(file, "utf8"));
+			expect(saved.memories.find((item: { title: string }) => item.title === "New").project).toBe("/repo");
+			let mergeError: unknown;
+			try {
+				await tool.execute("test", { action: "merge", targetId: "global", sourceId: "local" }, undefined, undefined, ctx);
+			} catch (error) {
+				mergeError = error;
+			}
+			expect(mergeError).toBeInstanceOf(Error);
+			expect((mergeError as Error).message).toContain("same project scope");
+		});
+	});
+
 	test("exposes proactive retrieval and safe persistence rules on the tool", () => {
 		const tool = runtime().tools.get("memory")!;
 		const guidelines = tool.promptGuidelines?.join("\n") ?? "";
@@ -316,10 +409,15 @@ describe("memory workflow", () => {
 		expect(guidelines).toContain("Do not call memory for isolated factual questions");
 		expect(guidelines).toContain("At the end of a task, review");
 		expect(guidelines).toContain("action=create");
-		expect(guidelines).toContain("retrieve/search first to avoid creating a duplicate");
+		expect(guidelines).toContain("retrieve/search first to avoid duplicates");
 		expect(guidelines).toContain("action=edit");
 		expect(guidelines).toContain("Never save passwords");
 		expect(guidelines).toContain("transient one-off details");
 		expect(guidelines).toContain("speculative assumptions");
+		expect(guidelines).toContain("Proactively save verified, reusable discoveries");
+		expect(guidelines).toContain("hard-won debugging lessons");
+		expect(guidelines).toContain("small, atomic, and actionable");
+		expect(guidelines).toContain("edit stale memories");
+		expect(guidelines).toContain("project=all");
 	});
 });

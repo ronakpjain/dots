@@ -55,6 +55,7 @@ function getTestModel(id: string) {
 
 type StubConfig = {
 	toolTurns?: number;
+	toolCall?: { name: string; arguments: Record<string, unknown> };
 	finalText?: string | ((context: any) => string);
 };
 
@@ -73,7 +74,7 @@ function stubProvider(config: StubConfig) {
 				? (config.finalText as (c: any) => string)(context)
 				: (config.finalText ?? "fake-result");
 		const content = useTool
-			? [{ type: "toolCall", id: `tc-${i}`, name: "bash", arguments: { command: "echo hi" } }]
+			? [{ type: "toolCall", id: `tc-${i}`, name: config.toolCall?.name ?? "bash", arguments: config.toolCall?.arguments ?? { command: "echo hi" } }]
 			: [{ type: "text", text }];
 		const finalMsg: any = {
 			role: "assistant",
@@ -159,6 +160,46 @@ function browserRun(overrides: Partial<LiveRun> = {}): LiveRun {
 function browserTui(rows = 24) {
 	return { requestRender() {}, terminal: { rows } };
 }
+
+test("default subagents can execute memory with their task cwd; explicit allowlists can exclude it", async () => {
+	const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const directory = await mkdtemp(join(tmpdir(), "subagent-memory-"));
+	const memoryFile = join(directory, "memories.json");
+	const priorMemoryFile = process.env.PI_MEMORY_FILE;
+	process.env.PI_MEMORY_FILE = memoryFile;
+	try {
+		const stub = stubProvider({
+			toolTurns: 1,
+			toolCall: { name: "memory", arguments: { action: "create", title: "cwd test", content: "verified cwd routing" } },
+			finalText: "saved",
+		});
+		const result = await runSubagent(spec({ cwd: directory }), opts(stub));
+		expect(result.exitCode).toBe(0);
+		const store = JSON.parse(await readFile(memoryFile, "utf8"));
+		expect(store.memories[0].project).toBe(directory);
+		const retrieval = stubProvider({
+			toolTurns: 1,
+			toolCall: { name: "memory", arguments: { action: "retrieve", query: "cwd" } },
+			finalText: "retrieved",
+		});
+		const recalled = await runSubagent(spec({ cwd: directory }), opts(retrieval));
+		expect(recalled.exitCode).toBe(0);
+		const toolResult = recalled.messages.find((message: any) => message.role === "toolResult" && message.toolName === "memory") as any;
+		expect(toolResult?.isError).not.toBe(true);
+		expect(JSON.stringify(toolResult?.content)).toContain("verified cwd routing");
+
+		const restricted = stubProvider({ finalText: "done" });
+		const cache = new Map();
+		await runSubagent(spec({ tools: ["read"], keepSession: true }), opts(restricted, { sessionCache: cache }));
+		expect([...cache.values()][0]!.state.tools.map((tool: any) => tool.name)).toEqual(["read"]);
+	} finally {
+		if (priorMemoryFile === undefined) delete process.env.PI_MEMORY_FILE;
+		else process.env.PI_MEMORY_FILE = priorMemoryFile;
+		await rm(directory, { recursive: true, force: true });
+	}
+});
 
 test("forces priority fast mode for Luna requests in the in-process runner", async () => {
 	const stub = stubProvider({ finalText: "DONE" });
