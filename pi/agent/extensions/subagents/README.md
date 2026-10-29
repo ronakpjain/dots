@@ -188,6 +188,23 @@ the session output behind it. The selected run row is highlighted with
 
 The launch tool renders only its immediate acknowledgement. Completed groups automatically queue their capped result as a steering message for the next assistant response after the current turn and its tool calls finish; they do not abort active work. `/subagents` remains available for interactive history, while the main agent uses `subagent_status`, `subagent_history` (including live activity with `includeTranscript: true`), and `subagent_cancel` for run control and transcript inspection.
 
+### Spawn toggle
+
+`/subagents` also toggles whether the model may spawn subagents at all:
+
+- `/subagents status` — show whether spawning is enabled.
+- `/subagents off` — refuse all new `subagent` launches for the session.
+- `/subagents on` — re-enable spawning.
+- `/subagents toggle` — flip the current state.
+
+When disabled, the `subagent` launch tool returns an error pointing the model back
+at the main session, and the system prompt switches to a "delegation disabled"
+notice so the model does not waste turns trying to launch. Runs already in
+flight are unaffected, and `subagent_status`, `subagent_history`, and
+`subagent_cancel` keep working. The state lives for the current pi process
+(each session start keeps the last value) and is mirrored in the status bar as
+`subagents on/off`. Any other argument is treated as the usual browser filter.
+
 ## Development
 
 - `runner.ts` — `runSubagent()`: resolves model/provider/auth, builds the

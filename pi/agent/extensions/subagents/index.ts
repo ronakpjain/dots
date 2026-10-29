@@ -719,6 +719,13 @@ export default function (pi: ExtensionAPI) {
 	let sessionShuttingDown = false;
 	let sessionGeneration = 0;
 
+	// Session toggle: when off, new subagent launches are refused. Runs already
+	// in flight are unaffected; monitoring and cancellation remain available.
+	let subagentsEnabled = true;
+	const updateSubagentStatus = (ctx: { ui: { setStatus(key: string, text: string | undefined): void } }): void => {
+		ctx.ui.setStatus("subagents", `subagents ${subagentsEnabled ? "on" : "off"}`);
+	};
+
 	const clearPendingCompletions = (): void => {
 		pendingCompletions.length = 0;
 		parentTurnActive = false;
@@ -1080,6 +1087,18 @@ export default function (pi: ExtensionAPI) {
 		],
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (!subagentsEnabled) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Subagent spawning is disabled for this session by the user (/subagents off). Do the work directly in the main session. Monitoring tools (subagent_status, subagent_history) remain available for runs already in flight. Ask the user to run /subagents on to re-enable delegation.",
+						},
+					],
+					details: {},
+					isError: true,
+				};
+			}
 			const parentSignal = signal ?? new AbortController().signal;
 			const launchGeneration = sessionGeneration;
 			const staleLaunch = (): boolean => sessionShuttingDown || launchGeneration !== sessionGeneration;
@@ -1561,8 +1580,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		sessionShuttingDown = true;
+		ctx.ui.setStatus("subagents", undefined);
 		sessionGeneration++;
 		clearPendingCompletions();
 		for (const group of backgroundGroups.values()) {
@@ -1658,8 +1678,23 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("subagents", {
-		description: "Browse subagent runs — live activity, per-run transcripts (optional case-insensitive multi-term filter)",
+		description:
+			"Browse subagent runs (optional case-insensitive multi-term filter), or toggle spawning: /subagents [status|on|off|toggle] [filter]",
 		handler: async (args, ctx) => {
+			const command = (args ?? "").trim().toLowerCase();
+			if (command === "status" || command === "on" || command === "off" || command === "toggle") {
+				if (command === "on") subagentsEnabled = true;
+				else if (command === "off") subagentsEnabled = false;
+				else if (command === "toggle") subagentsEnabled = !subagentsEnabled;
+				updateSubagentStatus(ctx);
+				ctx.ui.notify(
+					subagentsEnabled
+						? "Subagents enabled: the subagent tool will launch again."
+						: "Subagents disabled: new spawns are refused for this session (runs already in flight continue).",
+					subagentsEnabled ? "info" : "warning",
+				);
+				return;
+			}
 			if (ctx.mode === "tui" && ctx.hasUI) {
 				await openBrowser(args, ctx);
 			} else {
@@ -1865,11 +1900,17 @@ export default function (pi: ExtensionAPI) {
 		backgroundGroups.clear();
 		runControllers.clear();
 		setSessionPreferences(restoredPreferences(ctx.sessionManager.getBranch()));
+		updateSubagentStatus(ctx);
 	});
 
 	pi.on("before_agent_start", (event) => {
 		const preferences = getSessionPreferences();
 		const entries = Object.entries(preferences).sort(([a], [b]) => a.localeCompare(b));
+		if (!subagentsEnabled) {
+			return {
+				systemPrompt: `${event.systemPrompt}\n\n[SUBAGENT DELEGATION] Subagent spawning is currently DISABLED by the user for this session. Do not call the subagent tool; do the work directly in the main session. subagent_status, subagent_history, and subagent_cancel remain available for runs already in flight. The user can re-enable delegation with /subagents on.`,
+			};
+		}
 		const choice =
 			entries.length > 0
 				? `The user already chose subagent models per type (${entries.map(([type, preference]) => `${type}: ${describePreference(preference)}`).join(", ")}); do not ask again for those types. For a new type, ask on its first launch.`
