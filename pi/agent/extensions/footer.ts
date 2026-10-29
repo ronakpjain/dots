@@ -10,6 +10,18 @@ type UsageTotals = {
 	cost: number;
 };
 
+interface TpsState {
+	startMs: number;
+	lastMs: number;
+	lastOutput: number;
+	rate: number;
+}
+
+function tpsForState(state: TpsState | null, now: number): number {
+	if (!state || !state.rate || now - state.startMs > 5000) return 0;
+	return state.rate;
+}
+
 function numberOrZero(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -170,6 +182,51 @@ function renderFooterLine(width: number, parts: readonly FooterPart[], theme: Ex
 
 export default function footerExtension(pi: ExtensionAPI): void {
 	let requestRender = (): void => {};
+	let tpsTimer: ReturnType<typeof setInterval> | undefined;
+
+	// Rolling output token rate: recompute at most once per second from
+	// message_update stream events, decay to zero once streaming pauses.
+	function computeTps(state: TpsState | null, output: number, now: number): number {
+		if (state && now - state.lastMs < 1000) {
+			const elapsed = (now - state.startMs) / 1000;
+			state.rate = elapsed > 0 ? output / elapsed : state.rate;
+			state.lastMs = now;
+			state.lastOutput = output;
+			return state.rate;
+		}
+		return tpsForState(state, now);
+	}
+
+	function startTpsTick(): void {
+		if (tpsTimer) return;
+		tpsTimer = setInterval(requestRender, 500);
+	}
+
+	let tpsState: TpsState | null = null;
+
+	const onMessageUpdate = (event: { message: { role?: string; usage?: { output?: number } } }) => {
+		if (event.message.role !== "assistant") return;
+		const now = Date.now();
+		const output = numberOrZero(event.message.usage?.output);
+		if (!tpsState || now - tpsState.lastMs > 1500) {
+			tpsState = { startMs: now, lastMs: now, lastOutput: output, rate: 0 };
+		}
+		tpsState.rate = computeTps(tpsState, output, now);
+		startTpsTick();
+	};
+
+	const onStreamingEnd = () => {
+		if (tpsTimer) {
+			clearInterval(tpsTimer);
+			tpsTimer = undefined;
+		}
+		requestRender();
+	};
+
+	pi.on("message_update", onMessageUpdate);
+	pi.on("message_end", onStreamingEnd);
+	pi.on("agent_end", onStreamingEnd);
+	pi.on("turn_end", onStreamingEnd);
 
 	pi.on("before_agent_start", (event) => ({
 		systemPrompt: `${event.systemPrompt}\n\n[FOOTER CAPABILITY] A compact UI footer is active and displays model, context, usage, cost, branch, tool, and extension-status information. It requires no model action.`,
@@ -200,6 +257,10 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						.filter(Boolean)
 						.slice(0, 2);
 					const working = !ctx.isIdle();
+					const tps = tpsForState(tpsState, Date.now());
+					const tpsPart: FooterPart | undefined = working && tps > 0
+						? { text: theme.fg("success", `${Math.round(tps)} tps`), priority: 40 }
+						: undefined;
 
 					const project = formatPath(ctx.cwd);
 					const brandPart: FooterPart = {
@@ -298,6 +359,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 								width,
 								footerParts(
 									usagePart,
+									tpsPart,
 									cachePart,
 									costPart,
 									contextPart,
@@ -328,6 +390,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 								width,
 								footerParts(
 									compactUsagePart,
+									tpsPart,
 									costPart,
 									compactContextPart,
 									compactModelPart,
@@ -373,6 +436,10 @@ export default function footerExtension(pi: ExtensionAPI): void {
 	pi.on("tool_execution_end", refresh);
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		if (tpsTimer) {
+			clearInterval(tpsTimer);
+			tpsTimer = undefined;
+		}
 		ctx.ui.setFooter(undefined);
 		requestRender = () => {};
 	});
