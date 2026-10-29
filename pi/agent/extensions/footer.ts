@@ -10,16 +10,15 @@ type UsageTotals = {
 	cost: number;
 };
 
-interface TpsState {
+interface PhaseState {
 	startMs: number;
 	lastMs: number;
 	output: number;
-	rate: number;
 }
 
-// Live generation rate: output tokens divided by the wall-clock span of the
-// current stream (first event to last activity), so thinking time is included.
-function tpsForState(state: TpsState | null, now: number): number {
+// Live generation rate for one phase (thinking or output): phase output tokens
+// divided by the wall-clock span of that phase.
+function phaseTps(state: PhaseState | null, now: number): number {
 	if (!state || state.output <= 0) return 0;
 	const elapsed = (state.lastMs - state.startMs) / 1000;
 	if (elapsed <= 0) return 0;
@@ -196,24 +195,53 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		tpsTimer = setInterval(requestRender, 500);
 	}
 
-	let tpsState: TpsState | null = null;
+	// thinking: thinking blocks precede text/tool output, so deltas arriving
+	// before the first text_start/toolcall_start belong to the thinking phase.
+	let thinking: PhaseState | null = null;
+	let output: PhaseState | null = null;
+	let outputPhaseStarted = false;
 
 	const onMessageStart = (event: { message: { role?: string } }) => {
 		if (event.message.role !== "assistant") return;
 		const now = Date.now();
-		tpsState = { startMs: now, lastMs: now, output: 0, rate: 0 };
+		thinking = { startMs: now, lastMs: now, output: 0 };
+		output = null;
+		outputPhaseStarted = false;
 		startTpsTick();
 	};
 
-	const onMessageUpdate = (event: { message: { role?: string; usage?: { output?: number } } }) => {
+	const onMessageUpdate = (event: {
+		message: { role?: string; usage?: { output?: number } };
+		assistantMessageEvent?: { type?: string };
+	}) => {
 		if (event.message.role !== "assistant") return;
 		const now = Date.now();
-		if (!tpsState || now - tpsState.lastMs > 2000) {
-			tpsState = { startMs: now, lastMs: now, output: 0, rate: 0 };
+		const kind = event.assistantMessageEvent?.type;
+		const isThinking = kind === "thinking_start" || kind === "thinking_delta";
+		if (kind && !isThinking) outputPhaseStarted = true;
+
+		const tokens = numberOrZero(event.message.usage?.output);
+		if (isThinking) {
+			// thinking: phase output = total output tokens (text has not started)
+			if (!thinking) thinking = { startMs: now, lastMs: now, output: 0 };
+			thinking.lastMs = now;
+			thinking.output = tokens;
+		} else if (outputPhaseStarted) {
+			// output: report total minus thinking tokens
+			const thinkTokens = thinking?.output ?? 0;
+			if (!output) output = { startMs: now, lastMs: now, output: 0 };
+			output.lastMs = now;
+			output.output = Math.max(0, tokens - thinkTokens);
 		}
-		tpsState.lastMs = now;
-		tpsState.output = numberOrZero(event.message.usage?.output);
 		startTpsTick();
+	};
+
+	const onTurnEnd = () => {
+		// New model request after tool results: start the output phase cleanly.
+		if (outputPhaseStarted) {
+			const now = Date.now();
+			output = { startMs: now, lastMs: now, output: 0 };
+		}
 	};
 
 	const onStreamingEnd = () => {
@@ -228,7 +256,10 @@ export default function footerExtension(pi: ExtensionAPI): void {
 	pi.on("message_update", onMessageUpdate);
 	pi.on("message_end", onStreamingEnd);
 	pi.on("agent_end", onStreamingEnd);
-	pi.on("turn_end", onStreamingEnd);
+	pi.on("turn_end", (event) => {
+		onTurnEnd();
+		onStreamingEnd();
+	});
 
 	pi.on("before_agent_start", (event) => ({
 		systemPrompt: `${event.systemPrompt}\n\n[FOOTER CAPABILITY] A compact UI footer is active and displays model, context, usage, cost, branch, tool, and extension-status information. It requires no model action.`,
@@ -259,10 +290,20 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						.filter(Boolean)
 						.slice(0, 2);
 					const working = !ctx.isIdle();
-					const tps = tpsForState(tpsState, Date.now());
-					const tpsPart: FooterPart | undefined = working && tps > 0
-						? { text: theme.fg("success", `${Math.round(tps)} tps`), priority: 40 }
-						: undefined;
+					const thinkRate = !outputPhaseStarted ? phaseTps(thinking, Date.now()) : 0;
+					const outRate = phaseTps(output, Date.now());
+					const tpsPart: FooterPart | undefined =
+						working && (thinkRate > 0 || outRate > 0)
+							? {
+									text: theme.fg(
+										"success",
+										[thinkRate > 0 ? `think ${Math.round(thinkRate)}` : undefined, outRate > 0 ? `out ${Math.round(outRate)} t/s` : undefined]
+											.filter((part) => part !== undefined)
+											.join(" "),
+									),
+									priority: 40,
+								}
+							: undefined;
 
 					const project = formatPath(ctx.cwd);
 					const brandPart: FooterPart = {
