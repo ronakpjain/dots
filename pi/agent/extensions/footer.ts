@@ -197,15 +197,15 @@ export default function footerExtension(pi: ExtensionAPI): void {
 
 	// thinking: thinking blocks precede text/tool output, so deltas arriving
 	// before the first text_start/toolcall_start belong to the thinking phase.
-	let thinking: PhaseState | null = null;
-	let output: PhaseState | null = null;
+	let thinkingPhase: PhaseState | null = null;
+	let outputPhase: PhaseState | null = null;
 	let outputPhaseStarted = false;
 
 	const onMessageStart = (event: { message: { role?: string } }) => {
 		if (event.message.role !== "assistant") return;
 		const now = Date.now();
-		thinking = { startMs: now, lastMs: now, output: 0 };
-		output = null;
+		thinkingPhase = { startMs: now, lastMs: now, output: 0 };
+		outputPhase = null;
 		outputPhaseStarted = false;
 		startTpsTick();
 	};
@@ -217,21 +217,21 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		if (event.message.role !== "assistant") return;
 		const now = Date.now();
 		const kind = event.assistantMessageEvent?.type;
-		const isThinking = kind === "thinking_start" || kind === "thinking_delta";
+		const isThinking = kind === undefined || kind === "thinking_start" || kind === "thinking_delta" || kind === "thinking_end";
 		if (kind && !isThinking) outputPhaseStarted = true;
 
 		const tokens = numberOrZero(event.message.usage?.output);
-		if (isThinking) {
+		if (isThinking && !outputPhaseStarted) {
 			// thinking: phase output = total output tokens (text has not started)
-			if (!thinking) thinking = { startMs: now, lastMs: now, output: 0 };
-			thinking.lastMs = now;
-			thinking.output = tokens;
-		} else if (outputPhaseStarted) {
+			if (!thinkingPhase) thinkingPhase = { startMs: now, lastMs: now, output: 0 };
+			thinkingPhase.lastMs = now;
+			thinkingPhase.output = tokens;
+		} else if (outputPhaseStarted || kind === undefined) {
 			// output: report total minus thinking tokens
-			const thinkTokens = thinking?.output ?? 0;
-			if (!output) output = { startMs: now, lastMs: now, output: 0 };
-			output.lastMs = now;
-			output.output = Math.max(0, tokens - thinkTokens);
+			const thinkTokens = thinkingPhase?.output ?? 0;
+			if (!outputPhase) outputPhase = { startMs: now, lastMs: now, output: 0 };
+			outputPhase.lastMs = now;
+			outputPhase.output = Math.max(0, tokens - thinkTokens);
 		}
 		startTpsTick();
 	};
@@ -240,7 +240,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		// New model request after tool results: start the output phase cleanly.
 		if (outputPhaseStarted) {
 			const now = Date.now();
-			output = { startMs: now, lastMs: now, output: 0 };
+			outputPhase = { startMs: now, lastMs: now, output: 0 };
 		}
 	};
 
@@ -283,15 +283,15 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					const allTools = pi.getAllTools().length;
 					const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no model";
 					const modelId = ctx.model?.id ?? "no model";
-					const thinking = ctx.thinkingLevel ?? pi.getThinkingLevel();
+					const thinkingLevel = ctx.thinkingLevel ?? pi.getThinkingLevel();
 					const statuses = [...footerData.getExtensionStatuses().entries()]
 						.sort(([left], [right]) => left.localeCompare(right))
 						.map(([, text]) => sanitizeStatusText(text))
 						.filter(Boolean)
 						.slice(0, 2);
 					const working = !ctx.isIdle();
-					const thinkRate = !outputPhaseStarted ? phaseTps(thinking, Date.now()) : 0;
-					const outRate = phaseTps(output, Date.now());
+					const thinkRate = !outputPhaseStarted ? phaseTps(thinkingPhase, Date.now()) : 0;
+					const outRate = phaseTps(outputPhase, Date.now());
 					const tpsPart: FooterPart | undefined =
 						working && (thinkRate > 0 || outRate > 0)
 							? {
@@ -379,7 +379,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						priority: 100,
 					};
 					const thinkingPart: FooterPart = {
-						text: theme.fg("accent", thinking),
+						text: theme.fg("accent", thinkingLevel),
 						priority: 65,
 					};
 
