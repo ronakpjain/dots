@@ -13,13 +13,18 @@ type UsageTotals = {
 interface TpsState {
 	startMs: number;
 	lastMs: number;
-	lastOutput: number;
+	output: number;
 	rate: number;
 }
 
+// Live generation rate: output tokens divided by the wall-clock span of the
+// current stream (first event to last activity), so thinking time is included.
 function tpsForState(state: TpsState | null, now: number): number {
-	if (!state || !state.rate || now - state.startMs > 5000) return 0;
-	return state.rate;
+	if (!state || state.output <= 0) return 0;
+	const elapsed = (state.lastMs - state.startMs) / 1000;
+	if (elapsed <= 0) return 0;
+	if (now - state.lastMs > 5000) return 0;
+	return state.output / elapsed;
 }
 
 function numberOrZero(value: unknown): number {
@@ -184,19 +189,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
 	let requestRender = (): void => {};
 	let tpsTimer: ReturnType<typeof setInterval> | undefined;
 
-	// Rolling output token rate: recompute at most once per second from
-	// message_update stream events, decay to zero once streaming pauses.
-	function computeTps(state: TpsState | null, output: number, now: number): number {
-		if (state && now - state.lastMs < 1000) {
-			const elapsed = (now - state.startMs) / 1000;
-			state.rate = elapsed > 0 ? output / elapsed : state.rate;
-			state.lastMs = now;
-			state.lastOutput = output;
-			return state.rate;
-		}
-		return tpsForState(state, now);
-	}
-
+	// Track the live generation window from stream events. Thinking, text, and
+	// tool-call updates all extend the window; message_end settles it.
 	function startTpsTick(): void {
 		if (tpsTimer) return;
 		tpsTimer = setInterval(requestRender, 500);
@@ -204,14 +198,21 @@ export default function footerExtension(pi: ExtensionAPI): void {
 
 	let tpsState: TpsState | null = null;
 
+	const onMessageStart = (event: { message: { role?: string } }) => {
+		if (event.message.role !== "assistant") return;
+		const now = Date.now();
+		tpsState = { startMs: now, lastMs: now, output: 0, rate: 0 };
+		startTpsTick();
+	};
+
 	const onMessageUpdate = (event: { message: { role?: string; usage?: { output?: number } } }) => {
 		if (event.message.role !== "assistant") return;
 		const now = Date.now();
-		const output = numberOrZero(event.message.usage?.output);
-		if (!tpsState || now - tpsState.lastMs > 1500) {
-			tpsState = { startMs: now, lastMs: now, lastOutput: output, rate: 0 };
+		if (!tpsState || now - tpsState.lastMs > 2000) {
+			tpsState = { startMs: now, lastMs: now, output: 0, rate: 0 };
 		}
-		tpsState.rate = computeTps(tpsState, output, now);
+		tpsState.lastMs = now;
+		tpsState.output = numberOrZero(event.message.usage?.output);
 		startTpsTick();
 	};
 
@@ -223,6 +224,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		requestRender();
 	};
 
+	pi.on("message_start", onMessageStart);
 	pi.on("message_update", onMessageUpdate);
 	pi.on("message_end", onStreamingEnd);
 	pi.on("agent_end", onStreamingEnd);
