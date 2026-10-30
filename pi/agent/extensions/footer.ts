@@ -140,9 +140,13 @@ function numberOrZero(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+type PromptUsage = Pick<UsageTotals, "input" | "cacheRead" | "cacheWrite">;
+
 type SessionStats = {
 	usage: UsageTotals;
 	compactions: number;
+	/** Usage of the most recent assistant message, for its own cache hit rate. */
+	lastUsage: PromptUsage | undefined;
 };
 
 function collectSessionStats(ctx: ExtensionContext): SessionStats {
@@ -154,6 +158,7 @@ function collectSessionStats(ctx: ExtensionContext): SessionStats {
 		cost: 0,
 	};
 	let compactions = 0;
+	let lastUsage: PromptUsage | undefined;
 
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type === "compaction") {
@@ -180,9 +185,14 @@ function collectSessionStats(ctx: ExtensionContext): SessionStats {
 		usage.cacheRead += numberOrZero(messageUsage.cacheRead);
 		usage.cacheWrite += numberOrZero(messageUsage.cacheWrite);
 		usage.cost += numberOrZero(messageUsage.cost?.total);
+		lastUsage = {
+			input: numberOrZero(messageUsage.input),
+			cacheRead: numberOrZero(messageUsage.cacheRead),
+			cacheWrite: numberOrZero(messageUsage.cacheWrite),
+		};
 	}
 
-	return { usage, compactions };
+	return { usage, compactions, lastUsage };
 }
 
 function formatCount(value: number): string {
@@ -242,10 +252,34 @@ export function cacheLevel(rate: number, promptTokens: number): "success" | "war
 	return "warning";
 }
 
+export function sessionCacheRate(usage: PromptUsage): number {
+	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+	return promptTokens > 0 ? (usage.cacheRead / promptTokens) * 100 : 0;
+}
+
+/**
+ * Cache hit rate of the most recent response alone. A low rate is normal on a
+ * cold session or right after the prompt changed; it only signals breakage when
+ * the session as a whole is cached well, which is why it earns its own number
+ * next to the session gauge.
+ */
+export function lastCacheView(
+	lastUsage: PromptUsage | undefined,
+	sessionRate: number,
+	theme: ThemePalette,
+): string | undefined {
+	if (!lastUsage) return undefined;
+	const promptTokens = lastUsage.input + lastUsage.cacheRead + lastUsage.cacheWrite;
+	if (promptTokens <= 0) return undefined;
+	const rate = (lastUsage.cacheRead / promptTokens) * 100;
+	const level = rate >= 75 ? "success" : rate >= 40 ? "warning" : sessionRate >= 75 ? "error" : "dim";
+	return `${theme.fg("dim", "last")} ${theme.fg(level, `${rate.toFixed(0)}%`)}`;
+}
+
 export function cacheView(usage: UsageTotals, view: ContextView, theme: ThemePalette): string | undefined {
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
 	if (promptTokens <= 0) return undefined;
-	const rate = (usage.cacheRead / promptTokens) * 100;
+	const rate = sessionCacheRate(usage);
 	const level = cacheLevel(rate, promptTokens);
 	const label = theme.fg("dim", "cache");
 	const percent = theme.fg(level, `${rate.toFixed(0)}%`);
@@ -476,7 +510,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n[FOOTER CAPABILITY] A compact UI footer is active and already shows the user model, thinking level, session id, git branch, project trust, queued-message state, context gauge, token and cache totals, cost, compaction count, tool count, live thinking/output speed, session-average speed, and (on OpenRouter) the upstream provider that served the last request. It requires no model action, and the user never needs to ask for this information.`,
+		systemPrompt: `${event.systemPrompt}\n\n[FOOTER CAPABILITY] A compact UI footer is active and already shows the user model, thinking level, session id, git branch, project trust, queued-message state, context gauge and counts, cache hit rate for the session (a gauge) and for the most recent response (labeled "last"), cost, compaction count, tool count, live thinking/output speed, session-average speed, and (on OpenRouter) the upstream provider that served the last request. It requires no model action, and the user never needs to ask for this information.`,
 	}));
 
 	function refresh(): void {
@@ -490,7 +524,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 
 			return {
 				render(width: number): string[] {
-					const { usage, compactions } = collectSessionStats(ctx);
+					const { usage, compactions, lastUsage } = collectSessionStats(ctx);
 					const branch = footerData.getGitBranch();
 					const sessionName = pi.getSessionName();
 					const activeTools = pi.getActiveTools().length;
@@ -528,7 +562,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						!working && averageRate > 0
 							? {
 									text: `${theme.fg("dim", "avg")} ${theme.fg("mdCode", `${Math.round(averageRate)} t/s`)}`,
-									priority: 52,
+									priority: 58,
 								}
 							: undefined;
 
@@ -599,6 +633,10 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					})();
 					// Providers that do not charge for cache writes report 0, so the read
 					// volume carries the detail and the write count appears only when real.
+					const lastCacheText = lastCacheView(lastUsage, sessionCacheRate(usage), theme);
+					const lastCachePart: FooterPart | undefined = lastCacheText
+						? { text: lastCacheText, priority: 60 }
+						: undefined;
 					const cacheVolume = usage.cacheRead + usage.cacheWrite;
 					const cacheDetailPart: FooterPart | undefined =
 						cacheVolume > 0
@@ -686,6 +724,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 									tpsPart,
 									averagePart,
 									cachePart,
+									lastCachePart,
 									cacheDetailPart,
 									costPart,
 									contextCountsPart,
@@ -724,6 +763,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 									averagePart,
 									costPart,
 									mediumCachePart,
+									lastCachePart,
 									cacheDetailPart,
 									contextCountsPart,
 									mediumContextPart,
@@ -747,7 +787,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						renderFooterLine(width, narrowIdentity, theme),
 						renderFooterLine(
 							width,
-							footerParts(compactUsagePart, tpsPart, averagePart, costPart, compactCachePart, compactContextPart),
+							footerParts(compactUsagePart, tpsPart, averagePart, costPart, compactCachePart, lastCachePart, compactContextPart),
 							theme,
 						),
 						renderFooterLine(
