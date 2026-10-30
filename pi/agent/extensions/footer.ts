@@ -16,14 +16,104 @@ interface PhaseState {
 	output: number;
 }
 
-// Live generation rate for one phase (thinking or output): phase output tokens
+// Providers stream real token usage only in the final chunk, so a live rate
+// cannot come from `usage.output` (it stays 0 until the stream ends). Phases
+// therefore track a running character estimate using the same chars-per-token
+// heuristic pi applies to context estimation.
+const CHARS_PER_TOKEN = 3.5;
+const TPS_STALE_MS = 5000;
+// The footer repaints every 500ms, so shorter phases use that window as the
+// denominator to avoid spiking on the first few deltas of a phase.
+const TPS_MIN_WINDOW_MS = 500;
+
+type StreamingBlock = {
+	type?: string;
+	text?: string;
+	thinking?: string;
+	name?: string;
+	arguments?: unknown;
+};
+
+/** Estimate thinking and answer tokens from the live partial message content. */
+export function estimatePhaseTokens(content: unknown): { thinking: number; output: number } {
+	let thinkingChars = 0;
+	let outputChars = 0;
+	if (Array.isArray(content)) {
+		for (const candidate of content as StreamingBlock[]) {
+			if (!candidate || typeof candidate !== "object") continue;
+			if (candidate.type === "thinking") {
+				thinkingChars += candidate.thinking?.length ?? 0;
+			} else if (candidate.type === "text") {
+				outputChars += candidate.text?.length ?? 0;
+			} else if (candidate.type === "toolCall") {
+				outputChars += candidate.name?.length ?? 0;
+				try {
+					outputChars += JSON.stringify(candidate.arguments ?? {}).length;
+				} catch {
+					// Unserializable partial arguments contribute nothing.
+				}
+			}
+		}
+	}
+	return { thinking: thinkingChars / CHARS_PER_TOKEN, output: outputChars / CHARS_PER_TOKEN };
+}
+
+// Live generation rate for one phase (thinking or output): phase tokens
 // divided by the wall-clock span of that phase.
 function phaseTps(state: PhaseState | null, now: number): number {
 	if (!state || state.output <= 0) return 0;
-	const elapsed = (state.lastMs - state.startMs) / 1000;
-	if (elapsed <= 0) return 0;
-	if (now - state.lastMs > 5000) return 0;
-	return state.output / elapsed;
+	if (now - state.lastMs > TPS_STALE_MS) return 0;
+	const spanMs = Math.max(state.lastMs - state.startMs, TPS_MIN_WINDOW_MS);
+	return state.output / (spanMs / 1000);
+}
+
+/**
+ * Tracks live thinking and output rates for one streamed assistant message.
+ * Thinking blocks precede text and tool calls, so updates arriving before the
+ * first non-thinking event belong to the thinking phase.
+ */
+export class TpsTracker {
+	private thinking: PhaseState | null = null;
+	private output: PhaseState | null = null;
+	private outputStarted = false;
+
+	messageStart(now: number): void {
+		this.thinking = { startMs: now, lastMs: now, output: 0 };
+		this.output = null;
+		this.outputStarted = false;
+	}
+
+	messageUpdate(kind: string | undefined, content: unknown, now: number): void {
+		const isThinking = kind === "thinking_start" || kind === "thinking_delta" || kind === "thinking_end";
+		const thinkingActive = isThinking && !this.outputStarted;
+		const estimated = estimatePhaseTokens(content);
+		if (kind !== undefined && !isThinking) this.outputStarted = true;
+		if (thinkingActive) {
+			if (!this.thinking) this.thinking = { startMs: now, lastMs: now, output: 0 };
+			this.thinking.lastMs = now;
+			// Content only grows within a phase, so an `*_end` event that carries
+			// no content cannot retract tokens already counted.
+			this.thinking.output = Math.max(this.thinking.output, estimated.thinking);
+			return;
+		}
+		// An event without a kind cannot be attributed to thinking, so it is output.
+		if (kind === undefined) this.outputStarted = true;
+		if (!this.output) this.output = { startMs: now, lastMs: now, output: 0 };
+		this.output.lastMs = now;
+		this.output.output = Math.max(this.output.output, estimated.output);
+	}
+
+	/** A new model request after tool results starts a fresh output phase. */
+	turnEnd(now: number): void {
+		if (this.outputStarted) this.output = { startMs: now, lastMs: now, output: 0 };
+	}
+
+	rates(now: number): { think: number; output: number } {
+		return {
+			think: this.outputStarted ? 0 : phaseTps(this.thinking, now),
+			output: phaseTps(this.output, now),
+		};
+	}
 }
 
 function numberOrZero(value: unknown): number {
@@ -195,53 +285,21 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		tpsTimer = setInterval(requestRender, 500);
 	}
 
-	// thinking: thinking blocks precede text/tool output, so deltas arriving
-	// before the first text_start/toolcall_start belong to the thinking phase.
-	let thinkingPhase: PhaseState | null = null;
-	let outputPhase: PhaseState | null = null;
-	let outputPhaseStarted = false;
+	const tpsTracker = new TpsTracker();
 
 	const onMessageStart = (event: { message: { role?: string } }) => {
 		if (event.message.role !== "assistant") return;
-		const now = Date.now();
-		thinkingPhase = { startMs: now, lastMs: now, output: 0 };
-		outputPhase = null;
-		outputPhaseStarted = false;
+		tpsTracker.messageStart(Date.now());
 		startTpsTick();
 	};
 
 	const onMessageUpdate = (event: {
-		message: { role?: string; usage?: { output?: number } };
+		message: { role?: string; content?: unknown };
 		assistantMessageEvent?: { type?: string };
 	}) => {
 		if (event.message.role !== "assistant") return;
-		const now = Date.now();
-		const kind = event.assistantMessageEvent?.type;
-		const isThinking = kind === undefined || kind === "thinking_start" || kind === "thinking_delta" || kind === "thinking_end";
-		if (kind && !isThinking) outputPhaseStarted = true;
-
-		const tokens = numberOrZero(event.message.usage?.output);
-		if (isThinking && !outputPhaseStarted) {
-			// thinking: phase output = total output tokens (text has not started)
-			if (!thinkingPhase) thinkingPhase = { startMs: now, lastMs: now, output: 0 };
-			thinkingPhase.lastMs = now;
-			thinkingPhase.output = tokens;
-		} else if (outputPhaseStarted || kind === undefined) {
-			// output: report total minus thinking tokens
-			const thinkTokens = thinkingPhase?.output ?? 0;
-			if (!outputPhase) outputPhase = { startMs: now, lastMs: now, output: 0 };
-			outputPhase.lastMs = now;
-			outputPhase.output = Math.max(0, tokens - thinkTokens);
-		}
+		tpsTracker.messageUpdate(event.assistantMessageEvent?.type, event.message.content, Date.now());
 		startTpsTick();
-	};
-
-	const onTurnEnd = () => {
-		// New model request after tool results: start the output phase cleanly.
-		if (outputPhaseStarted) {
-			const now = Date.now();
-			outputPhase = { startMs: now, lastMs: now, output: 0 };
-		}
 	};
 
 	const onStreamingEnd = () => {
@@ -256,8 +314,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
 	pi.on("message_update", onMessageUpdate);
 	pi.on("message_end", onStreamingEnd);
 	pi.on("agent_end", onStreamingEnd);
-	pi.on("turn_end", (event) => {
-		onTurnEnd();
+	pi.on("turn_end", () => {
+		tpsTracker.turnEnd(Date.now());
 		onStreamingEnd();
 	});
 
@@ -290,20 +348,17 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						.filter(Boolean)
 						.slice(0, 2);
 					const working = !ctx.isIdle();
-					const thinkRate = !outputPhaseStarted ? phaseTps(thinkingPhase, Date.now()) : 0;
-					const outRate = phaseTps(outputPhase, Date.now());
+					const rates = tpsTracker.rates(Date.now());
+					const tpsText =
+						rates.think > 0
+							? `think ${Math.round(rates.think)} t/s`
+							: rates.output > 0
+								? `out ${Math.round(rates.output)} t/s`
+								: undefined;
+					// The live rate is transient, so on cramped narrow lines it outranks the
+					// cumulative cost and cache readouts that are still there when idle.
 					const tpsPart: FooterPart | undefined =
-						working && (thinkRate > 0 || outRate > 0)
-							? {
-									text: theme.fg(
-										"success",
-										[thinkRate > 0 ? `think ${Math.round(thinkRate)}` : undefined, outRate > 0 ? `out ${Math.round(outRate)} t/s` : undefined]
-											.filter((part) => part !== undefined)
-											.join(" "),
-									),
-									priority: 40,
-								}
-							: undefined;
+						working && tpsText ? { text: theme.fg("success", tpsText), priority: 75 } : undefined;
 
 					const project = formatPath(ctx.cwd);
 					const brandPart: FooterPart = {
@@ -453,7 +508,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 
 					return [
 						renderFooterLine(width, narrowIdentity, theme),
-						renderFooterLine(width, footerParts(compactUsagePart, costPart, compactContextPart), theme),
+						renderFooterLine(width, footerParts(compactUsagePart, tpsPart, costPart, compactContextPart), theme),
 						renderFooterLine(
 							width,
 							footerParts(compactModelPart, thinkingPart, toolsPart, ...statusParts),
