@@ -174,18 +174,34 @@ function formatPath(path: string): string {
 	return path;
 }
 
-function contextLabel(ctx: ExtensionContext): string {
-	const usage = ctx.getContextUsage();
-	if (!usage || usage.tokens === null) return "ctx —";
-	const percent = usage.percent === null ? "—" : `${usage.percent.toFixed(0)}%`;
-	return `ctx ${formatCount(usage.tokens)}/${formatCount(usage.contextWindow)} ${percent}`;
+type ContextView = "wide" | "medium" | "narrow";
+
+/** Context pressure drives its color, so a filling window announces itself. */
+function contextLevel(percent: number): "success" | "warning" | "error" {
+	if (percent >= 85) return "error";
+	if (percent >= 60) return "warning";
+	return "success";
 }
 
-function compactContextLabel(ctx: ExtensionContext): string {
+/**
+ * Small context gauge. The filled cells carry the pressure color; the empty
+ * track stays one step darker than body text so a young session reads calm.
+ */
+function contextBar(percent: number, cells: number, theme: ThemePalette): string {
+	const filled = Math.max(0, Math.min(cells, Math.round((percent / 100) * cells)));
+	return `${theme.fg(contextLevel(percent), "█".repeat(filled))}${theme.fg("borderMuted", "░".repeat(cells - filled))}`;
+}
+
+function contextView(ctx: ExtensionContext, view: ContextView, theme: ThemePalette): string {
+	const label = theme.fg("dim", "ctx");
 	const usage = ctx.getContextUsage();
-	if (!usage || usage.tokens === null) return "ctx —";
-	const percent = usage.percent === null ? "—" : `${usage.percent.toFixed(0)}%`;
-	return `ctx ${percent}`;
+	if (!usage || usage.tokens === null || usage.percent === null) return `${label} ${theme.fg("dim", "—")}`;
+	const percentText = theme.fg(contextLevel(usage.percent), `${usage.percent.toFixed(0)}%`);
+	if (view === "narrow") return `${label} ${percentText}`;
+	const bar = contextBar(usage.percent, view === "wide" ? 8 : 5, theme);
+	if (view === "medium") return `${label} ${bar} ${percentText}`;
+	const counts = theme.fg("dim", `${formatCount(usage.tokens)}/${formatCount(usage.contextWindow)}`);
+	return `${label} ${counts} ${bar} ${percentText}`;
 }
 
 function compactCount(value: number): string {
@@ -208,6 +224,13 @@ export type FooterPart = {
 
 export type FooterLayout = "wide" | "medium" | "narrow";
 
+type ThemePalette = ExtensionContext["ui"]["theme"];
+
+// A dim middot separates segments, so the footer reads as grouped chips rather
+// than a run of double-spaced words.
+const FOOTER_SEPARATOR = " · ";
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 const FRAME_WIDTH = 4;
 const WIDE_CONTENT_WIDTH = 88;
 const MEDIUM_CONTENT_WIDTH = 48;
@@ -224,19 +247,19 @@ export function footerLayoutForWidth(width: number): FooterLayout {
 	return "narrow";
 }
 
-function joinFooterParts(parts: readonly FooterPart[]): string {
+function joinFooterParts(parts: readonly FooterPart[], separator = "  "): string {
 	return parts
 		.filter((part) => visibleWidth(part.text) > 0)
 		.map((part) => part.text)
-		.join("  ");
+		.join(separator);
 }
 
 /** Keep important segments visible by dropping lower-priority segments before truncating. */
-export function fitFooterParts(parts: readonly FooterPart[], width: number): string {
+export function fitFooterParts(parts: readonly FooterPart[], width: number, separator = "  "): string {
 	const available = Math.max(1, Math.floor(width));
 	const selected = parts.filter((part) => visibleWidth(part.text) > 0);
 
-	while (selected.length > 1 && visibleWidth(joinFooterParts(selected)) > available) {
+	while (selected.length > 1 && visibleWidth(joinFooterParts(selected, separator)) > available) {
 		let removeIndex = 0;
 		for (let index = 1; index < selected.length; index++) {
 			const candidate = selected[index]!;
@@ -251,7 +274,7 @@ export function fitFooterParts(parts: readonly FooterPart[], width: number): str
 		selected.splice(removeIndex, 1);
 	}
 
-	return truncateToWidth(joinFooterParts(selected), available, "…");
+	return truncateToWidth(joinFooterParts(selected, separator), available, "…");
 }
 
 function footerParts(...entries: Array<FooterPart | undefined>): FooterPart[] {
@@ -270,19 +293,50 @@ function renderFrame(width: number, content: string, theme: ExtensionContext["ui
 	return truncateToWidth(`${left}${body}${padding}${right}`, renderWidth, "");
 }
 
-function renderFooterLine(width: number, parts: readonly FooterPart[], theme: ExtensionContext["ui"]["theme"]): string {
-	return renderFrame(width, fitFooterParts(parts, footerContentWidth(width)), theme);
+function renderFooterLine(width: number, parts: readonly FooterPart[], theme: ThemePalette): string {
+	return renderFrame(width, fitFooterParts(parts, footerContentWidth(width), theme.fg("dim", FOOTER_SEPARATOR)), theme);
+}
+
+/**
+ * One line with a left and a right cluster, so the model identity sits at the
+ * far edge and the telemetry row reads as a balanced whole. Both clusters fall
+ * back to priority-based packing when they cannot share the line.
+ */
+function renderAlignedFooterLine(
+	width: number,
+	left: readonly FooterPart[],
+	right: readonly FooterPart[],
+	theme: ThemePalette,
+): string {
+	const contentWidth = footerContentWidth(width);
+	const separator = theme.fg("dim", FOOTER_SEPARATOR);
+	const leftText = joinFooterParts(left, separator);
+	const rightText = joinFooterParts(right, separator);
+	const leftWidth = visibleWidth(leftText);
+	const rightWidth = visibleWidth(rightText);
+
+	if (leftWidth > 0 && rightWidth > 0 && leftWidth + rightWidth + 2 <= contentWidth) {
+		const padding = " ".repeat(contentWidth - leftWidth - rightWidth);
+		return renderFrame(width, `${leftText}${padding}${rightText}`, theme);
+	}
+
+	return renderFrame(width, fitFooterParts([...left, ...right], contentWidth, separator), theme);
 }
 
 export default function footerExtension(pi: ExtensionAPI): void {
 	let requestRender = (): void => {};
 	let tpsTimer: ReturnType<typeof setInterval> | undefined;
+	let spinnerIndex = 0;
 
 	// Track the live generation window from stream events. Thinking, text, and
-	// tool-call updates all extend the window; message_end settles it.
+	// tool-call updates all extend the window; message_end settles it. The same
+	// tick advances the working spinner.
 	function startTpsTick(): void {
 		if (tpsTimer) return;
-		tpsTimer = setInterval(requestRender, 500);
+		tpsTimer = setInterval(() => {
+			spinnerIndex += 1;
+			requestRender();
+		}, 500);
 	}
 
 	const tpsTracker = new TpsTracker();
@@ -358,27 +412,28 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					// The live rate is transient, so on cramped narrow lines it outranks the
 					// cumulative cost and cache readouts that are still there when idle.
 					const tpsPart: FooterPart | undefined =
-						working && tpsText ? { text: theme.fg("success", tpsText), priority: 75 } : undefined;
+						working && tpsText ? { text: theme.fg("mdCode", tpsText), priority: 98 } : undefined;
 
 					const project = formatPath(ctx.cwd);
+					const spinner = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length]!;
 					const brandPart: FooterPart = {
 						text: theme.fg("accent", theme.bold("✦ pi")),
 						priority: 100,
 					};
 					const sessionPart: FooterPart | undefined = sessionName
-						? { text: theme.fg("text", `◦ ${sessionName}`), priority: 35 }
+						? { text: `${theme.fg("mdListBullet", "◦")} ${theme.fg("text", sessionName)}`, priority: 35 }
 						: undefined;
 					const projectPart: FooterPart = { text: theme.fg("muted", project), priority: 70 };
 					const branchPart: FooterPart | undefined = branch
-						? { text: theme.fg("accent", `⎇ ${branch}`), priority: 85 }
+						? { text: theme.fg("mdLink", `⎇ ${branch}`), priority: 85 }
 						: undefined;
 					const workingPart: FooterPart | undefined = working
-						? { text: theme.fg("warning", "● working"), priority: 90 }
+						? { text: `${theme.fg("warning", spinner)} ${theme.fg("warning", "working")}`, priority: 90 }
 						: undefined;
 					const narrowBranchPart: FooterPart | undefined = branch
 						? {
 								text: theme.fg(
-									"accent",
+									"mdLink",
 									truncateToWidth(
 										`⎇ ${branch}`,
 										Math.max(1, footerContentWidth(width) - visibleWidth(brandPart.text) - 2),
@@ -393,40 +448,46 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						priority: 10 - index,
 					}));
 
+					const tokenCounts = (input: string, output: string): string =>
+						`${theme.fg("dim", "↑")}${theme.fg("muted", input)} ${theme.fg("dim", "↓")}${theme.fg("muted", output)}`;
 					const usagePart: FooterPart = {
-						text: theme.fg("muted", `↑${formatCount(usage.input)} ↓${formatCount(usage.output)}`),
+						text: tokenCounts(formatCount(usage.input), formatCount(usage.output)),
 						priority: 100,
 					};
 					const compactUsagePart: FooterPart = {
-						text: theme.fg("muted", `↑${compactCount(usage.input)} ↓${compactCount(usage.output)}`),
+						text: tokenCounts(compactCount(usage.input), compactCount(usage.output)),
 						priority: 100,
 					};
 					const cachePart: FooterPart = {
-						text: theme.fg("dim", `cache ${formatCount(usage.cacheRead)}/${formatCount(usage.cacheWrite)}`),
+						text: `${theme.fg("dim", "cache")} ${theme.fg("muted", `${formatCount(usage.cacheRead)}/${formatCount(usage.cacheWrite)}`)}`,
 						priority: 20,
 					};
 					const compactCachePart: FooterPart = {
-						text: theme.fg("dim", `R${compactCount(usage.cacheRead)} W${compactCount(usage.cacheWrite)}`),
+						text: `${theme.fg("dim", "R")}${theme.fg("muted", compactCount(usage.cacheRead))} ${theme.fg("dim", "W")}${theme.fg("muted", compactCount(usage.cacheWrite))}`,
 						priority: 15,
 					};
 					const costPart: FooterPart = {
 						text: theme.fg("success", formatCost(usage.cost)),
-						priority: 70,
+						priority: 55,
 					};
-					const contextPart: FooterPart = {
-						text: theme.fg("dim", contextLabel(ctx)),
+					const wideContextPart: FooterPart = {
+						text: contextView(ctx, "wide", theme),
+						priority: 95,
+					};
+					const mediumContextPart: FooterPart = {
+						text: contextView(ctx, "medium", theme),
 						priority: 95,
 					};
 					const compactContextPart: FooterPart = {
-						text: theme.fg("dim", compactContextLabel(ctx)),
+						text: contextView(ctx, "narrow", theme),
 						priority: 95,
 					};
 					const toolsPart: FooterPart = {
-						text: theme.fg("dim", `tools ${activeTools}/${allTools}`),
+						text: `${theme.fg("dim", "tools")} ${theme.fg("muted", `${activeTools}/${allTools}`)}`,
 						priority: 30,
 					};
 					const modelPart: FooterPart = {
-						text: theme.fg("text", model),
+						text: theme.fg("text", theme.bold(model)),
 						priority: 90,
 					};
 					const compactModelPart: FooterPart = {
@@ -434,7 +495,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						priority: 100,
 					};
 					const thinkingPart: FooterPart = {
-						text: theme.fg("accent", thinkingLevel),
+						text: `${theme.fg("dim", "◇")} ${theme.fg("accent", thinkingLevel)}`,
 						priority: 65,
 					};
 
@@ -453,18 +514,10 @@ export default function footerExtension(pi: ExtensionAPI): void {
 								),
 								theme,
 							),
-							renderFooterLine(
+							renderAlignedFooterLine(
 								width,
-								footerParts(
-									usagePart,
-									tpsPart,
-									cachePart,
-									costPart,
-									contextPart,
-									toolsPart,
-									modelPart,
-									thinkingPart,
-								),
+								footerParts(usagePart, tpsPart, cachePart, costPart, wideContextPart, toolsPart),
+								footerParts(modelPart, thinkingPart),
 								theme,
 							),
 						];
@@ -490,7 +543,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 									compactUsagePart,
 									tpsPart,
 									costPart,
-									compactContextPart,
+									mediumContextPart,
 									compactModelPart,
 									thinkingPart,
 									toolsPart,
