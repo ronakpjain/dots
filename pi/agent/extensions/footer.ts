@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 
-type UsageTotals = {
+export type UsageTotals = {
 	input: number;
 	output: number;
 	cacheRead: number;
@@ -230,6 +230,32 @@ function contextBar(percent: number, cells: number, theme: ThemePalette): string
 	return `${theme.fg(contextLevel(percent), "█".repeat(filled))}${theme.fg("borderMuted", "░".repeat(cells - filled))}`;
 }
 
+/**
+ * Cache health: the share of prompt tokens that came from the provider cache
+ * instead of being sent (and billed) fresh. Judging it needs enough history,
+ * so a young session stays neutral rather than alarming.
+ */
+export function cacheLevel(rate: number, promptTokens: number): "success" | "warning" | "error" | "dim" {
+	if (promptTokens < 20_000) return "dim";
+	if (rate >= 75) return "success";
+	if (promptTokens >= 100_000 && rate < 25) return "error";
+	return "warning";
+}
+
+export function cacheView(usage: UsageTotals, view: ContextView, theme: ThemePalette): string | undefined {
+	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+	if (promptTokens <= 0) return undefined;
+	const rate = (usage.cacheRead / promptTokens) * 100;
+	const level = cacheLevel(rate, promptTokens);
+	const label = theme.fg("dim", "cache");
+	const percent = theme.fg(level, `${rate.toFixed(0)}%`);
+	if (view === "narrow") return `${label} ${percent}`;
+	const cells = view === "wide" ? 6 : 4;
+	const filled = Math.max(0, Math.min(cells, Math.round((rate / 100) * cells)));
+	const bar = `${theme.fg(level, "█".repeat(filled))}${theme.fg("borderMuted", "░".repeat(cells - filled))}`;
+	return `${label} ${bar} ${percent}`;
+}
+
 function contextView(ctx: ExtensionContext, view: ContextView, theme: ThemePalette): string {
 	const label = theme.fg("dim", "ctx");
 	const usage = ctx.getContextUsage();
@@ -237,9 +263,14 @@ function contextView(ctx: ExtensionContext, view: ContextView, theme: ThemePalet
 	const percentText = theme.fg(contextLevel(usage.percent), `${usage.percent.toFixed(0)}%`);
 	if (view === "narrow") return `${label} ${percentText}`;
 	const bar = contextBar(usage.percent, view === "wide" ? 8 : 5, theme);
-	if (view === "medium") return `${label} ${bar} ${percentText}`;
-	const counts = theme.fg("dim", `${formatCount(usage.tokens)}/${formatCount(usage.contextWindow)}`);
-	return `${label} ${counts} ${bar} ${percentText}`;
+	return `${label} ${bar} ${percentText}`;
+}
+
+/** Absolute context tokens, kept separate so they yield to the gauge when tight. */
+function contextCountsView(ctx: ExtensionContext, theme: ThemePalette): string | undefined {
+	const usage = ctx.getContextUsage();
+	if (!usage || usage.tokens === null) return undefined;
+	return theme.fg("dim", `${formatCount(usage.tokens)}/${formatCount(usage.contextWindow)}`);
 }
 
 function compactCount(value: number): string {
@@ -497,7 +528,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						!working && averageRate > 0
 							? {
 									text: `${theme.fg("dim", "avg")} ${theme.fg("mdCode", `${Math.round(averageRate)} t/s`)}`,
-									priority: 60,
+									priority: 52,
 								}
 							: undefined;
 
@@ -554,14 +585,28 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						text: tokenCounts(compactCount(usage.input), compactCount(usage.output)),
 						priority: 100,
 					};
-					const cachePart: FooterPart = {
-						text: `${theme.fg("dim", "cache")} ${theme.fg("muted", `${formatCount(usage.cacheRead)}/${formatCount(usage.cacheWrite)}`)}`,
-						priority: 20,
-					};
-					const compactCachePart: FooterPart = {
-						text: `${theme.fg("dim", "R")}${theme.fg("muted", compactCount(usage.cacheRead))} ${theme.fg("dim", "W")}${theme.fg("muted", compactCount(usage.cacheWrite))}`,
-						priority: 15,
-					};
+					const cachePart: FooterPart | undefined = (() => {
+						const text = cacheView(usage, "wide", theme);
+						return text ? { text, priority: 62 } : undefined;
+					})();
+					const mediumCachePart: FooterPart | undefined = (() => {
+						const text = cacheView(usage, "medium", theme);
+						return text ? { text, priority: 62 } : undefined;
+					})();
+					const compactCachePart: FooterPart | undefined = (() => {
+						const text = cacheView(usage, "narrow", theme);
+						return text ? { text, priority: 62 } : undefined;
+					})();
+					// Providers that do not charge for cache writes report 0, so the read
+					// volume carries the detail and the write count appears only when real.
+					const cacheVolume = usage.cacheRead + usage.cacheWrite;
+					const cacheDetailPart: FooterPart | undefined =
+						cacheVolume > 0
+							? {
+									text: `${theme.fg("dim", "R")}${theme.fg("muted", compactCount(usage.cacheRead))}${usage.cacheWrite > 0 ? ` ${theme.fg("dim", "W")}${theme.fg("muted", compactCount(usage.cacheWrite))}` : ""}`,
+									priority: 45,
+								}
+							: undefined;
 					const costPart: FooterPart = {
 						text: theme.fg("success", formatCost(usage.cost)),
 						priority: 55,
@@ -578,6 +623,10 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						text: contextView(ctx, "narrow", theme),
 						priority: 95,
 					};
+					const contextCountsText = contextCountsView(ctx, theme);
+					const contextCountsPart: FooterPart | undefined = contextCountsText
+						? { text: contextCountsText, priority: 50 }
+						: undefined;
 					const toolsPart: FooterPart = {
 						text: `${theme.fg("dim", "tools")} ${theme.fg("muted", `${activeTools}/${allTools}`)}`,
 						priority: 30,
@@ -587,12 +636,15 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						: "";
 					// Knowing the upstream provider is more useful than repeating the router,
 					// so routing detail replaces the "provider/" prefix when it is known.
+					// With routing detail present, the vendor prefix is redundant (`deepseek/
+					// deepseek-v4.1-flash`), so only the model itself is shown.
+					const routedLabel = ctx.model?.id.split("/").pop() ?? modelId;
 					const modelPart: FooterPart = {
-						text: `${theme.fg("text", theme.bold(upstreamName ? modelId : model))}${upstreamSuffix}`,
+						text: `${theme.fg("text", theme.bold(upstreamName ? routedLabel : model))}${upstreamSuffix}`,
 						priority: 90,
 					};
 					const compactModelPart: FooterPart = {
-						text: `${theme.fg("text", modelId)}${upstreamSuffix}`,
+						text: `${theme.fg("text", upstreamName ? routedLabel : modelId)}${upstreamSuffix}`,
 						priority: 100,
 					};
 					const compactionPart: FooterPart | undefined =
@@ -634,7 +686,9 @@ export default function footerExtension(pi: ExtensionAPI): void {
 									tpsPart,
 									averagePart,
 									cachePart,
+									cacheDetailPart,
 									costPart,
+									contextCountsPart,
 									wideContextPart,
 									toolsPart,
 									compactionPart,
@@ -669,11 +723,13 @@ export default function footerExtension(pi: ExtensionAPI): void {
 									tpsPart,
 									averagePart,
 									costPart,
+									mediumCachePart,
+									cacheDetailPart,
+									contextCountsPart,
 									mediumContextPart,
 									compactModelPart,
 									thinkingPart,
 									toolsPart,
-									compactCachePart,
 									compactionPart,
 									sessionIdPart,
 								),
@@ -691,7 +747,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						renderFooterLine(width, narrowIdentity, theme),
 						renderFooterLine(
 							width,
-							footerParts(compactUsagePart, tpsPart, averagePart, costPart, compactContextPart),
+							footerParts(compactUsagePart, tpsPart, averagePart, costPart, compactCachePart, compactContextPart),
 							theme,
 						),
 						renderFooterLine(
