@@ -76,6 +76,8 @@ export class TpsTracker {
 	private thinking: PhaseState | null = null;
 	private output: PhaseState | null = null;
 	private outputStarted = false;
+	private averageRate = 0;
+	private samples = 0;
 
 	messageStart(now: number): void {
 		this.thinking = { startMs: now, lastMs: now, output: 0 };
@@ -114,22 +116,50 @@ export class TpsTracker {
 			output: phaseTps(this.output, now),
 		};
 	}
+
+	/** Fold a finished answer phase into the session average (EWMA). */
+	finish(): void {
+		const phase = this.output;
+		if (!phase || phase.output <= 0) return;
+		const spanMs = phase.lastMs - phase.startMs;
+		// A fast model finishes a short answer in well under a second, so the gate
+		// is on real substance (tokens) rather than on a long enough span.
+		if (spanMs < 40 || phase.output < 15) return;
+		const rate = phase.output / (spanMs / 1000);
+		this.averageRate = this.samples === 0 ? rate : this.averageRate * 0.7 + rate * 0.3;
+		this.samples += 1;
+	}
+
+	/** Session-average answer rate, 0 until at least one answer has completed. */
+	average(): number {
+		return this.samples === 0 ? 0 : this.averageRate;
+	}
 }
 
 function numberOrZero(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-function collectUsage(ctx: ExtensionContext): UsageTotals {
-	const totals: UsageTotals = {
+type SessionStats = {
+	usage: UsageTotals;
+	compactions: number;
+};
+
+function collectSessionStats(ctx: ExtensionContext): SessionStats {
+	const usage: UsageTotals = {
 		input: 0,
 		output: 0,
 		cacheRead: 0,
 		cacheWrite: 0,
 		cost: 0,
 	};
+	let compactions = 0;
 
 	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type === "compaction") {
+			compactions += 1;
+			continue;
+		}
 		if (entry.type !== "message") continue;
 
 		const message = entry.message as {
@@ -142,17 +172,17 @@ function collectUsage(ctx: ExtensionContext): UsageTotals {
 				cost?: { total?: number };
 			};
 		};
-		const usage = message.usage;
-		if (!usage) continue;
+		const messageUsage = message.usage;
+		if (!messageUsage) continue;
 
-		totals.input += numberOrZero(usage.input);
-		totals.output += numberOrZero(usage.output);
-		totals.cacheRead += numberOrZero(usage.cacheRead);
-		totals.cacheWrite += numberOrZero(usage.cacheWrite);
-		totals.cost += numberOrZero(usage.cost?.total);
+		usage.input += numberOrZero(messageUsage.input);
+		usage.output += numberOrZero(messageUsage.output);
+		usage.cacheRead += numberOrZero(messageUsage.cacheRead);
+		usage.cacheWrite += numberOrZero(messageUsage.cacheWrite);
+		usage.cost += numberOrZero(messageUsage.cost?.total);
 	}
 
-	return totals;
+	return { usage, compactions };
 }
 
 function formatCount(value: number): string {
@@ -165,6 +195,14 @@ function formatCost(value: number): string {
 	if (value === 0) return "$0";
 	if (value < 0.01) return `$${value.toFixed(4)}`;
 	return `$${value.toFixed(3)}`;
+}
+
+function formatDuration(seconds: number): string {
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, "0")}s`;
+	const hours = Math.floor(minutes / 60);
+	return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 function formatPath(path: string): string {
@@ -327,11 +365,15 @@ export default function footerExtension(pi: ExtensionAPI): void {
 	let requestRender = (): void => {};
 	let tpsTimer: ReturnType<typeof setInterval> | undefined;
 	let spinnerIndex = 0;
+	// Wall-clock start of the current agent run, for the elapsed working timer.
+	let agentStartedAt = 0;
+	// Upstream provider that served the latest router chunk. Routing is decided
+	// per request, so this is refreshed as chunks arrive.
+	let upstream: { model: string; name: string } | undefined;
 
-	// Track the live generation window from stream events. Thinking, text, and
-	// tool-call updates all extend the window; message_end settles it. The same
-	// tick advances the working spinner.
-	function startTpsTick(): void {
+	// The tick advances the spinner and keeps the live rate and elapsed timer
+	// fresh for as long as the agent is working, including tool execution.
+	function startWorkingTick(): void {
 		if (tpsTimer) return;
 		tpsTimer = setInterval(() => {
 			spinnerIndex += 1;
@@ -339,12 +381,20 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		}, 500);
 	}
 
+	function stopWorkingTick(): void {
+		if (tpsTimer) {
+			clearInterval(tpsTimer);
+			tpsTimer = undefined;
+		}
+		requestRender();
+	}
+
 	const tpsTracker = new TpsTracker();
 
 	const onMessageStart = (event: { message: { role?: string } }) => {
 		if (event.message.role !== "assistant") return;
 		tpsTracker.messageStart(Date.now());
-		startTpsTick();
+		startWorkingTick();
 	};
 
 	const onMessageUpdate = (event: {
@@ -353,28 +403,49 @@ export default function footerExtension(pi: ExtensionAPI): void {
 	}) => {
 		if (event.message.role !== "assistant") return;
 		tpsTracker.messageUpdate(event.assistantMessageEvent?.type, event.message.content, Date.now());
-		startTpsTick();
+		startWorkingTick();
 	};
 
-	const onStreamingEnd = () => {
-		if (tpsTimer) {
-			clearInterval(tpsTimer);
-			tpsTimer = undefined;
+	const onMessageEnd = (event: { message: { role?: string; stopReason?: string } }) => {
+		if (event.message.role !== "assistant") return;
+		// Aborted and failed responses are not generation-speed samples.
+		if (event.message.stopReason !== "aborted" && event.message.stopReason !== "error") {
+			tpsTracker.finish();
 		}
+		requestRender();
+	};
+
+	// OpenRouter tags every stream chunk with the upstream provider that served
+	// it (for example "Morph"), which the model string alone cannot tell you.
+	const onProviderStreamEvent = (event: { provider?: string; model?: string; data?: unknown }) => {
+		if (event.provider !== "openrouter") return;
+		const data = event.data as { provider?: unknown } | undefined;
+		const name = data && typeof data === "object" ? data.provider : undefined;
+		if (typeof name !== "string" || name.length === 0) return;
+		const chunkModel = event.model ?? "";
+		if (upstream?.name === name && upstream.model === chunkModel) return;
+		upstream = { model: chunkModel, name };
 		requestRender();
 	};
 
 	pi.on("message_start", onMessageStart);
 	pi.on("message_update", onMessageUpdate);
-	pi.on("message_end", onStreamingEnd);
-	pi.on("agent_end", onStreamingEnd);
+	pi.on("message_end", onMessageEnd);
+	pi.on("provider_stream_event", onProviderStreamEvent);
+	pi.on("agent_start", () => {
+		agentStartedAt = Date.now();
+		startWorkingTick();
+		requestRender();
+	});
+	pi.on("agent_end", stopWorkingTick);
+	pi.on("agent_settled", stopWorkingTick);
 	pi.on("turn_end", () => {
 		tpsTracker.turnEnd(Date.now());
-		onStreamingEnd();
+		requestRender();
 	});
 
 	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n[FOOTER CAPABILITY] A compact UI footer is active and displays model, context, usage, cost, branch, tool, and extension-status information. It requires no model action.`,
+		systemPrompt: `${event.systemPrompt}\n\n[FOOTER CAPABILITY] A compact UI footer is active and already shows the user model, thinking level, session id, git branch, project trust, queued-message state, context gauge, token and cache totals, cost, compaction count, tool count, live thinking/output speed, session-average speed, and (on OpenRouter) the upstream provider that served the last request. It requires no model action, and the user never needs to ask for this information.`,
 	}));
 
 	function refresh(): void {
@@ -388,7 +459,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 
 			return {
 				render(width: number): string[] {
-					const usage = collectUsage(ctx);
+					const { usage, compactions } = collectSessionStats(ctx);
 					const branch = footerData.getGitBranch();
 					const sessionName = pi.getSessionName();
 					const activeTools = pi.getActiveTools().length;
@@ -400,9 +471,17 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						.sort(([left], [right]) => left.localeCompare(right))
 						.map(([, text]) => sanitizeStatusText(text))
 						.filter(Boolean)
-						.slice(0, 2);
+						.slice(0, 3);
 					const working = !ctx.isIdle();
-					const rates = tpsTracker.rates(Date.now());
+					const now = Date.now();
+					const sessionId = ctx.sessionManager.getSessionId();
+					const queued = ctx.hasPendingMessages();
+					const untrusted = !ctx.isProjectTrusted();
+					const elapsed = working && agentStartedAt > 0 ? Math.floor((now - agentStartedAt) / 1000) : 0;
+					// Only trust a remembered provider when it belongs to the active model.
+					const upstreamName = upstream && upstream.model === ctx.model?.id ? upstream.name : undefined;
+					const rates = tpsTracker.rates(now);
+					const averageRate = tpsTracker.average();
 					const tpsText =
 						rates.think > 0
 							? `think ${Math.round(rates.think)} t/s`
@@ -413,6 +492,14 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					// cumulative cost and cache readouts that are still there when idle.
 					const tpsPart: FooterPart | undefined =
 						working && tpsText ? { text: theme.fg("mdCode", tpsText), priority: 98 } : undefined;
+					// Session-speed summary, so the line still says something useful when idle.
+					const averagePart: FooterPart | undefined =
+						!working && averageRate > 0
+							? {
+									text: `${theme.fg("dim", "avg")} ${theme.fg("mdCode", `${Math.round(averageRate)} t/s`)}`,
+									priority: 60,
+								}
+							: undefined;
 
 					const project = formatPath(ctx.cwd);
 					const spinner = SPINNER_FRAMES[spinnerIndex % SPINNER_FRAMES.length]!;
@@ -428,7 +515,16 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						? { text: theme.fg("mdLink", `⎇ ${branch}`), priority: 85 }
 						: undefined;
 					const workingPart: FooterPart | undefined = working
-						? { text: `${theme.fg("warning", spinner)} ${theme.fg("warning", "working")}`, priority: 90 }
+						? {
+								text: `${theme.fg("warning", spinner)} ${theme.fg("warning", "working")}${elapsed >= 1 ? theme.fg("dim", ` ${formatDuration(elapsed)}`) : ""}`,
+								priority: 90,
+							}
+						: undefined;
+					const untrustedPart: FooterPart | undefined = untrusted
+						? { text: `${theme.fg("warning", "⚠")} ${theme.fg("warning", "untrusted")}`, priority: 96 }
+						: undefined;
+					const queuedPart: FooterPart | undefined = queued
+						? { text: `${theme.fg("accent", "⏳")} ${theme.fg("muted", "queued")}`, priority: 88 }
 						: undefined;
 					const narrowBranchPart: FooterPart | undefined = branch
 						? {
@@ -486,14 +582,29 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						text: `${theme.fg("dim", "tools")} ${theme.fg("muted", `${activeTools}/${allTools}`)}`,
 						priority: 30,
 					};
+					const upstreamSuffix = upstreamName
+						? ` ${theme.fg("dim", "via")} ${theme.fg("mdListBullet", upstreamName)}`
+						: "";
+					// Knowing the upstream provider is more useful than repeating the router,
+					// so routing detail replaces the "provider/" prefix when it is known.
 					const modelPart: FooterPart = {
-						text: theme.fg("text", theme.bold(model)),
+						text: `${theme.fg("text", theme.bold(upstreamName ? modelId : model))}${upstreamSuffix}`,
 						priority: 90,
 					};
 					const compactModelPart: FooterPart = {
-						text: theme.fg("text", modelId),
+						text: `${theme.fg("text", modelId)}${upstreamSuffix}`,
 						priority: 100,
 					};
+					const compactionPart: FooterPart | undefined =
+						compactions > 0
+							? {
+									text: `${theme.fg("dim", "compact")} ${theme.fg("muted", `×${compactions}`)}`,
+									priority: 25,
+								}
+							: undefined;
+					const sessionIdPart: FooterPart | undefined = sessionId
+						? { text: theme.fg("dim", `#${sessionId.slice(0, 8)}`), priority: 22 }
+						: undefined;
 					const thinkingPart: FooterPart = {
 						text: `${theme.fg("dim", "◇")} ${theme.fg("accent", thinkingLevel)}`,
 						priority: 65,
@@ -506,9 +617,11 @@ export default function footerExtension(pi: ExtensionAPI): void {
 								width,
 								footerParts(
 									brandPart,
+									untrustedPart,
 									sessionPart,
 									projectPart,
 									branchPart,
+									queuedPart,
 									workingPart,
 									...statusParts,
 								),
@@ -516,7 +629,17 @@ export default function footerExtension(pi: ExtensionAPI): void {
 							),
 							renderAlignedFooterLine(
 								width,
-								footerParts(usagePart, tpsPart, cachePart, costPart, wideContextPart, toolsPart),
+								footerParts(
+									usagePart,
+									tpsPart,
+									averagePart,
+									cachePart,
+									costPart,
+									wideContextPart,
+									toolsPart,
+									compactionPart,
+									sessionIdPart,
+								),
 								footerParts(modelPart, thinkingPart),
 								theme,
 							),
@@ -529,9 +652,11 @@ export default function footerExtension(pi: ExtensionAPI): void {
 								width,
 								footerParts(
 									brandPart,
+									untrustedPart,
 									sessionPart,
 									projectPart,
 									branchPart,
+									queuedPart,
 									workingPart,
 									...statusParts,
 								),
@@ -542,12 +667,15 @@ export default function footerExtension(pi: ExtensionAPI): void {
 								footerParts(
 									compactUsagePart,
 									tpsPart,
+									averagePart,
 									costPart,
 									mediumContextPart,
 									compactModelPart,
 									thinkingPart,
 									toolsPart,
 									compactCachePart,
+									compactionPart,
+									sessionIdPart,
 								),
 								theme,
 							),
@@ -561,10 +689,14 @@ export default function footerExtension(pi: ExtensionAPI): void {
 
 					return [
 						renderFooterLine(width, narrowIdentity, theme),
-						renderFooterLine(width, footerParts(compactUsagePart, tpsPart, costPart, compactContextPart), theme),
 						renderFooterLine(
 							width,
-							footerParts(compactModelPart, thinkingPart, toolsPart, ...statusParts),
+							footerParts(compactUsagePart, tpsPart, averagePart, costPart, compactContextPart),
+							theme,
+						),
+						renderFooterLine(
+							width,
+							footerParts(compactModelPart, thinkingPart, toolsPart, compactionPart, sessionIdPart, ...statusParts),
 							theme,
 						),
 					];
@@ -580,17 +712,11 @@ export default function footerExtension(pi: ExtensionAPI): void {
 	pi.on("session_info_changed", refresh);
 	pi.on("model_select", refresh);
 	pi.on("thinking_level_select", refresh);
-	pi.on("agent_start", refresh);
-	pi.on("agent_end", refresh);
-	pi.on("turn_end", refresh);
 	pi.on("tool_execution_start", refresh);
 	pi.on("tool_execution_end", refresh);
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		if (tpsTimer) {
-			clearInterval(tpsTimer);
-			tpsTimer = undefined;
-		}
+		stopWorkingTick();
 		ctx.ui.setFooter(undefined);
 		requestRender = () => {};
 	});
