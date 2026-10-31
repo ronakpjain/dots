@@ -9,7 +9,9 @@ vim.pack.add({
 require("render-markdown").setup({
 	file_types = { "markdown", "pi" },
 })
-require("mdmath").setup({})
+require("mdmath").setup({
+	filetypes = { "markdown", "cpp", "c" },
+})
 
 local ok, markdown_plus = pcall(require, "markdown-plus")
 if ok and type(markdown_plus.setup) == "function" then
