@@ -11,6 +11,7 @@ require("render-markdown").setup({
 })
 require("mdmath").setup({
 	filetypes = { "markdown", "cpp", "c" },
+	inline_align = "left",
 })
 
 local ok, markdown_plus = pcall(require, "markdown-plus")
