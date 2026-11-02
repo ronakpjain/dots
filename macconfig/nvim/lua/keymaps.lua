@@ -33,7 +33,7 @@ vim.keymap.set("n", "<leader>gd", "<Cmd>DiffTab<CR>", { desc = "Git: Unified dif
 vim.keymap.set("n", "<leader>gD", "<Cmd>vertical Diff<CR>", { desc = "Git: Unified diff (vertical split)" })
 vim.keymap.set("n", "<leader>gs", "<Cmd>DiffTab ++layout=stacked<CR>", { desc = "Git: Stacked diff in new tab" })
 vim.keymap.set("n", "<leader>gS", "<Cmd>DiffTab ++layout=split<CR>", { desc = "Git: Split diff in new tab" })
-vim.keymap.set("n", "<leader>gr", "<Cmd>Diff review<CR>", { desc = "Git: Repo review diff" })
+vim.keymap.set("n", "<leader>gr", "<Cmd>DiffTab review<CR>", { desc = "Git: Repo review diff in new tab" })
 
 -- Git: guh.nvim (GitHub)
 vim.keymap.set("n", "<leader>gh", "<Cmd>Guh<CR>", { desc = "GitHub: Guh status" })
