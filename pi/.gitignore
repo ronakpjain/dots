@@ -2,3 +2,6 @@
 /agent/memories.json
 /agent/token-usage.jsonl
 /agent/checkpoints/
+# Regenerated/rewritten by Pi on run (model metadata cache, settings churn).
+/agent/models-store.json
+/agent/settings.json
