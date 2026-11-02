@@ -100,7 +100,11 @@ yay_install tree
 
 # ── Editors ────────────────────────────────────────────
 info "Installing editors..."
-yay_install neovim
+if nvim --version 2>/dev/null | head -1 | grep -q 'dev'; then
+    ok "neovim nightly already installed"
+else
+    yay_install neovim-git
+fi
 
 # ── Languages & runtimes ───────────────────────────────
 info "Installing languages & runtimes..."
