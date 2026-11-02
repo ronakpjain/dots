@@ -28,11 +28,11 @@ vim.keymap.set("n", "<leader>gb", "<Cmd>e#<CR>", { desc = "Go to previous buffer
 -- Git: Neogit
 vim.keymap.set("n", "<leader>gg", "<Cmd>Neogit<CR>", { desc = "Git: Neogit status" })
 
--- Git: diffs.nvim split (default) / unified / stacked views
-vim.keymap.set("n", "<leader>gd", "<Cmd>Diff<CR>", { desc = "Git: Split diff vs index" })
-vim.keymap.set("n", "<leader>gD", "<Cmd>vertical Diff ++layout=unified<CR>", { desc = "Git: Unified diff (vertical)" })
-vim.keymap.set("n", "<leader>gs", "<Cmd>Diff ++layout=stacked<CR>", { desc = "Git: Stacked diff vs index" })
-vim.keymap.set("n", "<leader>gS", "<Cmd>Diff ++layout=split<CR>", { desc = "Git: Split diff vs index (explicit)" })
+-- Git: diffs.nvim unified (default) / stacked / split views in a new tab
+vim.keymap.set("n", "<leader>gd", "<Cmd>DiffTab<CR>", { desc = "Git: Unified diff in new tab" })
+vim.keymap.set("n", "<leader>gD", "<Cmd>vertical Diff<CR>", { desc = "Git: Unified diff (vertical split)" })
+vim.keymap.set("n", "<leader>gs", "<Cmd>DiffTab ++layout=stacked<CR>", { desc = "Git: Stacked diff in new tab" })
+vim.keymap.set("n", "<leader>gS", "<Cmd>DiffTab ++layout=split<CR>", { desc = "Git: Split diff in new tab" })
 vim.keymap.set("n", "<leader>gr", "<Cmd>Diff review<CR>", { desc = "Git: Repo review diff" })
 
 -- Git: guh.nvim (GitHub)
