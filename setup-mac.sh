@@ -108,7 +108,12 @@ brew_install vivid
 brew_install tree
 
 # Editors
-brew_install neovim
+if nvim --version 2>/dev/null | head -1 | grep -q 'dev'; then
+    ok "neovim nightly already installed"
+else
+    info "Installing neovim (nightly, --HEAD)..."
+    brew install --HEAD neovim
+fi
 
 # Languages & runtimes
 brew_install python@3.13

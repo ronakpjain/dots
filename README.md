@@ -185,7 +185,8 @@ Text Editor of choice
     - [Conform](https://github.com/stevearc/conform.nvim) - Formatting (stylua, prettier, latexindent, rustfmt, clang-format)
 - **Git**
     - [Neogit](https://github.com/NeogitOrg/neogit) - Git interface
-    - [Diffview](https://github.com/sindrets/diffview.nvim) - Diff viewer
+    - [diffs.nvim](https://github.com/barrettruth/diffs.nvim) - Treesitter diff highlighting and unified/stacked/split `:Diff` views
+    - [guh.nvim](https://github.com/justinmk/guh.nvim) - GitHub PRs, issues, and CI logs (requires `gh` and Neovim 0.13+)
 - **Debugging**
     - [DAP](https://github.com/mfussenegger/nvim-dap) - Debug adapter protocol
     - [nvim-dap-ui](https://github.com/rcarriga/nvim-dap-ui) - Debug UI

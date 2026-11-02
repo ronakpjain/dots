@@ -25,6 +25,20 @@ vim.keymap.set("n", "<leader>fa", vim.cmd.Alpha, { desc = "Open Alpha dashboard"
 -- Go back to previous file
 vim.keymap.set("n", "<leader>gb", "<Cmd>e#<CR>", { desc = "Go to previous buffer" })
 
+-- Git: Neogit
+vim.keymap.set("n", "<leader>gg", "<Cmd>Neogit<CR>", { desc = "Git: Neogit status" })
+
+-- Git: diffs.nvim unified/stacked/split views
+vim.keymap.set("n", "<leader>gd", "<Cmd>Diff<CR>", { desc = "Git: Unified diff vs index" })
+vim.keymap.set("n", "<leader>gD", "<Cmd>vertical Diff<CR>", { desc = "Git: Unified diff (vertical)" })
+vim.keymap.set("n", "<leader>gs", "<Cmd>Diff ++layout=stacked<CR>", { desc = "Git: Stacked diff vs index" })
+vim.keymap.set("n", "<leader>gS", "<Cmd>Diff ++layout=split<CR>", { desc = "Git: Split diff vs index" })
+vim.keymap.set("n", "<leader>gr", "<Cmd>Diff review<CR>", { desc = "Git: Repo review diff" })
+
+-- Git: guh.nvim (GitHub)
+vim.keymap.set("n", "<leader>gh", "<Cmd>Guh<CR>", { desc = "GitHub: Guh status" })
+vim.keymap.set("n", "<leader>gH", "<Cmd>Guh .<CR>", { desc = "GitHub: Guh at cursor" })
+
 -- DAP: Basic controls
 vim.keymap.set("n", "<leader>bp", function()
 	require("dap").toggle_breakpoint()
