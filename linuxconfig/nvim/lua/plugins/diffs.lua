@@ -1,7 +1,7 @@
 -- diffs.nvim: treesitter diff highlighting + `:Diff` unified/stacked/split views.
 -- `vim.g.diffs` must be set before the plugin loads; the plugin lazy-loads itself.
 vim.g.diffs = {
-	view = { default_layout = "unified" },
+	view = { default_layout = "split" },
 	integrations = { neogit = true },
 }
 
