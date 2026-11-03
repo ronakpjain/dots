@@ -13,8 +13,6 @@ type Check = {
 
 type JsonObject = Record<string, unknown>;
 
-const DOCTOR_CAPABILITY =
-	"[DOCTOR CAPABILITY] Use /doctor for a read-only health check of Pi extensions, configuration, memory storage, Git, and LSP servers.";
 const LSP_COMMANDS = [
 	"clangd",
 	"pylsp",
@@ -29,16 +27,12 @@ const LSP_COMMANDS = [
 ];
 const REQUIRED_EXTENSIONS = [
 	"footer.ts",
-	"goal-mode.ts",
 	"memory.ts",
 	"question.ts",
 	"lsp.ts",
 	"doctor.ts",
-	"context-budget.ts",
-	"checkpoint.ts",
 	"session-automation.ts",
 	"token-tracker.ts",
-	"recheck/index.ts",
 ];
 
 function agentDir(): string {
@@ -212,10 +206,6 @@ function formatReport(checks: Check[]): string {
 }
 
 export default function doctorExtension(pi: ExtensionAPI): void {
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${DOCTOR_CAPABILITY}`,
-	}));
-
 	pi.registerCommand("doctor", {
 		description: "Run a read-only Pi health check",
 		handler: async (_args, ctx) => {

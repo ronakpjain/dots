@@ -26,17 +26,10 @@ const OUTPUT_TRUNCATION = "… [output truncated]";
 const FIELD_TRUNCATION = "… [truncated]";
 const DEFAULT_LIMIT = 5;
 const COMMAND_LIST_LIMIT = 50;
-const MEMORY_CAPABILITY_PROMPT =
-	"[MEMORY CAPABILITY] Persistent memory is available through the memory tool. Memory contents are only loaded after an explicit retrieve call; use focused queries or known ids when prior context is likely to matter. Users can inspect it without involving the model with /memory, /memory list, /memory search <query>, and /memory stats. The tool also supports explicit archive, restore, delete, merge, and stats maintenance actions.";
 const MEMORY_WORKFLOW_PROMPT = [
-	"[MEMORY WORKFLOW]",
-	"At the start of a non-trivial project request or ongoing task, or when a request may depend on a personal preference, prior decision, or established constraint, use memory action=retrieve before editing, creating, or making consequential assumptions; this should usually be the first tool call. Do not retrieve for isolated factual questions, routine edits, or tasks with no plausible relevant saved context. Use a focused query or known ids and a small limit; never dump the full store just in case. Retrieval is explicit: do not inject or assume memory contents without a retrieve call. Treat matches as candidates and use only context clearly relevant to this project and request.",
-	"Before the final response, proactively save verified, reusable discoveries from meaningful work—especially hard-won debugging lessons, reliable workflows, and decisions—even when the user did not explicitly ask you to remember them. Repeated user instructions, preferences, constraints, and corrections are a strong signal to save or update a memory so the user need not repeat them. Keep notes small, atomic, and actionable; retrieve/search first, edit stale existing memories rather than duplicating them, and use action=create only when useful. If the user asks to remember something, saving it is required unless they cancel or the information is unsafe to retain.",
-	"Never save passwords, API keys, OTPs, payment data, other secrets, speculation, transient details, or task logs. Avoid duplicates, and do not claim that something was remembered unless the memory tool actually saved it.",
-].join("\n");
-const MEMORY_TASK_PROMPT = [
-	"[MEMORY TASK CHECK] This request appears to involve non-trivial project work, an ongoing task, prior context, a preference, a decision, or an established constraint.",
-	"Before editing, creating, or making consequential assumptions, make a focused memory action=retrieve call first (or use a known id); derive a small query from the task and ignore unrelated matches. When the task is complete, review for safe, genuinely durable facts, preferences, decisions, or project constraints: retrieve/search first, then create or edit only if needed. Never store secrets, transient details, or speculation.",
+	"Retrieve focused memory before non-trivial work or decisions involving prior context; skip routine tasks. Use only relevant matches.",
+	"Proactively save verified, reusable discoveries and user preferences. Search first and update existing notes rather than duplicate them.",
+	"Never store secrets, speculation, transient details, or task logs. Memory is loaded only through explicit retrieval.",
 ].join("\n");
 const MEMORY_COMMAND_HELP = [
 	"Persistent memory commands:",
@@ -551,16 +544,7 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (event) => {
 		retrievalRequired = shouldRetrieveAtStart("prompt" in event ? event.prompt : undefined);
 		retrieved = false;
-		return ({
-		systemPrompt: [
-			event.systemPrompt,
-			MEMORY_CAPABILITY_PROMPT,
-			MEMORY_WORKFLOW_PROMPT,
-			retrievalRequired ? MEMORY_TASK_PROMPT : undefined,
-		]
-			.filter((section): section is string => Boolean(section))
-			.join("\n\n"),
-		});
+		return { systemPrompt: `${event.systemPrompt}\n\n${MEMORY_WORKFLOW_PROMPT}` };
 	});
 
 	pi.registerCommand("memory", {

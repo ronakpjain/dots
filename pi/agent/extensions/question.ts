@@ -69,10 +69,6 @@ function cancelledResult(answers: Answer[]): { content: { type: "text"; text: st
 }
 
 export default function questionExtension(pi: ExtensionAPI): void {
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n[QUESTION CAPABILITY] The question tool can ask the user concise choice or free-form questions. Use it only when necessary information or a decision cannot be obtained from the current context or available tools.`,
-	}));
-
 	pi.registerTool({
 		name: "question",
 		label: "Question",
