@@ -509,10 +509,6 @@ export default function footerExtension(pi: ExtensionAPI): void {
 		requestRender();
 	});
 
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n[FOOTER CAPABILITY] A compact UI footer is active and already shows the user model, thinking level, session id, git branch, project trust, queued-message state, context gauge and counts, cache hit rate for the session (a gauge) and for the most recent response (labeled "last"), cost, compaction count, tool count, live thinking/output speed, session-average speed, and (on OpenRouter) the upstream provider that served the last request. It requires no model action, and the user never needs to ask for this information.`,
-	}));
-
 	function refresh(): void {
 		requestRender();
 	}

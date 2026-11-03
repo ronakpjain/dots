@@ -1083,10 +1083,6 @@ export default function tokenTrackerExtension(pi: ExtensionAPI): void {
 		}
 	};
 
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n[TOKEN TRACKER CAPABILITY] Persistent token usage is recorded across Pi sessions. Use /tokens for reports. It accepts all, today, yesterday, week, month, year, last 7d, since YYYY-MM-DD, until YYYY-MM-DD, or arbitrary ranges such as YYYY-MM-DD..YYYY-MM-DD. Costs are equivalent API pricing; subscription charges are not billed per API call.`,
-	}));
-
 	pi.on("session_start", (_event, ctx) => {
 		currentContext = ctx;
 		ctx.ui.setStatus("token-tracker", "tracking tokens");

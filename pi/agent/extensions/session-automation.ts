@@ -1,7 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const SESSION_CAPABILITY =
-	"[SESSION CAPABILITY] Unnamed sessions are named from their first meaningful request or active goal. Use /session-label <label> (or /label) to name the session and bookmark the current conversation branch.";
 const MAX_NAME_LENGTH = 80;
 
 type SessionEntry = {
@@ -10,12 +8,6 @@ type SessionEntry = {
 	customType?: string;
 	message?: { role?: string; content?: unknown };
 	data?: unknown;
-};
-
-type GoalState = {
-	status?: string;
-	goal?: string;
-	iterations?: number;
 };
 
 function textFromContent(content: unknown): string {
@@ -37,20 +29,10 @@ function compact(value: string): string {
 
 function nameFromText(text: string): string | undefined {
 	const normalized = compact(text)
-		.replace(/^\[GOAL MODE ACTIVE[^\]]*\]\s*/i, "")
-		.replace(/^Original goal:\s*/i, "")
 		.replace(/^[/!][^\s]+\s*/i, "")
 		.trim();
 	if (!normalized) return undefined;
 	return normalized.length > MAX_NAME_LENGTH ? `${normalized.slice(0, MAX_NAME_LENGTH - 1).trimEnd()}…` : normalized;
-}
-
-function goalFromPrompt(prompt: string | undefined): string | undefined {
-	if (typeof prompt !== "string") return undefined;
-	const match = prompt.match(
-		/Original goal:\s*([\s\S]*?)(?:\n\s*Current designed plan:|\n\s*Work autonomously toward this goal\.|\n\s*\n)/i,
-	);
-	return nameFromText(match?.[1] ?? "");
 }
 
 function branchEntries(ctx: ExtensionContext): SessionEntry[] {
@@ -70,20 +52,6 @@ function latestUserPrompt(ctx: ExtensionContext): string | undefined {
 	return undefined;
 }
 
-function latestGoalState(ctx: ExtensionContext): GoalState | undefined {
-	for (const entry of [...branchEntries(ctx)].reverse()) {
-		if (
-			entry.type === "custom" &&
-			entry.customType === "goal-mode-state" &&
-			entry.data &&
-			typeof entry.data === "object"
-		) {
-			return entry.data as GoalState;
-		}
-	}
-	return undefined;
-}
-
 function labelCurrentEntry(pi: ExtensionAPI, ctx: ExtensionContext, label: string): void {
 	const entry = latestEntry(ctx);
 	if (entry?.id) pi.setLabel(entry.id, label);
@@ -97,16 +65,8 @@ function autoName(pi: ExtensionAPI, value: string | undefined): void {
 
 export default function sessionAutomationExtension(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (event, ctx) => {
-		const goalName = goalFromPrompt(event.prompt);
-		if (goalName) {
-			if (!pi.getSessionName()) pi.setSessionName(`Goal: ${goalName}`);
-			if (/\[GOAL MODE ACTIVE\s+—\s+iteration 0\//i.test(event.prompt)) labelCurrentEntry(pi, ctx, "goal-start");
-			return { systemPrompt: `${event.systemPrompt}\n\n${SESSION_CAPABILITY}` };
-		}
-
-		autoName(pi, event.prompt);
+		autoName(pi, "prompt" in event ? event.prompt : undefined);
 		labelCurrentEntry(pi, ctx, "work-start");
-		return { systemPrompt: `${event.systemPrompt}\n\n${SESSION_CAPABILITY}` };
 	});
 
 	pi.registerCommand("session-label", {
@@ -154,15 +114,6 @@ export default function sessionAutomationExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		autoName(pi, latestUserPrompt(ctx));
 		ctx.ui.setStatus("session-automation", pi.getSessionName() ? "session labeled" : "auto-name on");
-	});
-
-	pi.on("agent_end", (_event, ctx) => {
-		const goal = latestGoalState(ctx);
-		if (goal?.status === "active" && typeof goal.iterations === "number") {
-			labelCurrentEntry(pi, ctx, `goal-iteration-${goal.iterations}`);
-		} else if (goal?.status === "completed") {
-			labelCurrentEntry(pi, ctx, "goal-complete");
-		}
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
