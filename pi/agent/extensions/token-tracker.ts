@@ -8,12 +8,11 @@ import { renderToolResult } from "./tool-results/render.ts";
 
 export const TOKEN_USAGE_EVENT = "pi-token-usage";
 const STORE_VERSION = 1;
-const SUBAGENT_RUN_ENTRY_TYPE = "subagent-run";
 const DEFAULT_STORE_NAME = "token-usage.jsonl";
 const MAX_MODEL_ROWS = 12;
 const MAX_SOURCE_ROWS = 8;
 
-export type TokenUsageSource = "main" | "subagent" | "tool" | "compaction";
+export type TokenUsageSource = "main" | "tool" | "compaction";
 export type TokenUsageCostBasis = "reported" | "estimated" | "unknown";
 
 export interface TokenUsageCost {
@@ -422,7 +421,7 @@ function recordFromMessage(
 }
 
 function validSource(value: unknown): value is TokenUsageSource {
-	return value === "main" || value === "subagent" || value === "tool" || value === "compaction";
+	return value === "main" || value === "tool" || value === "compaction";
 }
 
 function parsePersistedRecord(value: unknown): TokenUsageRecord | undefined {
@@ -626,31 +625,6 @@ export function parseSessionUsage(
 			if (record) records.push(record);
 			continue;
 		}
-
-		if (entry.type !== "custom" || entry.customType !== SUBAGENT_RUN_ENTRY_TYPE) continue;
-		const data = asRecord(entry.data);
-		if (!data) continue;
-		const usage = asRecord(data.usage);
-		if (!usage) continue;
-		const qualified = stringOrUndefined(data.model);
-		const split = splitQualifiedModel(qualified);
-		const provider = stringOrUndefined(data.provider) ?? split.provider;
-		const model = stringOrUndefined(data.modelId) ?? split.model;
-		const record = recordFromUsage(
-			{
-				id: `subagent:${stringOrUndefined(data.runId) ?? sessionRecordId(sessionId, entry, "run")}`,
-				source: "subagent",
-				timestamp: data.startedAt ?? entry.timestamp,
-				sessionId,
-				cwd,
-				provider,
-				model,
-				label: stringOrUndefined(data.name),
-			},
-			usage,
-			lookup(provider, model),
-		);
-		if (record) records.push(record);
 	}
 
 	return records;
@@ -1110,7 +1084,7 @@ export default function tokenTrackerExtension(pi: ExtensionAPI): void {
 	};
 
 	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n[TOKEN TRACKER CAPABILITY] Persistent token usage is recorded across Pi sessions, including subagents. Use /tokens for reports. It accepts all, today, yesterday, week, month, year, last 7d, since YYYY-MM-DD, until YYYY-MM-DD, or arbitrary ranges such as YYYY-MM-DD..YYYY-MM-DD. Costs are equivalent API pricing; subscription charges are not billed per API call.`,
+		systemPrompt: `${event.systemPrompt}\n\n[TOKEN TRACKER CAPABILITY] Persistent token usage is recorded across Pi sessions. Use /tokens for reports. It accepts all, today, yesterday, week, month, year, last 7d, since YYYY-MM-DD, until YYYY-MM-DD, or arbitrary ranges such as YYYY-MM-DD..YYYY-MM-DD. Costs are equivalent API pricing; subscription charges are not billed per API call.`,
 	}));
 
 	pi.on("session_start", (_event, ctx) => {
@@ -1155,7 +1129,7 @@ export default function tokenTrackerExtension(pi: ExtensionAPI): void {
 		const model = split.model ?? stringOrUndefined(event.model);
 		const record = recordFromUsage(
 			{
-				id: stringOrUndefined(event.recordId) ?? `subagent:event:${hashIdentity(JSON.stringify(payload))}`,
+				id: stringOrUndefined(event.recordId) ?? `event:${hashIdentity(JSON.stringify(payload))}`,
 				source: event.source,
 				timestamp: event.timestamp,
 				sessionId: stringOrUndefined(event.sessionId),
@@ -1199,8 +1173,7 @@ export default function tokenTrackerExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "token_usage",
 		label: "Token usage",
-		description:
-			"Query persistent Pi token usage and equivalent API cost across sessions, including subagent calls.",
+		description: "Query persistent Pi token usage and equivalent API cost across sessions.",
 		promptSnippet: "Query persistent token usage and equivalent API costs for an arbitrary period",
 		promptGuidelines: [
 			"Use token_usage when the user asks how many tokens Pi used or what the equivalent API cost was.",

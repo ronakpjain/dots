@@ -80,13 +80,6 @@ function defaultCollapsedSummary(toolName: string, result: ToolResultLike, outpu
 	}
 	if (toolName === "goal_complete") return "Goal completion result ready";
 	if (toolName === "token_usage") return "Token usage report ready";
-	if (toolName === "subagent_status") return "Subagent status ready";
-	if (toolName === "subagent_history") {
-		const details = asRecord(result.details);
-		const count = Array.isArray(details?.runIds) ? details.runIds.length : 0;
-		return `${count} subagent run${count === 1 ? "" : "s"}`;
-	}
-	if (toolName === "subagent_cancel") return "Cancellation result ready";
 	if (toolName === "lsp_diagnostics") {
 		const count = output.text.match(/\b(\d+) issue\(s\)/)?.[1];
 		if (count) return `${count} diagnostic${count === "1" ? "" : "s"}`;
