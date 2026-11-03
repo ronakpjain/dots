@@ -34,7 +34,6 @@ const REQUIRED_EXTENSIONS = [
 	"question.ts",
 	"lsp.ts",
 	"doctor.ts",
-	"safety-gate.ts",
 	"context-budget.ts",
 	"checkpoint.ts",
 	"session-automation.ts",
