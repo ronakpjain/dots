@@ -318,7 +318,7 @@ alias :qa='killall kitty'
 # -----------------------------------------------------------------------------
 
 # Virtual environment (uv-managed Python)
-[[ -f ~/.venv-uv/bin/activate ]] && source ~/.venv-uv/bin/activate
+[[ -f ~/.venv/bin/activate ]] && source ~/.venv/bin/activate
 
 export PATH=$PATH:/Users/ronak/.spicetify
 
