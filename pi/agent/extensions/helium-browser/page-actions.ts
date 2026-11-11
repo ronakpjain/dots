@@ -2,10 +2,8 @@ import type { Page } from "puppeteer-core";
 import {
 	clickabilityEvaluator,
 	inputActionEvaluator,
-	loginFormEvaluator,
 	type ClickabilityResult,
 	type InputActionResult,
-	type LoginFormDescriptor,
 } from "./renderer-evaluators.ts";
 
 export const ELEMENT_ACTION_TIMEOUT_MS = 2_000;
@@ -388,53 +386,5 @@ export async function pageIsHidden(page: Page, actions?: HeliumActionContext): P
 		"Checking page visibility",
 		actions,
 	);
-}
-
-export function currentHttpsOrigin(page: Page): string {
-	let parsed: URL;
-	try {
-		parsed = new URL(page.url());
-	} catch {
-		throw new Error("APW autofill requires an HTTPS login page.");
-	}
-	if (parsed.protocol !== "https:") throw new Error("APW autofill requires an HTTPS login page.");
-	return parsed.origin;
-}
-
-export async function discoverCurrentLoginForm(page: Page): Promise<LoginFormDescriptor> {
-	try {
-		const form: unknown = await page.evaluate(loginFormEvaluator, "discover");
-		if (!form || typeof form !== "object") throw new Error("not eligible");
-		return form as LoginFormDescriptor;
-	} catch {
-		throw new Error("No safe visible top-frame login form was found.");
-	}
-}
-
-export async function fillApwOnPage(
-	page: Page,
-	origin: string,
-	discovered: LoginFormDescriptor,
-	username: string,
-	password: string,
-	signal?: AbortSignal,
-): Promise<void> {
-	throwIfActionNotAborted(signal, "APW fill");
-	try {
-		const filled: unknown = await page.evaluate(
-			loginFormEvaluator,
-			"fill",
-			origin,
-			username,
-			password,
-			discovered.signature,
-		);
-		if (filled !== true) throw new Error("form changed");
-		throwIfActionNotAborted(signal, "APW fill");
-	} catch {
-		// Never let page-defined setters, event handlers, or renderer errors enter
-		// the model-facing APW error. Credential cleanup remains best effort.
-		throw new Error("APW autofill was canceled because the login page or form changed.");
-	}
 }
 

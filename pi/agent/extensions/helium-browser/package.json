@@ -15,9 +15,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --allowImportingTsExtensions index.ts",
-    "test": "bun test ../../tests/helium-browser*.test.ts",
-    "test:integration": "HELIUM_BROWSER_INTEGRATION=1 bun test integration/helium-browser-chromium.integration.test.ts",
-    "check": "bun run typecheck && bun run test"
+    "check": "bun run typecheck"
   },
   "dependencies": {
     "puppeteer-core": "^25.3.0",

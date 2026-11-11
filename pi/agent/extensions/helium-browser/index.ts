@@ -6,14 +6,10 @@ import { lstat, mkdir, readFile, readdir, rename, rm, rmdir, unlink, writeFile }
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Type, type Static } from "typebox";
-import { apwStatus, getApwCredential, listApwLogins, type ApwLoginMetadata } from "./apw.ts";
-import { registerApwAliasTool } from "./apw-alias-tool.ts";
 import { createToolResultRenderer } from "../tool-results/render.ts";
 import {
 	focusedSensitiveFieldEvaluator,
-	loginFormEvaluator,
 	snapshotEvaluator,
-	type LoginFormDescriptor,
 	type SnapshotDescriptor,
 } from "./renderer-evaluators.ts";
 
@@ -21,23 +17,14 @@ export {
 	clickabilityEvaluator,
 	focusedSensitiveFieldEvaluator,
 	inputActionEvaluator,
-	loginFormEvaluator,
 	snapshotEvaluator,
 } from "./renderer-evaluators.ts";
-
-export function discoverLoginFormEvaluator(): LoginFormDescriptor | undefined {
-	const result = loginFormEvaluator("discover");
-	return result && typeof result === "object" ? result : undefined;
-}
 
 import {
 	ActionCanceledError,
 	ActionUnknownOutcomeError,
 	checkInputHandle,
 	clickElementHandle,
-	currentHttpsOrigin,
-	discoverCurrentLoginForm,
-	fillApwOnPage,
 	fillHandle,
 	pageIsHidden,
 	throwIfActionNotAborted,
@@ -51,7 +38,6 @@ export {
 	ActionCanceledError,
 	ActionUnknownOutcomeError,
 	clickElementHandle,
-	fillApwOnPage,
 	withTabMutation,
 } from "./page-actions.ts";
 export { ELEMENT_ACTION_TIMEOUT_MS } from "./page-actions.ts";
@@ -371,17 +357,12 @@ const interventionParams = Type.Object({
 	tabId: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
 	focus: Type.Optional(Type.Boolean({ default: false })),
 });
-const apwFillParams = Type.Object({
-	tabId: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
-});
-
 type ElementTarget = Static<typeof elementTargetParams>;
 type FillInput = Static<typeof fillParams>;
 type TabsInput = Static<typeof tabsParams>;
 type TypeInput = Static<typeof typeParams>;
 type KeyInput = Static<typeof keyParams>;
 type InterventionInput = Static<typeof interventionParams>;
-type ApwFillInput = Static<typeof apwFillParams>;
 
 function textContent(text: string): { type: "text"; text: string } {
 	return { type: "text", text };
@@ -1296,8 +1277,8 @@ export function heliumSetupInstructions(): string {
 		`Profile data: ${HELIUM_USER_DATA_DIR}`,
 		`Profile: ${HELIUM_PROFILE_DIRECTORY}`,
 		"Pi ownership safely adopts an existing default window only when every page is an empty new tab; meaningful user windows are never adopted. Status and tabs stay read-only, while snapshots and screenshots require an existing Pi window.",
-		"APW autofill is available only through helium_apw_fill after explicit confirmation for the exact HTTPS origin and account; Pi will not click the submit button or call form.submit, but the site may react to input events. Signup, MFA, payment, and new-password forms are rejected.",
-		"Available commands: /helium status, /helium apw, /helium window, /helium start, /helium setup, /helium help",
+		"Credentials must be entered manually by the user; use helium_request_intervention for credential steps.",
+		"Available commands: /helium status, /helium window, /helium start, /helium setup, /helium help",
 	].join("\n");
 }
 
@@ -2844,119 +2825,6 @@ async function executeIntervention(
 	};
 }
 
-export async function confirmApwLogin(
-	origin: string,
-	logins: readonly ApwLoginMetadata[],
-	confirm: (title: string, message: string) => Promise<boolean>,
-	signal?: AbortSignal,
-): Promise<ApwLoginMetadata | undefined> {
-	for (const login of logins) {
-		throwIfActionNotAborted(signal, "APW confirmation");
-		const approved = await confirm(
-			"Fill saved login?",
-			`Origin: ${origin}\nUsername: ${login.username}\nPi will not click the submit button or call form.submit; the site may react to input events.`,
-		);
-		throwIfActionNotAborted(signal, "APW confirmation");
-		if (approved) return login;
-	}
-	throwIfActionNotAborted(signal, "APW confirmation");
-	return undefined;
-}
-
-async function executeApwFill(
-	params: ApwFillInput,
-	ctx: HeliumUiContext,
-	pi: ExtensionAPI,
-	signal?: AbortSignal,
-): Promise<{ content: ReturnType<typeof textContent>[]; details: { status: string } }> {
-	if (!ctx.hasUI) throw new Error("APW autofill requires an interactive UI confirmation and is unavailable here.");
-	throwIfActionNotAborted(signal, "APW autofill");
-	const connected = await getBrowser(pi);
-	const instanceId = requireBrowserInstanceId();
-	const resolved = await resolvePage(connected, instanceId, params.tabId, false);
-	throwIfActionNotAborted(signal, "APW autofill");
-	return withTabMutation(resolved.id, signal, async (actions) => {
-		const origin = currentHttpsOrigin(resolved.page);
-		const discovered = await actions.run(
-			() => discoverCurrentLoginForm(resolved.page),
-			"APW form discovery",
-			{ timeoutMs: ACTION_TIMEOUT_MS },
-		);
-		actions.assertNotAborted("APW autofill");
-		let logins: ApwLoginMetadata[];
-		try {
-			logins = await actions.run(
-				() => listApwLogins(origin, { signal }),
-				"APW lookup",
-				{ timeoutMs: ACTION_TIMEOUT_MS },
-			);
-		} catch (error) {
-			if (error instanceof ActionCanceledError || error instanceof ActionUnknownOutcomeError) throw error;
-			throw new Error("APW lookup failed. Use helium_apw_alias to inspect saved-hostname mismatches; authentication or daemon failures may also cause this error.");
-		}
-		// Do not let an abort that arrived while APW was queried reach the UI.
-		actions.assertNotAborted("APW autofill");
-		if (logins.length === 0) throw new Error("APW has no saved login for this exact HTTPS origin.");
-
-		const selected = await confirmApwLogin(
-			origin,
-			logins,
-			(title, message) => actions.run(() => ctx.ui.confirm(title, message), "APW confirmation", { timeoutMs: ACTION_TIMEOUT_MS }),
-			signal,
-		);
-		actions.assertNotAborted("APW autofill");
-		if (!selected)
-			return {
-				content: [textContent("APW autofill canceled; no fields were changed.")],
-				details: { status: "canceled" },
-			};
-
-		let credential: { username: string; password: string } | undefined;
-		try {
-			try {
-				credential = await actions.run(
-					() => getApwCredential(origin, selected.username, { signal }),
-					"APW credential retrieval",
-					{ timeoutMs: ACTION_TIMEOUT_MS },
-				);
-			} catch (error) {
-				if (error instanceof ActionCanceledError || error instanceof ActionUnknownOutcomeError) throw error;
-				throw new Error("APW lookup failed.");
-			}
-			// Retrieval can complete after an abort signal was delivered. Never fill
-			// with a credential obtained after cancellation.
-			actions.assertNotAborted("APW autofill");
-			try {
-				await actions.run(
-					() => fillApwOnPage(resolved.page, origin, discovered, credential!.username, credential!.password, signal),
-					"APW fill",
-					{ timeoutMs: ACTION_TIMEOUT_MS },
-				);
-			} catch (error) {
-				if (error instanceof ActionCanceledError || error instanceof ActionUnknownOutcomeError) throw error;
-				throw new Error("APW autofill failed safely; no credential details were exposed.");
-			}
-			actions.assertNotAborted("APW autofill");
-			return {
-				content: [
-					textContent(
-						"APW autofill completed. Pi did not click the submit button or call form.submit; the site may react to input events.",
-					),
-				],
-				details: { status: "filled" },
-			};
-		} finally {
-			if (credential) {
-				// Strings are immutable; clearing these object slots is best-effort only
-				// and cannot erase renderer copies or values already observed by the site.
-				credential.password = "";
-				credential.username = "";
-			}
-			actions.defer(() => pruneRefCache(resolved.id));
-		}
-	});
-}
-
 async function executeCommand(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
 	const action = args.trim().toLowerCase().split(/\s+/)[0] || "status";
 	try {
@@ -2966,19 +2834,6 @@ async function executeCommand(args: string, ctx: ExtensionCommandContext, pi: Ex
 		}
 		if (action === "status") {
 			ctx.ui.notify(formatStatus(await inspectStatus(pi, ctx.signal)), "info");
-			return;
-		}
-		if (action === "apw") {
-			const status = await apwStatus();
-			ctx.ui.notify(
-				[
-					`APW installed: ${status.installed ? "yes" : "no"}`,
-					`APW path: ${status.path}`,
-					`APW socket: ${status.socket}`,
-					`APW authentication: ${status.authenticated}`,
-				].join("\n"),
-				status.installed ? "info" : "warning",
-			);
 			return;
 		}
 		if (action === "window") {
@@ -2995,7 +2850,7 @@ async function executeCommand(args: string, ctx: ExtensionCommandContext, pi: Ex
 			ctx.ui.notify(await startHelium(pi), "info");
 			return;
 		}
-		ctx.ui.notify("Usage: /helium [status|apw|window|start|setup|help]", "warning");
+		ctx.ui.notify("Usage: /helium [status|window|start|setup|help]", "warning");
 	} catch (error) {
 		ctx.ui.notify(`Helium command failed: ${errorText(error)}`, "error");
 	}
@@ -3003,13 +2858,13 @@ async function executeCommand(args: string, ctx: ExtensionCommandContext, pi: Ex
 
 export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n[HELIUM BROWSER CAPABILITY] Helium browser tools attach to the user's already-running Helium over CDP. Use helium_status or helium_tabs first. Pi-owned operations safely adopt an existing default window only when every page is an empty new tab; meaningful user windows are left untouched. Status and tabs are read-only; snapshots and screenshots use an existing Pi window only. Omitted tabId on mutating tools may lazily ensure that window, while explicit tabId may target a user tab. helium_open_tab reuses an unused blank Pi tab when possible and otherwise opens a same-window tab. Use helium_snapshot before interacting with a page. Use helium_request_intervention whenever manual login, signup, MFA, passkey, CAPTCHA, payment, consent, or other user action blocks progress. Never use helium_fill or helium_type for passwords, OTPs, API keys, payment data, or any other credentials; use helium_apw_fill only after its per-origin, per-account confirmation. Pi will not click the submit button or call form.submit during APW autofill, but the site may react to input events. Use /helium window to ensure or recover the dedicated window. Do not assume CDP is enabled; tell the user to run /helium setup if unavailable.`,
+		systemPrompt: `${event.systemPrompt}\n\n[HELIUM BROWSER CAPABILITY] Helium browser tools attach to the user's already-running Helium over CDP. Use helium_status or helium_tabs first. Pi-owned operations safely adopt an existing default window only when every page is an empty new tab; meaningful user windows are left untouched. Status and tabs are read-only; snapshots and screenshots use an existing Pi window only. Omitted tabId on mutating tools may lazily ensure that window, while explicit tabId may target a user tab. helium_open_tab reuses an unused blank Pi tab when possible and otherwise opens a same-window tab. Use helium_snapshot before interacting with a page. Use helium_request_intervention whenever manual login, signup, MFA, passkey, CAPTCHA, payment, consent, or other user action blocks progress. Never use helium_fill or helium_type for passwords, OTPs, API keys, payment data, or any other credentials; request manual user action for credential entry. Use /helium window to ensure or recover the dedicated window. Do not assume CDP is enabled; tell the user to run /helium setup if unavailable.`,
 	}));
 
 	pi.registerCommand("helium", {
 		description: "Inspect, set up, or start safe CDP access to the Helium browser",
 		getArgumentCompletions: (prefix) =>
-			["status", "apw", "window", "start", "setup", "help"]
+			["status", "window", "start", "setup", "help"]
 				.filter((value) => value.startsWith(prefix.trim().toLowerCase()))
 				.map((value) => ({ value, label: value })),
 		handler: async (args, ctx) => executeCommand(args, ctx, pi),
@@ -3030,32 +2885,6 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 		executionMode: "sequential",
 		async execute(_id, params: InterventionInput, _signal, _onUpdate, ctx) {
 			return executeIntervention(params, ctx, pi);
-		},
-	});
-
-	registerApwAliasTool(pi, async (tabId) => {
-		const connected = await getBrowser(pi);
-		const resolved = await resolvePage(connected, requireBrowserInstanceId(), tabId, false);
-		return currentHttpsOrigin(resolved.page);
-	});
-
-	pi.registerTool({
-		name: "helium_apw_fill",
-		renderResult: createToolResultRenderer("helium_apw_fill"),
-		label: "Helium: Fill saved login",
-		description:
-			"After mandatory interactive confirmation for an exact HTTPS origin and saved account, fill one visible login form from APW. Pi will not click the submit button or call form.submit; the site may react to input events.",
-		promptSnippet: "Confirm and fill an exact-origin saved login from APW",
-		promptGuidelines: [
-			"Use helium_apw_fill only for a visible top-frame current-login form with exactly one password field and at most one username/email field. Prefer autocomplete=current-password; otherwise the same form must show strong login/sign-in evidence.",
-			"Never use helium_apw_fill for signup, reset/recovery, new-password, MFA/OTP, payment, or other credential forms. Pi will not click submit or call form.submit, but sites may react to input events.",
-			"helium_apw_fill requires UI confirmation and never returns a password, OTP, or credential identifier.",
-			"If helium_apw_fill lookup fails due to a saved hostname mismatch, use helium_apw_alias to inspect candidates and request approval, then retry.",
-		],
-		parameters: apwFillParams,
-		executionMode: "sequential",
-		async execute(_id, params: ApwFillInput, signal, _onUpdate, ctx) {
-			return executeApwFill(params, ctx, pi, signal);
 		},
 	});
 
@@ -3268,9 +3097,9 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 		renderResult: createToolResultRenderer("helium_fill"),
 		label: "Helium: Fill",
 		description:
-			"Replace one non-credential value in a Helium tab. Never use for passwords, OTPs, API keys, payment data, or other credentials; use helium_apw_fill for eligible logins.",
+			"Replace one non-credential value in a Helium tab. Never use for passwords, OTPs, API keys, payment data, or other credentials; request manual user action for credential entry.",
 		promptGuidelines: [
-			"Never use helium_fill for passwords or other credentials; use helium_apw_fill for eligible login forms.",
+			"Never use helium_fill for passwords or other credentials; request manual user action for credential entry.",
 		],
 		parameters: fillParams,
 		executionMode: "sequential",
@@ -3329,7 +3158,7 @@ export default function heliumBrowserExtension(pi: ExtensionAPI): void {
 		description:
 			"Focus one non-credential input-like element and type text without evaluating arbitrary page JavaScript. Never use for passwords, OTPs, API keys, payment data, or other credentials.",
 		promptGuidelines: [
-			"Never use helium_type for passwords or other credentials; use helium_apw_fill for eligible login forms.",
+			"Never use helium_type for passwords or other credentials; request manual user action for credential entry.",
 		],
 		parameters: typeParams,
 		executionMode: "sequential",
