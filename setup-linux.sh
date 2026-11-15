@@ -254,6 +254,10 @@ link "$DOTS/tmux/tmux.conf"         "$HOME_DIR/.config/tmux/tmux.conf"
 # Pi
 link "$DOTS/pi"                     "$HOME_DIR/.pi"
 
+# Codex
+link "$DOTS/codex/config.toml"      "$HOME_DIR/.codex/config.toml"
+link "$DOTS/codex/go.config.toml"   "$HOME_DIR/.codex/go.config.toml"
+
 # ═══════════════════════════════════════════════════════
 #  4. NEOVIM PLUGINS
 # ═══════════════════════════════════════════════════════

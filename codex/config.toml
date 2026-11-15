@@ -1,0 +1,37 @@
+model = "gpt-6.1-sol"
+model_reasoning_effort = "low"
+service_tier = "default"
+
+[model_providers.opencode-go]
+name = "OpenCode Go"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+env_key = "OPENCODE_API_KEY"
+wire_api = "responses"
+
+[projects."/Users/ronak"]
+trust_level = "trusted"
+
+[projects."/Users/ronak/coding/projects/mofi"]
+trust_level = "trusted"
+
+[projects."/Users/ronak/life"]
+trust_level = "trusted"
+
+[projects."/Users/ronak/dots"]
+trust_level = "trusted"
+
+[projects."/Users/ronak/coding/projects/petty"]
+trust_level = "trusted"
+
+[projects."/Users/ronak/coding/PER/Projects/firmware"]
+trust_level = "trusted"
+
+[projects."/Users/ronak/coding/projects/fil"]
+trust_level = "trusted"
+
+[projects."/Users/ronak/coding/projects/roco"]
+trust_level = "trusted"
+
+[tui]
+screen_reader_detection_done = true
+pet = "disabled"

@@ -39,6 +39,11 @@ export LESS='-R'
 export LS_COLORS="$(vivid generate catppuccin-mocha)"
 export VIRTUAL_ENV_DISABLE_PROMPT=1
 
+# OpenCode Go API key (shared with pi's auth.json)
+if [ -z "${OPENCODE_API_KEY:-}" ] && [ -r "$HOME/.pi/agent/auth.json" ]; then
+    export OPENCODE_API_KEY="$(jq -r '."opencode-go".key // empty' "$HOME/.pi/agent/auth.json" 2>/dev/null)"
+fi
+
 # Syntax highlighting highlighters path
 export ZSH_HIGHLIGHT_HIGHLIGHTERS_DIR=/opt/homebrew/share/zsh-syntax-highlighting/highlighters
 

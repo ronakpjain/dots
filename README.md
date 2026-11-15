@@ -28,6 +28,7 @@ The script installs everything: yay packages, zsh plugins, symlinks, Neovim plug
 - `macconfig/` – macOS services, keybindings, and status bar configs.
 - `linuxconfig/` – Linux Hyprland, Niri, Kitty, Waybar, Rofi, and Neovim configs.
 - `vim/` – Vim/Neovim configuration, plugins, and runtime files.
+- `codex/` – Codex CLI/app `config.toml` plus the `go` profile (`go.config.toml`).
 - `setup-mac.sh` – Full Mac bootstrap script.
 - `setup-linux.sh` – Full Linux (Arch) bootstrap script.
 - Top-level files such as `maczshrc`, `linuxzshrc`, `vimrc` are symlinked into `~/`.

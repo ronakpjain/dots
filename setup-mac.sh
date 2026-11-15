@@ -279,6 +279,10 @@ link "$DOTS/macconfig/opencode"     "$HOME_DIR/.config/opencode"
 # Pi
 link "$DOTS/pi"                     "$HOME_DIR/.pi"
 
+# Codex
+link "$DOTS/codex/config.toml"      "$HOME_DIR/.codex/config.toml"
+link "$DOTS/codex/go.config.toml"   "$HOME_DIR/.codex/go.config.toml"
+
 # Mofi
 link "$DOTS/macconfig/mofi"         "$HOME_DIR/.config/mofi"
 

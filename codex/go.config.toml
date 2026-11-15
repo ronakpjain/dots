@@ -1,0 +1,3 @@
+model = "kimi-k3"
+model_provider = "opencode-go"
+model_reasoning_effort = "high"
