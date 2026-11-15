@@ -1,3 +1,4 @@
 model = "kimi-k3"
 model_provider = "opencode-go"
 model_reasoning_effort = "high"
+model_catalog_json = "/Users/ronak/dots/codex/models-go.json"
