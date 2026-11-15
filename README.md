@@ -28,7 +28,7 @@ The script installs everything: yay packages, zsh plugins, symlinks, Neovim plug
 - `macconfig/` – macOS services, keybindings, and status bar configs.
 - `linuxconfig/` – Linux Hyprland, Niri, Kitty, Waybar, Rofi, and Neovim configs.
 - `vim/` – Vim/Neovim configuration, plugins, and runtime files.
-- `codex/` – Codex CLI `config.toml`, the `go` profile (`go.config.toml`), and `models-go.json`, the OpenCode Go model catalog used by that profile.
+- `codex/` – Codex CLI `config.toml`, the `go` profile (`go.config.toml`), the OpenCode Go model catalog (`models-go.json`), and `go-proxy.ts`, a local Responses proxy that repairs `call_id` on goal/automation items before forwarding to OpenCode Go.
 - `setup-mac.sh` – Full Mac bootstrap script.
 - `setup-linux.sh` – Full Linux (Arch) bootstrap script.
 - Top-level files such as `maczshrc`, `linuxzshrc`, `vimrc` are symlinked into `~/`.

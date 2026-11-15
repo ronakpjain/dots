@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ronak.codex-go-proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/bun</string>
+        <string>/Users/ronak/dots/codex/go-proxy.ts</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/ronak/Library/Logs/codex-go-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ronak/Library/Logs/codex-go-proxy.log</string>
+</dict>
+</plist>

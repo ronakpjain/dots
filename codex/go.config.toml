@@ -1,4 +1,4 @@
-model = "kimi-k3"
+model = "deepseek-v4.1-flash"
 model_provider = "opencode-go"
-model_reasoning_effort = "high"
+model_reasoning_effort = "low"
 model_catalog_json = "/Users/ronak/dots/codex/models-go.json"

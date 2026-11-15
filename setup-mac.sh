@@ -283,6 +283,11 @@ link "$DOTS/pi"                     "$HOME_DIR/.pi"
 link "$DOTS/codex/config.toml"      "$HOME_DIR/.codex/config.toml"
 link "$DOTS/codex/go.config.toml"   "$HOME_DIR/.codex/go.config.toml"
 
+# Codex -> OpenCode Go responses proxy (repairs call_id on strict upstreams)
+link "$DOTS/codex/com.ronak.codex-go-proxy.plist" "$HOME_DIR/Library/LaunchAgents/com.ronak.codex-go-proxy.plist"
+launchctl bootout "gui/$UID/com.ronak.codex-go-proxy" 2>/dev/null || true
+launchctl bootstrap "gui/$UID" "$HOME_DIR/Library/LaunchAgents/com.ronak.codex-go-proxy.plist" 2>/dev/null || true
+
 # Mofi
 link "$DOTS/macconfig/mofi"         "$HOME_DIR/.config/mofi"
 
