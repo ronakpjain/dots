@@ -35,24 +35,64 @@ function syntheticCallId(item: Record<string, unknown>): string {
   return `call_${id}`;
 }
 
-// Fill in call_id (and function-call ids) that strict Responses servers require.
+// Strict-upstream repair: fill in call_id, and for codex-injected context tool
+// outputs that have no originating call, synthesise the matching call so the
+// pair is valid for OpenAI-style validators too.
+const OUTPUT_TYPES = new Set(["function_call_output", "custom_tool_call_output"]);
+
 function repairItem(item: unknown): unknown {
   if (!item || typeof item !== "object") return item;
   const entry = item as Record<string, unknown>;
   const hasCallId = typeof entry.call_id === "string" && entry.call_id.length > 0;
   const type = entry.type;
 
-  if ((type === "function_call_output" || type === "custom_tool_call_output") && !hasCallId) {
+  if ((type === "function_call" || type === "custom_tool_call") && !hasCallId) {
     entry.call_id = syntheticCallId(entry);
-    log("patched", type, "call_id", entry.call_id);
   }
-
-  if (type === "function_call" || type === "custom_tool_call") {
-    if (!hasCallId) entry.call_id = syntheticCallId(entry);
-    if (typeof entry.id !== "string" || !entry.id) entry.id = `fc_${crypto.randomUUID()}`;
+  if ((type === "function_call" || type === "custom_tool_call") && (typeof entry.id !== "string" || !entry.id)) {
+    entry.id = `fc_${crypto.randomUUID()}`;
+  }
+  if (OUTPUT_TYPES.has(String(type)) && !hasCallId) {
+    entry.call_id = syntheticCallId(entry);
   }
 
   return entry;
+}
+
+function syntheticCallFor(output: Record<string, unknown>): Record<string, unknown> {
+  const callId = output.call_id as string;
+  const custom = output.type === "custom_tool_call_output";
+  const call: Record<string, unknown> = custom
+    ? { type: "custom_tool_call", call_id: callId, id: `ctc_${callId}`, name: output.name ?? "context" }
+    : {
+        type: "function_call",
+        call_id: callId,
+        id: `fc_${callId}`,
+        name: output.name ?? "context",
+        arguments: "{}",
+      };
+  if (custom) call.input = "";
+  if (typeof output.namespace === "string" && output.namespace) call.namespace = output.namespace;
+  return call;
+}
+
+function repairInput(input: unknown[]): unknown[] {
+  const repaired: unknown[] = [];
+  for (const raw of input) {
+    const isOutput =
+      raw && typeof raw === "object" && OUTPUT_TYPES.has(String((raw as Record<string, unknown>).type));
+    const rawCallId = isOutput ? (raw as Record<string, unknown>).call_id : undefined;
+    const needsSyntheticCall =
+      isOutput && (typeof rawCallId !== "string" || rawCallId.length === 0);
+
+    const item = repairItem(raw);
+    if (needsSyntheticCall && item && typeof item === "object") {
+      repaired.push(syntheticCallFor(item as Record<string, unknown>));
+      log("synthesised call for", (item as Record<string, unknown>).type, (item as Record<string, unknown>).call_id);
+    }
+    repaired.push(item);
+  }
+  return repaired;
 }
 
 function repairBody(text: string): string {
@@ -64,7 +104,7 @@ function repairBody(text: string): string {
   }
   if (body && typeof body === "object" && Array.isArray((body as { input?: unknown }).input)) {
     const parsed = body as { input: unknown[] };
-    parsed.input = parsed.input.map(repairItem);
+    parsed.input = repairInput(parsed.input);
   }
   return JSON.stringify(body);
 }
